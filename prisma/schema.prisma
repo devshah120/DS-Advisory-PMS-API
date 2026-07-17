@@ -1,0 +1,389 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mongodb"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id @default(cuid()) @map("_id")
+  email     String   @unique
+  firstName String
+  lastName  String
+  password  String
+  role      Role     @default(PORTFOLIO_MANAGER)
+  avatar    String?
+  active    Boolean  @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("users")
+}
+
+enum Role {
+  ADMIN
+  PORTFOLIO_MANAGER
+  RESEARCH_ANALYST
+  VIEWER
+}
+
+model Client {
+  id              String   @id @default(cuid()) @map("_id")
+  name            String
+  broker          String
+  accountNumber   String
+  /// Free-text label kept for the existing CRUD UI. Analytics joins on benchmarkId
+  /// instead: a string like "swderfg" cannot be joined to a price series.
+  benchmark       String
+  benchmarkId     String?
+  riskProfile     RiskProfile
+
+  /// Which cash flows feed this client's XIRR. See PerformanceService.
+  ///
+  /// CASH_FLOW    — the manager records the money the client actually handed over
+  ///                and took back (CASH_DEPOSIT / CASH_WITHDRAWAL). Trades are
+  ///                internal reshuffling and are NOT flows.
+  /// TRANSACTIONAL — no external flow record exists; each BUY is treated as money
+  ///                in and each SELL as money out, so the return is measured on
+  ///                capital deployed into positions.
+  ///
+  /// Defaults to CASH_FLOW because that is what the engine did for every client
+  /// before this field existed — an existing client's XIRR must not silently
+  /// change method on migration.
+  accountingMethod AccountingMethod @default(CASH_FLOW)
+
+  /// Only meaningful under TRANSACTIONAL. Excluding fees gives the gross-of-fee
+  /// return the manager is measured on; including them gives the net-of-fee
+  /// return the client actually received. Both default ON, so the headline
+  /// number is the one the client experienced.
+  ///
+  /// Under CASH_FLOW these are ignored — dividends and fees are already inside
+  /// the terminal value there, because the cash landed in (or left) the balance.
+  /// Counting them as flows as well would double-count them.
+  includeDividends Boolean @default(true)
+  includeFees      Boolean @default(true)
+
+  currency        String   @default("USD")
+  status          ClientStatus @default(ACTIVE)
+  cashBalance     Float    @default(0)
+  portfolioValue  Float    @default(0)
+  xirr            Float    @default(0)
+  notes           String?
+
+  /// Annual management fee, as a percent (e.g. 2 for 2%). Billed quarterly at
+  /// feeRatePercent / 4 of quarter-end portfolio value. Defaulted for clients
+  /// created before this field existed; required on create going forward.
+  feeRatePercent  Float    @default(0)
+  /// The mandate's actual start date, used to prorate the first (partial)
+  /// billing quarter. NOT the same as createdAt, which is only when the
+  /// record was entered into Atlas PMS and may postdate real inception for
+  /// backfilled clients. Defaults to createdAt's value at write time for
+  /// clients created before this field existed.
+  inceptionDate   DateTime @default(now())
+
+  holdings        Holding[]
+  transactions    Transaction[]
+  research        Research[]
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([status])
+  @@index([name])
+  @@map("clients")
+}
+
+enum RiskProfile {
+  CONSERVATIVE
+  MODERATE
+  AGGRESSIVE
+}
+
+enum AccountingMethod {
+  TRANSACTIONAL
+  CASH_FLOW
+}
+
+enum ClientStatus {
+  ACTIVE
+  INACTIVE
+  CLOSED
+}
+
+model Holding {
+  id              String   @id @default(cuid()) @map("_id")
+  clientId        String
+  client          Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  ticker          String
+  company         String
+  sector          String
+  industry        String
+  country         String
+  theme           String?
+  exchange        String
+
+  quantity        Float
+  averageCost     Float
+  currentPrice    Float
+  marketValue     Float
+  allocationPercent Float @default(0)
+  unrealizedPnL   Float @default(0)
+  realizedPnL     Float @default(0)
+  dividend        Float @default(0)
+  weight          Float @default(0)
+  targetWeight    Float @default(0)
+  holdingDays     Int @default(0)
+
+  investmentThesis String?
+  notes           String?
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@unique([clientId, ticker])
+  @@index([clientId])
+  @@index([ticker])
+  @@index([sector])
+  @@map("holdings")
+}
+
+model Transaction {
+  id              String   @id @default(cuid()) @map("_id")
+  clientId        String
+  client          Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  ticker          String?
+  type            TransactionType
+  quantity        Float?
+  price           Float?
+  amount          Float
+  date            DateTime
+  description     String?
+  reference       String?
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([clientId])
+  @@index([ticker])
+  @@index([date])
+  /// The valuation replay issues `clientId = ? AND date <= ?` once per client.
+  /// Separate single-field indexes make Mongo pick one and scan the rest.
+  @@index([clientId, date])
+  @@map("transactions")
+}
+
+enum TransactionType {
+  BUY
+  SELL
+  DIVIDEND
+  SPLIT
+  BONUS
+  TRANSFER
+  CASH_DEPOSIT
+  CASH_WITHDRAWAL
+  FEES
+}
+
+model Research {
+  id              String   @id @default(cuid()) @map("_id")
+  clientId        String?
+  client          Client?  @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  ticker          String
+  investmentThesis String?
+  whyBought       String?
+  catalysts       String?
+  risks           String?
+  valuation       String?
+  targetAllocation Float?
+  targetPrice     Float?
+  reviewDate      DateTime?
+  reviewNotes     String?
+  attachments     String[]
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([ticker])
+  @@index([clientId])
+  @@map("research")
+}
+
+/// A tracked ticker with no priority/status workflow — returns (MTD/QTD/YTD)
+/// are computed live from market data, not stored here. `slot` is one of five
+/// fixed lists ("1".."5") a ticker can be placed on; the same ticker may
+/// appear on more than one list.
+model Watchlist {
+  id              String   @id @default(cuid()) @map("_id")
+  slot            String   @default("1")
+  ticker          String
+  company         String
+  sector          String
+  industry        String
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@unique([slot, ticker])
+  @@map("watchlists")
+}
+
+/// Display name for each of the five watchlist slots. Rows are created
+/// lazily (upsert) the first time a slot's name is changed from its default.
+model WatchlistFolder {
+  id     String @id @default(cuid()) @map("_id")
+  slot   String @unique
+  name   String
+
+  @@map("watchlist_folders")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Analytics engine — see ANALYTICS_ARCHITECTURE.md
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Daily bars for every instrument AND every benchmark. Benchmarks are ordinary
+/// symbols (^GSPC, ^IXIC) rather than a separate table, so "beta vs the S&P" and
+/// "beta vs a peer stock" are the same code path.
+///
+/// Without this collection there is no return series, and Beta/Sharpe/Sortino/
+/// drawdown/attribution cannot be computed at all.
+model PriceBar {
+  id       String   @id @default(cuid()) @map("_id")
+  symbol   String
+  date     DateTime
+  open     Float?
+  high     Float?
+  low      Float?
+  close    Float
+  /// Split- and dividend-adjusted. Returns are ALWAYS computed from this, never
+  /// from `close` — using close makes every stock that paid a dividend look like
+  /// it crashed on the ex-date.
+  adjClose Float
+  volume   Float?
+  /// "yahoo" | "workbook" | "manual" — provenance stays auditable.
+  source   String
+
+  createdAt DateTime @default(now())
+
+  /// Doubles as the range-scan index every risk calc issues, and as the idempotent
+  /// upsert key that makes backfill safely re-runnable.
+  @@unique([symbol, date])
+  @@map("price_bars")
+}
+
+/// Named benchmarks. Client.benchmark is free text today (the live value is
+/// literally "swderfg"), and free text cannot drive a calculation.
+model Benchmark {
+  id        String  @id @default(cuid()) @map("_id")
+  code      String  @unique
+  name      String
+  /// Join key into PriceBar.symbol.
+  symbol    String
+  isDefault Boolean @default(false)
+
+  @@map("benchmarks")
+}
+
+/// One row per instrument. Today sector/industry/country are copied onto every
+/// holding row of every client, so reclassifying one ticker is an N-client write
+/// and any partial failure leaves the house-level rollup inconsistent with itself.
+model InstrumentProfile {
+  id         String     @id @default(cuid()) @map("_id")
+  symbol     String     @unique
+  company    String
+  assetClass AssetClass @default(EQUITY)
+  sector     String     @default("Unclassified")
+  industry   String     @default("Unclassified")
+  /// Domicile of the ISSUER. For a US-listed China ETF this is "United States",
+  /// which is exactly why lookThrough exists.
+  country    String     @default("Unknown")
+  region     String     @default("Unknown")
+  exchange   String     @default("Unknown")
+  currency   String     @default("USD")
+
+  /// ETF decomposition: { region: [{ key: "China", weight: 1 }], sector: [...] }.
+  /// Null for single stocks. Without this, a book holding MCHI reports 0% China
+  /// exposure, because Yahoo classifies the fund itself as US-domiciled.
+  lookThrough Json?
+
+  source     String    @default("manual")
+  /// Set when a human sets the classification. The nightly Yahoo sync must not
+  /// overwrite a considered manual decision.
+  reviewedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([sector])
+  @@index([region])
+  @@map("instrument_profiles")
+}
+
+enum AssetClass {
+  EQUITY
+  ETF
+  FUND
+  CASH_EQUIV
+}
+
+/// Daily NAV per client. PriceBar gives instrument history; this gives PORTFOLIO
+/// history, which is what risk/drawdown/XIRR actually consume.
+model PortfolioValuation {
+  id              String   @id @default(cuid()) @map("_id")
+  clientId        String
+  date            DateTime
+
+  securitiesValue Float
+  cashValue       Float
+  totalValue      Float
+
+  /// EXTERNAL flows only (deposits/withdrawals). A BUY moves cash into securities
+  /// inside the portfolio and leaves NAV unchanged — counting it here would
+  /// double-count and corrupt the return.
+  netFlow         Float    @default(0)
+
+  /// Flow-adjusted: (V_t - V_{t-1} - F_t) / V_{t-1}. Stored rather than derived on
+  /// read because every risk metric scans this column, and recomputing it needs
+  /// that day's flows from another collection.
+  dailyReturn     Float    @default(0)
+
+  positionCount   Int      @default(0)
+  /// Marks days where a price had to be carried forward. Stale days are excluded
+  /// from volatility — a stale price makes risk read artificially LOW.
+  stale           Boolean  @default(false)
+  source          String   @default("eod-job")
+
+  createdAt DateTime @default(now())
+
+  @@unique([clientId, date])
+  @@map("portfolio_valuations")
+}
+
+/// Precomputed rollups. MongoDB has no GROUP BY across relations, so house-level
+/// analytics are computed once by the nightly job rather than aggregated on every
+/// read. This is the concession that makes 1000+ clients viable on Mongo; it costs
+/// eventual consistency on house figures.
+model AnalyticsCache {
+  id         String   @id @default(cuid()) @map("_id")
+  /// "house" | "client:<id>" | "overlap"
+  scope      String
+  metric     String
+  asOf       DateTime
+  payload    Json
+  /// Fingerprint of the inputs, including a calcVersion that is bumped whenever a
+  /// calculator's logic changes — otherwise a fixed formula keeps serving stale
+  /// wrong numbers from cache, invisibly.
+  inputHash  String
+
+  computedAt DateTime @default(now())
+
+  @@unique([scope, metric, asOf])
+  @@index([scope, asOf])
+  @@map("analytics_cache")
+}

@@ -1,0 +1,143 @@
+import { Transform } from 'class-transformer';
+import {
+  IsBoolean,
+  IsString,
+  IsEnum,
+  IsNumber,
+  IsOptional,
+  IsNotEmpty,
+  IsDateString,
+  MaxLength,
+  Min,
+  Max,
+} from 'class-validator';
+
+// The API contract is lowercase (it matches the frontend `Client` type);
+// Prisma stores the uppercase variants. ClientsService maps between them.
+export enum RiskProfile {
+  CONSERVATIVE = 'conservative',
+  MODERATE = 'moderate',
+  AGGRESSIVE = 'aggressive',
+}
+
+export enum ClientStatus {
+  ACTIVE = 'active',
+  INACTIVE = 'inactive',
+  CLOSED = 'closed',
+}
+
+/**
+ * Which ledger rows drive this client's XIRR.
+ *
+ * transactional — every buy is money in, every sell is money out.
+ * cash_flow     — only the inflows/outflows the client actually handed over.
+ */
+export enum AccountingMethod {
+  TRANSACTIONAL = 'transactional',
+  CASH_FLOW = 'cash_flow',
+}
+
+const trim = () =>
+  Transform(({ value }) => (typeof value === 'string' ? value.trim() : value));
+
+const lower = () =>
+  Transform(({ value }) =>
+    typeof value === 'string' ? value.trim().toLowerCase() : value
+  );
+
+export class CreateClientDto {
+  @IsString()
+  @IsNotEmpty({ message: 'Client name is required' })
+  @MaxLength(120)
+  @trim()
+  name: string;
+
+  @IsString()
+  @IsNotEmpty({ message: 'Broker is required' })
+  @MaxLength(120)
+  @trim()
+  broker: string;
+
+  @IsString()
+  @IsNotEmpty({ message: 'Account number is required' })
+  @MaxLength(64)
+  @trim()
+  accountNumber: string;
+
+  @IsString()
+  @IsNotEmpty({ message: 'Benchmark is required' })
+  @MaxLength(64)
+  @trim()
+  benchmark: string;
+
+  @IsEnum(RiskProfile, {
+    message: 'riskProfile must be conservative, moderate, or aggressive',
+  })
+  @lower()
+  riskProfile: RiskProfile;
+
+  // Required on create: this decides how the client's return is computed for the
+  // life of the mandate, and there is no default that is right for everyone.
+  // (Prisma defaults it to CASH_FLOW so that clients created before this field
+  // existed keep the behaviour they already had.)
+  @IsEnum(AccountingMethod, {
+    message: 'accountingMethod must be transactional or cash_flow',
+  })
+  @lower()
+  accountingMethod: AccountingMethod;
+
+  // Both default true (see schema.prisma). They only affect TRANSACTIONAL
+  // clients: under cash_flow, dividends and fees are already inside the terminal
+  // value, and counting them as flows too would double-count them.
+  @IsBoolean()
+  @IsOptional()
+  includeDividends?: boolean;
+
+  @IsBoolean()
+  @IsOptional()
+  includeFees?: boolean;
+
+  @IsString()
+  @IsOptional()
+  @MaxLength(3)
+  @Transform(({ value }) =>
+    typeof value === 'string' ? value.trim().toUpperCase() : value
+  )
+  currency?: string;
+
+  @IsEnum(ClientStatus, {
+    message: 'status must be active, inactive, or closed',
+  })
+  @IsOptional()
+  @lower()
+  status?: ClientStatus;
+
+  @IsNumber()
+  @Min(0)
+  @IsOptional()
+  cashBalance?: number;
+
+  @IsNumber()
+  @Min(0)
+  @IsOptional()
+  portfolioValue?: number;
+
+  // Required on create: the fee report can't compute anything meaningful
+  // without a rate. 0 is a valid, explicit "no fee" — that's different from
+  // "not entered yet", so this is not optional.
+  @IsNumber()
+  @Min(0)
+  @Max(100, { message: 'feeRatePercent must be a percentage between 0 and 100' })
+  feeRatePercent: number;
+
+  // Required on create: prorating the first billing quarter needs a real
+  // mandate start date, not the record's createdAt timestamp.
+  @IsDateString({}, { message: 'inceptionDate must be a valid date' })
+  inceptionDate: string;
+
+  @IsString()
+  @IsOptional()
+  @MaxLength(2000)
+  @trim()
+  notes?: string;
+}
