@@ -7,6 +7,7 @@ export interface HoldingMover {
   company: string;
   clientId: string;
   marketValue: number;
+  currentPrice: number;
   changePercent: number;
 }
 
@@ -14,6 +15,7 @@ export interface MarketQuote {
   code: string;
   label: string;
   symbol: string;
+  currentPrice: number | null;
   dayChangePercent: number | null;
   ytdChangePercent: number | null;
 }
@@ -89,6 +91,7 @@ export class DashboardService {
         company: h.company,
         clientId: h.clientId,
         marketValue: h.marketValue,
+        currentPrice: last.close,
         changePercent: ((last.close - prior.close) / prior.close) * 100,
       });
     }
@@ -108,9 +111,10 @@ export class DashboardService {
       all.map(async (entry) => {
         try {
           const bars = await this.market.history(entry.symbol, from);
-          return { ...entry, ...changeFromBars(bars, ytdBase) };
+          const currentPrice = bars.length > 0 ? bars[bars.length - 1].close : null;
+          return { ...entry, currentPrice, ...changeFromBars(bars, ytdBase) };
         } catch {
-          return { ...entry, dayChangePercent: null, ytdChangePercent: null };
+          return { ...entry, currentPrice: null, dayChangePercent: null, ytdChangePercent: null };
         }
       }),
     );

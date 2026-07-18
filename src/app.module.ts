@@ -11,6 +11,7 @@ import { WatchlistModule } from './watchlist/watchlist.module';
 import { MarketModule } from './market/market.module';
 import { AnalyticsModule } from './analytics/analytics.module';
 import { ReportsModule } from './reports/reports.module';
+import { EventsModule } from './events/events.module';
 
 @Module({
   imports: [
@@ -26,6 +27,7 @@ import { ReportsModule } from './reports/reports.module';
     MarketModule,
     AnalyticsModule,
     ReportsModule,
+    EventsModule,
   ],
 })
 export class AppModule {}

@@ -104,37 +104,34 @@ export class PerformanceService {
     /**
      * Cash.
      *
-     * The naive rule — "always derive, never trust the stored scalar" — is right
-     * about market value but WRONG about cash, and the live book proves it. Atlas
-     * Global Fund maintains a $51,800 buying-power balance. The ledger's four
-     * contributions ($188,780.68) were spent almost entirely on stock
-     * ($188,735.80 of cost basis), so deriving cash from the ledger gives $44.88:
-     * the change left over from the deposits. Both figures are real; they are
-     * simply answers to different questions.
+     * TRANSACTIONAL clients never carry cash flows in the Excel/ledger sense —
+     * idle cash is excluded from the method entirely (see the terminal-value
+     * comment below), so there is nothing to reconcile against the ledger. We
+     * take client.cashBalance as-is, whatever it is: it is the maintained
+     * buying-power balance, not something the ledger is expected to explain.
      *
-     *   derived  = what the RECORDED FLOWS leave behind        ($44.88)
-     *   stored   = the buying power actually maintained        ($51,800)
+     * CASH_FLOW clients are different: cash IS part of the terminal value for
+     * them, so a ledger that doesn't account for the maintained balance is a
+     * real data gap worth surfacing (see `cashIsExplained` below and the
+     * `insufficient` branch it feeds).
      *
-     * The stored balance is the true cash position: it includes money that
-     * predates the flow series (the opening balance) and was never a recorded
-     * deposit. It is what the client can actually trade with, so it is what cash
-     * weight and cash drag must be measured on.
+     *   derived  = what the RECORDED FLOWS leave behind
+     *   stored   = the buying power actually maintained
      *
-     * We therefore prefer the stored balance when the ledger cannot fully account
-     * for the book, and derive only when it can. The `cashSource` field on the
-     * response says which was used, every time — a cash figure without its
+     * For CASH_FLOW we prefer the stored balance when the ledger cannot fully
+     * account for the book, and derive only when it can. The `cashSource` field
+     * on the response says which was used — a cash figure without its
      * provenance is not something an operator can act on.
      */
     const ledgerExplainsBook = cashIsExplained(ledger, holdingsValue);
     const ledgerCash = derivedCash(ledger);
 
-    // A maintained balance the ledger doesn't account for is not an error — but
-    // it is a fact the reader needs, because it is exactly the cash that creates
-    // the drag this client is exposed to.
     const cashSource: 'ledger' | 'stored' =
-      ledgerExplainsBook && Math.abs(client.cashBalance - ledgerCash) <= 0.01
-        ? 'ledger'
-        : 'stored';
+      method === 'TRANSACTIONAL'
+        ? 'stored'
+        : ledgerExplainsBook && Math.abs(client.cashBalance - ledgerCash) <= 0.01
+          ? 'ledger'
+          : 'stored';
 
     const cash = cashSource === 'ledger' ? ledgerCash : client.cashBalance;
     const portfolioValue = holdingsValue + cash;
@@ -466,8 +463,12 @@ export class PerformanceService {
      * What the reader actually needs to know is that the flow series does not
      * account for the whole cash position — which matters, because that
      * unaccounted cash is precisely what generates the cash drag on this client.
+     *
+     * TRANSACTIONAL clients never derive cash from the ledger in the first
+     * place (see the cash comment in `forClient`), so there is nothing to
+     * reconcile and nothing to warn about — only CASH_FLOW clients see this.
      */
-    if (cashSource === 'stored') {
+    if (method === 'CASH_FLOW' && cashSource === 'stored') {
       const unaccounted = cashUsed - ledgerCash;
 
       if (Math.abs(unaccounted) > 0.01) {
