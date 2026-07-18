@@ -2,6 +2,15 @@ import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { ALL_METRICS, MetricName, PILLAR_METRICS, Pillar } from './scoring-metrics';
 
+// Matches seed-scoring-rules.ts's NEG_INF/POS_INF (-999999/999999) — the finite
+// stand-ins for -Infinity/+Infinity used because ScoringRule's bounds are
+// finite DB columns. A raw-dollar metric (Free Cash Flow, Enterprise Value)
+// can exceed 999999 for a real company, so `value < maximumValue` would wrongly
+// reject it on the very band meant to catch "everything above X" — comparing
+// against THIS constant, not the literal column value, is what makes a band
+// whose bound IS the sentinel open-ended regardless of the metric's scale.
+const INFINITY_SENTINEL = 999999;
+
 export interface MetricInput {
   metric: MetricName;
   /** Null when the underlying data point wasn't available — see `computeMetric`. */
@@ -92,7 +101,18 @@ export class ScoringEngine {
       return { pillar, metric, value, matchedRange: null, score: null, weight, contribution: 0 };
     }
 
-    const matched = rules.find((r) => value >= r.minimumValue && value < r.maximumValue);
+    // Seed data stands in for -Infinity/+Infinity with a large finite sentinel
+    // (see seed-scoring-rules.ts), because these are finite DB columns. Some
+    // metrics (Free Cash Flow, Enterprise Value, ...) are raw dollar amounts
+    // that routinely exceed that sentinel, so a literal `value < maximumValue`
+    // comparison would reject a real value as out of range on the very band
+    // meant to catch "everything above X". Any band whose max/min IS the
+    // sentinel is therefore treated as open-ended on that side.
+    const matched = rules.find(
+      (r) =>
+        (r.minimumValue <= -INFINITY_SENTINEL || value >= r.minimumValue) &&
+        (r.maximumValue >= INFINITY_SENTINEL || value < r.maximumValue),
+    );
     if (!matched) {
       return { pillar, metric, value, matchedRange: null, score: null, weight, contribution: 0 };
     }

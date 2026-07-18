@@ -104,6 +104,56 @@ export function isFlowType(
 }
 
 /**
+ * Types that get same-day netting under the transactional method: a client who
+ * buys ten $10k positions in one session gave the portfolio one $100k trade,
+ * not ten separate cash-flow events. XIRR treats each flow date as one client
+ * decision, so ten rows on the same day would overweight that day's trading
+ * activity relative to a single $100k buy made on a quieter day.
+ *
+ * DIVIDEND and FEES are deliberately NOT netted here: they are per-event cash
+ * (a dividend per holding, a fee charge), not a batch of orders placed as one
+ * trading decision, so each row already represents its own real-world event.
+ */
+const NETTABLE_TYPES = new Set(['BUY', 'SELL']);
+
+function dateKey(d: Date): string {
+  return d.toISOString().slice(0, 10);
+}
+
+/**
+ * Turn already flow-eligible ledger rows into signed cash flows, netting same-day
+ * BUY/SELL rows into one flow per day (per the NETTABLE_TYPES rationale above).
+ * Non-nettable rows (DIVIDEND, FEES) each become their own flow, one per row.
+ */
+function toNettedCashFlows(eligible: LedgerEntry[]): CashFlow[] {
+  const buckets = new Map<string, number>();
+  const passthrough: CashFlow[] = [];
+
+  for (const t of eligible) {
+    // Magnitude, not the stored sign: the ledger is not consistent about whether
+    // a withdrawal is written as -5000 or 5000, and the TYPE is the reliable signal.
+    const signedAmount = OUTFLOW_TYPES.has(t.type) ? -Math.abs(t.amount) : Math.abs(t.amount);
+
+    if (!NETTABLE_TYPES.has(t.type)) {
+      passthrough.push({ date: t.date, amount: signedAmount });
+      continue;
+    }
+
+    // Net BUY and SELL against each other within the same day so that a buy and
+    // a sell on the same day still produce one flow, signed by which side won.
+    const key = dateKey(t.date);
+    buckets.set(key, (buckets.get(key) ?? 0) + signedAmount);
+  }
+
+  const netted = [...buckets.entries()].map(([key, amount]) => ({
+    date: new Date(key),
+    amount,
+  }));
+
+  return [...passthrough, ...netted];
+}
+
+/**
  * Build the XIRR series for a client.
  *
  * `terminalValue` is the book's worth today (securities + cash) and closes the
@@ -119,11 +169,9 @@ export function buildFlows(
   asOf: Date,
   opts: FlowOptions = {},
 ): FlowBuildResult {
-  const relevant = ledger
-    .filter((t) => isFlowType(t.type, method, opts))
-    .sort((a, b) => a.date.getTime() - b.date.getTime());
+  const eligible = ledger.filter((t) => isFlowType(t.type, method, opts));
 
-  if (relevant.length === 0) {
+  if (eligible.length === 0) {
     return {
       status: 'insufficient',
       reason:
@@ -133,15 +181,17 @@ export function buildFlows(
     };
   }
 
-  const flows: CashFlow[] = relevant.map((t) => ({
-    date: t.date,
-    // Magnitude, not the stored sign: the ledger is not consistent about whether a
-    // withdrawal is written as -5000 or 5000, and the TYPE is the reliable signal.
-    amount: OUTFLOW_TYPES.has(t.type)
-      ? -Math.abs(t.amount)
-      : Math.abs(t.amount),
-  }));
+  // Only the transactional method nets same-day BUY/SELL rows: under CASH_FLOW,
+  // trades are not flows at all, so there is nothing here to net.
+  const flows =
+    method === 'TRANSACTIONAL'
+      ? toNettedCashFlows(eligible)
+      : eligible.map((t) => ({
+          date: t.date,
+          amount: OUTFLOW_TYPES.has(t.type) ? -Math.abs(t.amount) : Math.abs(t.amount),
+        }));
 
+  flows.sort((a, b) => a.date.getTime() - b.date.getTime());
   flows.push({ date: asOf, amount: terminalValue });
 
   return { status: 'ok', flows };

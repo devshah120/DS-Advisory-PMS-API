@@ -158,6 +158,72 @@ describe('dividends increase the return', () => {
   });
 });
 
+/**
+ * A client who buys ten $10k positions in one session gave the portfolio one
+ * $100k trade, not ten cash-flow events. This is the whole point of the
+ * "one date = one trade" rule: XIRR must see it as a single decision.
+ */
+describe('buildFlows — TRANSACTIONAL same-day netting', () => {
+  it('nets multiple same-day buys into a single flow', () => {
+    const ledger: LedgerEntry[] = [
+      { type: 'BUY', amount: 10000, date: d('2026-05-06') },
+      { type: 'BUY', amount: 10000, date: d('2026-05-06') },
+      { type: 'BUY', amount: 10000, date: d('2026-05-06') },
+    ];
+    const r = buildFlows(ledger, 'TRANSACTIONAL', 33000, d('2026-06-01'));
+    expect(r.status).toBe('ok');
+    if (r.status !== 'ok') return;
+
+    expect(r.flows).toEqual([
+      { date: d('2026-05-06'), amount: -30000 },
+      { date: d('2026-06-01'), amount: 33000 },
+    ]);
+  });
+
+  it('nets a same-day buy and sell into one signed flow', () => {
+    const ledger: LedgerEntry[] = [
+      { type: 'BUY', amount: 10000, date: d('2026-05-06') },
+      { type: 'SELL', amount: 4000, date: d('2026-05-06') },
+    ];
+    const r = buildFlows(ledger, 'TRANSACTIONAL', 6000, d('2026-06-01'));
+    if (r.status !== 'ok') throw new Error('setup');
+
+    expect(r.flows).toEqual([
+      { date: d('2026-05-06'), amount: -6000 }, // net: -10,000 + 4,000
+      { date: d('2026-06-01'), amount: 6000 },
+    ]);
+  });
+
+  it('keeps trades on different days as separate flows', () => {
+    const ledger: LedgerEntry[] = [
+      { type: 'BUY', amount: 10000, date: d('2026-05-06') },
+      { type: 'BUY', amount: 10000, date: d('2026-05-07') },
+    ];
+    const r = buildFlows(ledger, 'TRANSACTIONAL', 20000, d('2026-06-01'));
+    if (r.status !== 'ok') throw new Error('setup');
+
+    expect(r.flows).toEqual([
+      { date: d('2026-05-06'), amount: -10000 },
+      { date: d('2026-05-07'), amount: -10000 },
+      { date: d('2026-06-01'), amount: 20000 },
+    ]);
+  });
+
+  it('does not net DIVIDEND or FEES rows — each stays its own flow', () => {
+    const ledger: LedgerEntry[] = [
+      { type: 'DIVIDEND', amount: 50, date: d('2026-05-06') },
+      { type: 'DIVIDEND', amount: 30, date: d('2026-05-06') },
+      { type: 'FEES', amount: 20, date: d('2026-05-06') },
+    ];
+    const r = buildFlows(ledger, 'TRANSACTIONAL', 1000, d('2026-06-01'));
+    if (r.status !== 'ok') throw new Error('setup');
+
+    // 3 distinct ledger rows + terminal — none merged.
+    expect(r.flows).toHaveLength(4);
+    expect(r.flows.filter((f) => f.date.getTime() === d('2026-05-06').getTime())).toHaveLength(3);
+  });
+});
+
 describe('totals', () => {
   it('sums contributions and withdrawals without swallowing the terminal value', () => {
     const r = buildFlows(LEDGER, 'CASH_FLOW', 95000, ASOF);
