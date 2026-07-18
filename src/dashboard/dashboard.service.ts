@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { MarketService, DailyClose } from '../market/market.service';
+import { HouseService } from '../analytics/services/house.service';
 
 export interface HoldingMover {
   ticker: string;
@@ -9,6 +10,14 @@ export interface HoldingMover {
   marketValue: number;
   currentPrice: number;
   changePercent: number;
+}
+
+export interface TopHolding {
+  ticker: string;
+  company: string;
+  marketValue: number;
+  weight: number;
+  numClients: number;
 }
 
 export interface MarketQuote {
@@ -38,14 +47,17 @@ export class DashboardService {
   constructor(
     private prisma: PrismaService,
     private market: MarketService,
+    private house: HouseService,
   ) {}
 
   async getOverview() {
-    const [clients, holdings] = await Promise.all([
+    const [clients, stored, exposure] = await Promise.all([
       this.prisma.client.count(),
       this.prisma.holding.findMany(),
+      this.house.exposure(),
     ]);
 
+    const holdings = await this.withLiveMarketValue(stored);
     const totalAUM = holdings.reduce((sum, h) => sum + h.marketValue, 0);
     const movers = await this.dailyMovers(holdings);
 
@@ -55,7 +67,71 @@ export class DashboardService {
       numHoldings: holdings.length,
       topGainers: movers.filter((m) => m.changePercent != null).slice(0, 3),
       topLosers: [...movers].reverse().slice(0, 3),
+      // House-wide, not per-client: every client's holdings merged into one
+      // book before grouping by sector, with ETFs exploded via look-through.
+      sectorAllocation: exposure.data.sectors,
+      // Same book, grouped by ticker instead of sector: one row per stock
+      // regardless of how many clients hold it, ranked by combined market value.
+      topHoldings: this.topHoldingsByTicker(holdings, totalAUM),
     };
+  }
+
+  /**
+   * Recomputes marketValue from a live quote per distinct ticker, so AUM and
+   * top-holdings match what the holdings page now shows instead of the
+   * DB's last-saved price. A ticker whose live quote fails to resolve keeps
+   * its stored marketValue rather than dropping out of the total.
+   */
+  private async withLiveMarketValue<T extends { ticker: string; quantity: number; marketValue: number }>(
+    holdings: T[],
+  ): Promise<T[]> {
+    const tickers = [...new Set(holdings.map((h) => h.ticker))];
+    const quotes = new Map<string, number>();
+
+    await Promise.all(
+      tickers.map(async (ticker) => {
+        try {
+          const { currentPrice } = await this.market.lookup(ticker);
+          if (typeof currentPrice === 'number') quotes.set(ticker, currentPrice);
+        } catch {
+          // Keep the stored marketValue for this ticker.
+        }
+      }),
+    );
+
+    return holdings.map((h) => {
+      const livePrice = quotes.get(h.ticker);
+      if (livePrice == null) return h;
+      return { ...h, marketValue: h.quantity * livePrice };
+    });
+  }
+
+  /** Combines one ticker's positions across every client into a single ranked row. */
+  private topHoldingsByTicker(
+    holdings: Array<{ ticker: string; company: string; clientId: string; marketValue: number }>,
+    totalAUM: number,
+  ): TopHolding[] {
+    const byTicker = new Map<string, { company: string; marketValue: number; clientIds: Set<string> }>();
+
+    for (const h of holdings) {
+      const entry = byTicker.get(h.ticker);
+      if (entry) {
+        entry.marketValue += h.marketValue;
+        entry.clientIds.add(h.clientId);
+      } else {
+        byTicker.set(h.ticker, { company: h.company, marketValue: h.marketValue, clientIds: new Set([h.clientId]) });
+      }
+    }
+
+    return [...byTicker.entries()]
+      .map(([ticker, v]) => ({
+        ticker,
+        company: v.company,
+        marketValue: v.marketValue,
+        weight: totalAUM > 0 ? v.marketValue / totalAUM : 0,
+        numClients: v.clientIds.size,
+      }))
+      .sort((a, b) => b.marketValue - a.marketValue);
   }
 
   /**

@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { PrismaModule } from '../common/prisma/prisma.module';
+import { MarketModule } from '../market/market.module';
 import { AnalyticsController } from './analytics.controller';
 import { SnapshotService } from './services/snapshot.service';
 import { ExposureService } from './services/exposure.service';
@@ -8,7 +9,7 @@ import { PerformanceService } from './services/performance.service';
 import { WorkbookImportService } from './ingestion/workbook-import.service';
 
 @Module({
-  imports: [PrismaModule],
+  imports: [PrismaModule, MarketModule],
   controllers: [AnalyticsController],
   providers: [
     SnapshotService,

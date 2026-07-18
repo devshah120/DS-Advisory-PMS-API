@@ -25,7 +25,10 @@ export class HouseService {
     const snaps = await this.snapshots.forAllClients();
 
     const profile = exposureProfile(house);
-    const sectors = allocationBy(house, 'sector');
+    // Look-through matters for sector exactly like it does for region: an ETF
+    // is classified as its own thing (e.g. "Diversified") unless exploded into
+    // its constituents' real sectors.
+    const sectors = allocationBy(house, 'sector', { lookThrough: true });
     const industries = allocationBy(house, 'industry');
     const regions = allocationBy(house, 'region', { lookThrough: true });
 
@@ -65,7 +68,10 @@ export class HouseService {
       meta: {
         asOf: house.asOf,
         denominator: sectors.denominator,
+        // Both use look-through and can each carry their own unmapped share —
+        // collapsing to one field silently hid whichever wasn't reported.
         unclassifiedWeight: regions.unclassifiedWeight,
+        sectorUnclassifiedWeight: sectors.unclassifiedWeight,
       },
     };
   }

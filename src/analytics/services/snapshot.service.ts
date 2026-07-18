@@ -1,5 +1,6 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../../common/prisma/prisma.service';
+import { MarketService } from '../../market/market.service';
 import {
   AssetClass,
   Classification,
@@ -17,7 +18,12 @@ import {
  */
 @Injectable()
 export class SnapshotService {
-  constructor(private prisma: PrismaService) {}
+  private readonly logger = new Logger(SnapshotService.name);
+
+  constructor(
+    private prisma: PrismaService,
+    private market: MarketService,
+  ) {}
 
   /** Classification cache. A few hundred documents, effectively static. */
   private profileCache: Map<string, Classification> | null = null;
@@ -57,6 +63,29 @@ export class SnapshotService {
    * the CRUD UI and they are already known to drift (the live client "Dev" had
    * portfolioValue = 0 against $40,702 of holdings).
    */
+  /**
+   * Live quote per distinct ticker held anywhere in `holdings`. A ticker whose
+   * quote fails to resolve is simply absent from the map, and `toPosition`
+   * falls back to the holding's stored `currentPrice` for it.
+   */
+  private async liveQuotes(holdings: Array<{ ticker: string }>): Promise<Map<string, number>> {
+    const tickers = [...new Set(holdings.map((h) => h.ticker))];
+    const quotes = new Map<string, number>();
+
+    await Promise.all(
+      tickers.map(async (ticker) => {
+        try {
+          const { currentPrice } = await this.market.lookup(ticker);
+          if (typeof currentPrice === 'number') quotes.set(ticker, currentPrice);
+        } catch (error) {
+          this.logger.warn(`Live price lookup failed for ${ticker}: ${(error as Error).message}`);
+        }
+      }),
+    );
+
+    return quotes;
+  }
+
   async forClient(clientId: string): Promise<PortfolioSnapshot> {
     const client = await this.prisma.client.findUnique({
       where: { id: clientId },
@@ -65,6 +94,8 @@ export class SnapshotService {
     if (!client) throw new NotFoundException(`Client ${clientId} not found`);
 
     const profiles = await this.profiles();
+    const open = client.holdings.filter((h) => h.quantity !== 0); // closed positions are not exposures
+    const quotes = await this.liveQuotes(open);
 
     return {
       clientId: client.id,
@@ -72,9 +103,7 @@ export class SnapshotService {
       asOf: new Date(),
       baseCurrency: client.currency,
       cash: client.cashBalance,
-      positions: client.holdings
-        .filter((h) => h.quantity !== 0) // closed positions are not exposures
-        .map((h) => this.toPosition(h, profiles)),
+      positions: open.map((h) => this.toPosition(h, profiles, quotes)),
     };
   }
 
@@ -85,6 +114,8 @@ export class SnapshotService {
     });
 
     const profiles = await this.profiles();
+    const allOpen = clients.flatMap((c) => c.holdings.filter((h) => h.quantity !== 0));
+    const quotes = await this.liveQuotes(allOpen);
 
     return clients.map((c) => ({
       clientId: c.id,
@@ -92,7 +123,9 @@ export class SnapshotService {
       asOf: new Date(),
       baseCurrency: c.currency,
       cash: c.cashBalance,
-      positions: c.holdings.filter((h) => h.quantity !== 0).map((h) => this.toPosition(h, profiles)),
+      positions: c.holdings
+        .filter((h) => h.quantity !== 0)
+        .map((h) => this.toPosition(h, profiles, quotes)),
     }));
   }
 
@@ -148,9 +181,12 @@ export class SnapshotService {
     };
   }
 
-  private toPosition(h: any, profiles: Map<string, Classification>): Position {
-    // DERIVED. Never h.marketValue.
-    const marketValue = h.quantity * h.currentPrice;
+  private toPosition(h: any, profiles: Map<string, Classification>, quotes: Map<string, number>): Position {
+    // DERIVED. Never h.marketValue. Prefer the live quote over the stored
+    // currentPrice; the stored value is a display cache from the last CRUD
+    // write and goes stale the moment the market moves.
+    const price = quotes.get(h.ticker) ?? h.currentPrice;
+    const marketValue = h.quantity * price;
     const costBasisTotal = h.quantity * h.averageCost;
 
     const classification: Classification = profiles.get(h.ticker) ?? {
@@ -169,7 +205,7 @@ export class SnapshotService {
       ticker: h.ticker,
       company: h.company,
       quantity: h.quantity,
-      price: h.currentPrice,
+      price,
       costBasis: h.averageCost,
       costBasisTotal,
       marketValue,

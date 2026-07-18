@@ -1,5 +1,6 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../common/prisma/prisma.service';
+import { MarketService } from '../market/market.service';
 import { CreateHoldingDto } from './dto/create-holding.dto';
 import { UpdateHoldingDto } from './dto/update-holding.dto';
 
@@ -12,7 +13,48 @@ function derive(quantity: number, averageCost: number, currentPrice: number) {
 
 @Injectable()
 export class HoldingsService {
-  constructor(private prisma: PrismaService) {}
+  private readonly logger = new Logger(HoldingsService.name);
+
+  constructor(
+    private prisma: PrismaService,
+    private market: MarketService,
+  ) {}
+
+  /**
+   * Overlays each holding's stored `currentPrice`/`marketValue`/`unrealizedPnL`
+   * with a live quote. The DB row stays untouched (it's the cost-basis ledger,
+   * not a price cache) — this only affects what a read returns. One ticker
+   * lookup per distinct symbol, shared across every client holding it, and a
+   * failed quote just falls back to the last stored price rather than failing
+   * the whole list.
+   */
+  private async withLivePrices<T extends { ticker: string; quantity: number; averageCost: number; currentPrice: number }>(
+    holdings: T[],
+  ): Promise<T[]> {
+    const tickers = [...new Set(holdings.map((h) => h.ticker))];
+    const quotes = new Map<string, number>();
+
+    await Promise.all(
+      tickers.map(async (ticker) => {
+        try {
+          const { currentPrice } = await this.market.lookup(ticker);
+          if (typeof currentPrice === 'number') quotes.set(ticker, currentPrice);
+        } catch (error) {
+          this.logger.warn(`Live price lookup failed for ${ticker}: ${(error as Error).message}`);
+        }
+      }),
+    );
+
+    return holdings.map((h) => {
+      const livePrice = quotes.get(h.ticker);
+      if (livePrice == null) return h;
+      return {
+        ...h,
+        currentPrice: livePrice,
+        ...derive(h.quantity, h.averageCost, livePrice),
+      };
+    });
+  }
 
   /**
    * Records a buy or a sell against a client's position in a ticker.
@@ -92,18 +134,20 @@ export class HoldingsService {
     });
   }
 
-  findAll() {
-    return this.prisma.holding.findMany({
+  async findAll() {
+    const holdings = await this.prisma.holding.findMany({
       include: {
         client: true,
       },
     });
+    return this.withLivePrices(holdings);
   }
 
-  findByClient(clientId: string) {
-    return this.prisma.holding.findMany({
+  async findByClient(clientId: string) {
+    const holdings = await this.prisma.holding.findMany({
       where: { clientId },
     });
+    return this.withLivePrices(holdings);
   }
 
   findOne(id: string) {
@@ -138,18 +182,20 @@ export class HoldingsService {
   }
 
   async getByTicker(ticker: string) {
-    return this.prisma.holding.findMany({
+    const holdings = await this.prisma.holding.findMany({
       where: { ticker },
       include: {
         client: true,
       },
     });
+    return this.withLivePrices(holdings);
   }
 
   async getSectorExposure(clientId: string) {
-    const holdings = await this.prisma.holding.findMany({
+    const stored = await this.prisma.holding.findMany({
       where: { clientId },
     });
+    const holdings = await this.withLivePrices(stored);
 
     const sectors = holdings.reduce((acc: Record<string, { value: number; holdings: number }>, h: any) => {
       if (!acc[h.sector]) {
