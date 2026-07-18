@@ -365,6 +365,166 @@ model PortfolioValuation {
   @@map("portfolio_valuations")
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Fundamentals Engine — see FUNDAMENTALS_ARCHITECTURE.md
+//
+// Three collections, one direction of dependency: FundamentalSnapshot (raw,
+// provider-sourced) -> ScoringRule (operator-authored, provider-agnostic) ->
+// FundamentalScore (derived, cached). Nothing here is read by any of the
+// modules listed as already-existing (Holdings, Dashboard, Transactions,
+// Performance, Reports, Live Prices, Portfolio Analytics) and nothing here
+// reads from them either — the engine is additive.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One symbol's raw fundamental data, as last fetched from the active provider.
+/// This is the ONLY collection a provider adapter is allowed to write to —
+/// everything downstream (scoring, industry comparison, explanations) reads
+/// this shape and never touches the provider's response directly, which is
+/// what makes swapping FMP for Finnhub/AlphaVantage/Polygon a provider-layer
+/// change only.
+model FundamentalSnapshot {
+  id       String @id @default(cuid()) @map("_id")
+  symbol   String @unique
+
+  // ── Company information ────────────────────────────────────────────────
+  company    String
+  sector     String  @default("Unclassified")
+  industry   String  @default("Unclassified")
+  marketCap  Float?
+
+  // ── Valuation ───────────────────────────────────────────────────────────
+  peRatio          Float?
+  forwardPe        Float?
+  pegRatio         Float?
+  evToEbitda       Float?
+  priceToSales     Float?
+  priceToBook      Float?
+  enterpriseValue  Float?
+
+  // ── Growth ──────────────────────────────────────────────────────────────
+  revenueQoqPercent    Float?
+  revenueYoyPercent    Float?
+  netProfitQoqPercent  Float?
+  netProfitYoyPercent  Float?
+  revenueCagr3y        Float?
+  netProfitCagr3y       Float?
+
+  // ── Profitability ───────────────────────────────────────────────────────
+  roe              Float?
+  roic             Float?
+  grossMargin      Float?
+  operatingMargin  Float?
+  netMargin        Float?
+
+  // ── Financial strength ──────────────────────────────────────────────────
+  debtToEquity      Float?
+  currentRatio      Float?
+  interestCoverage  Float?
+  freeCashFlow      Float?
+
+  // ── Momentum ────────────────────────────────────────────────────────────
+  /// Average of the last up-to-4 quarters' (actual - estimated) / |estimated|,
+  /// as a percent. Null when the provider has no estimate to compare against.
+  lastFourEarningsBeatPercent  Float?
+  nextEarningsDate             DateTime?
+  /// Derived at read time from nextEarningsDate in the service layer, NOT
+  /// stored — "days until" only means something relative to today, and
+  /// storing it would go stale the moment a day passes without a refresh.
+
+  // ── Dividend ────────────────────────────────────────────────────────────
+  dividendYield      Float?
+  dividendPerShare   Float?
+  exDividendDate     DateTime?
+  paymentDate        DateTime?
+
+  /// "fmp" today; any adapter implementing FundamentalsProvider sets its own key.
+  source     String   @default("fmp")
+  refreshedAt DateTime @default(now())
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([sector])
+  @@index([industry])
+  @@map("fundamental_snapshots")
+}
+
+/// One row = one banded rule for one metric under one strategy. The scoring
+/// engine is ONLY this table plus a range lookup — there is deliberately no
+/// switch/if-chain in code mapping a metric name to a score. Adding a new
+/// factor, re-tuning a band, or authoring an entirely new strategy (Growth,
+/// Value, Quality, Dividend, Small Cap, AI, ...) is a data change: insert
+/// rows here, restart nothing, ship nothing.
+///
+/// A metric's rows within one strategy must tile the number line with no gaps
+/// and no overlaps for the engine to always find exactly one match; the seed
+/// data follows that convention but it is not (and cannot be) enforced by the
+/// database schema itself, so treat it as a contract for anyone authoring rules.
+model ScoringRule {
+  id       String @id @default(cuid()) @map("_id")
+
+  /// e.g. "Revenue YoY", "ROIC", "PE vs Industry" — must match the key the
+  /// ScoringEngine looks up for that pillar's metric. See scoring-metrics.ts.
+  metricName   String
+  minimumValue Float
+  maximumValue Float
+  /// Points awarded [0..100] when the metric falls in [minimumValue, maximumValue).
+  score        Float
+  /// This metric's weight (points out of the pillar's total) under this strategy.
+  /// Duplicated on every band row for the same metric+strategy by design —
+  /// weight is a property of the METRIC, banding is a property of the VALUE,
+  /// and keeping them on one row is what lets the engine compute
+  /// `score/100 * weight` from a single matched record with no join.
+  weight       Float
+  /// "GARP" | "Growth" | "Value" | "Quality" | "Dividend" | "Small Cap" | "AI" | ...
+  /// Free text on purpose: a brand-new strategy is rows with a new string here,
+  /// never a schema migration or an enum change.
+  strategy     String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([strategy, metricName])
+  @@map("scoring_rules")
+}
+
+/// One symbol's computed Atlas Fundamental Score under one strategy, cached so
+/// the watchlist doesn't re-run five pillars' worth of rule lookups on every
+/// render. Recomputed by the same daily refresh that pulls fresh snapshots,
+/// and on demand if a caller asks for a symbol/strategy pair with no cache row.
+model FundamentalScore {
+  id       String @id @default(cuid()) @map("_id")
+  symbol   String
+  /// Matches ScoringRule.strategy — one symbol can be scored under several
+  /// strategies at once (e.g. both "GARP" and "Growth") without collision.
+  strategy String
+
+  overallScore            Float
+  growthScore              Float
+  profitabilityScore       Float
+  financialStrengthScore   Float
+  valuationScore           Float
+  momentumScore            Float
+
+  /// Per-metric breakdown: [{ metric, value, matchedRange, score, weight,
+  /// contribution, pillar }, ...]. This is what powers the "hover for full
+  /// breakdown" requirement — the UI renders this directly rather than
+  /// re-deriving it, so the tooltip can never disagree with the number
+  /// next to it.
+  breakdown  Json
+
+  /// { strengths: string[], weaknesses: string[] } — see ExplanationEngine.
+  explanation Json
+
+  industryComparison Json?
+
+  computedAt DateTime @default(now())
+
+  @@unique([symbol, strategy])
+  @@index([strategy, overallScore])
+  @@map("fundamental_scores")
+}
+
 /// Precomputed rollups. MongoDB has no GROUP BY across relations, so house-level
 /// analytics are computed once by the nightly job rather than aggregated on every
 /// read. This is the concession that makes 1000+ clients viable on Mongo; it costs

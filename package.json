@@ -17,7 +17,8 @@
     "test:watch": "jest --watch",
     "test:cov": "jest --coverage",
     "test:debug": "node --inspect-brk -r tsconfig-paths/register node_modules/.bin/jest --runInBand",
-    "import:workbook": "ts-node -r tsconfig-paths/register src/analytics/ingestion/import-workbook.cli.ts"
+    "import:workbook": "ts-node -r tsconfig-paths/register src/analytics/ingestion/import-workbook.cli.ts",
+    "seed:scoring-rules": "ts-node -r tsconfig-paths/register src/fundamentals/seed-scoring-rules.ts"
   },
   "dependencies": {
     "@nestjs/common": "^10.2.8",
@@ -25,6 +26,7 @@
     "@nestjs/jwt": "^11.0.1",
     "@nestjs/passport": "^10.0.2",
     "@nestjs/platform-express": "^10.2.8",
+    "@nestjs/schedule": "^6.1.3",
     "@prisma/client": "^5.6.0",
     "bcrypt": "^5.1.1",
     "class-transformer": "^0.5.1",
@@ -41,13 +43,19 @@
     "xlsx": "^0.18.5"
   },
   "jest": {
-    "moduleFileExtensions": ["js", "json", "ts"],
+    "moduleFileExtensions": [
+      "js",
+      "json",
+      "ts"
+    ],
     "rootDir": "src",
     "testRegex": ".*\\.spec\\.ts$",
     "transform": {
       "^.+\\.(t|j)s$": "ts-jest"
     },
-    "collectCoverageFrom": ["**/*.(t|j)s"],
+    "collectCoverageFrom": [
+      "**/*.(t|j)s"
+    ],
     "coverageDirectory": "../coverage",
     "testEnvironment": "node"
   },

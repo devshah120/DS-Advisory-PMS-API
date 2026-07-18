@@ -12,6 +12,7 @@ import { MarketModule } from './market/market.module';
 import { AnalyticsModule } from './analytics/analytics.module';
 import { ReportsModule } from './reports/reports.module';
 import { EventsModule } from './events/events.module';
+import { FundamentalsModule } from './fundamentals/fundamentals.module';
 
 @Module({
   imports: [
@@ -28,6 +29,7 @@ import { EventsModule } from './events/events.module';
     AnalyticsModule,
     ReportsModule,
     EventsModule,
+    FundamentalsModule,
   ],
 })
 export class AppModule {}
