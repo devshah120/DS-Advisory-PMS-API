@@ -83,7 +83,7 @@ export class RefreshScheduler implements OnModuleInit {
             failed.push(symbol);
             continue;
           }
-          await this.repository.upsertSnapshot(raw);
+          await this.repository.upsertSnapshot(raw, this.provider.name);
         } catch (err) {
           failed.push(symbol);
           this.logger.warn(`Snapshot refresh failed for ${symbol}: ${(err as Error).message}`);

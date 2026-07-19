@@ -17,8 +17,9 @@ import { Explanation } from './scoring/explanation.engine';
 export class ApiRepository {
   constructor(private prisma: PrismaService) {}
 
-  upsertSnapshot(raw: RawFundamentals): Promise<FundamentalSnapshot> {
-    const data = { ...raw, source: 'fmp', refreshedAt: new Date() };
+  /** `source` records which provider produced this snapshot (e.g. "finnhub+fmp"); the caller passes the active provider's name so provenance stays honest. */
+  upsertSnapshot(raw: RawFundamentals, source = 'fmp'): Promise<FundamentalSnapshot> {
+    const data = { ...raw, source, refreshedAt: new Date() };
     return this.prisma.fundamentalSnapshot.upsert({
       where: { symbol: raw.symbol },
       create: data,
