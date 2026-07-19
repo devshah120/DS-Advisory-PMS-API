@@ -525,6 +525,41 @@ model FundamentalScore {
   @@map("fundamental_scores")
 }
 
+/// One row = one upcoming corporate event (earnings / dividend / split) as last
+/// fetched from FMP's date-ranged calendars. The Event Center reads THIS, never
+/// FMP directly, so the page keeps working when the FMP request budget is
+/// exhausted or the process just restarted — same durability the Fundamentals
+/// Engine gets from FundamentalSnapshot. A manual refresh (POST /events/refresh)
+/// re-fetches the calendars and upserts these rows; nothing else writes here.
+///
+/// company / clientCount are deliberately NOT stored — they belong to Holding
+/// and would drift the moment a position changes. The service joins them on at
+/// read time. `ticker + type + date` is the natural key: FMP can list at most
+/// one event of a given type per ticker per day.
+model EventSnapshot {
+  id     String @id @default(cuid()) @map("_id")
+  ticker String
+  /// "EARNINGS" | "DIVIDEND" | "SPLIT" — matches WatchlistEventType.
+  type   String
+  /// "E" | "D" | "C" badge code, carried through from the source event.
+  code   String
+  label  String
+  /// ISO date (YYYY-MM-DD) the event falls on.
+  date   String
+  /// "Upcoming" | "Confirmed".
+  status String
+
+  source      String   @default("fmp")
+  refreshedAt DateTime @default(now())
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([ticker, type, date])
+  @@index([ticker])
+  @@map("event_snapshots")
+}
+
 /// Precomputed rollups. MongoDB has no GROUP BY across relations, so house-level
 /// analytics are computed once by the nightly job rather than aggregated on every
 /// read. This is the concession that makes 1000+ clients viable on Mongo; it costs
