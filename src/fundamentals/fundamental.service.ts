@@ -64,12 +64,31 @@ export class FundamentalService {
     return this.computeAndPersist(snapshot, peers, strategy);
   }
 
+  /**
+   * Scored rows for the current symbol universe — the unique tickers across all
+   * clients' holdings plus every watchlist slot.
+   *
+   * The universe scope is applied even when no explicit `symbols` filter is
+   * passed. Serving an unfiltered snapshot list is what let this table show
+   * names nobody owned (MSFT, CAT) alongside pre-Finnhub ETF rows: `refreshAll`
+   * only ever upserts, so a row written under an older universe survives
+   * indefinitely and a purely date-based read has no way to tell it apart from
+   * a live one. An explicit `symbols` argument narrows within the universe
+   * rather than escaping it, so no caller can reach an unowned symbol here.
+   * (Single-symbol lookups still go through `getBySymbol`, which is
+   * deliberately unscoped so an advisor can research a prospect.)
+   */
   async list(strategy = DEFAULT_STRATEGY, symbols?: string[]): Promise<FundamentalView[]> {
-    const snapshots = await this.repository.listSnapshots(symbols);
-    const scores = await this.repository.listScores(
-      strategy,
-      symbols,
-    );
+    const universe = await this.repository.listUniverseSymbols();
+    const requested = symbols?.map((s) => s.trim().toUpperCase()).filter(Boolean);
+    const scope = requested ? universe.filter((s) => requested.includes(s)) : universe;
+
+    // An empty scope must short-circuit: `listSnapshots(undefined)` means "no
+    // filter" downstream, which would serve the whole table — the exact bug.
+    if (scope.length === 0) return [];
+
+    const snapshots = await this.repository.listSnapshots(scope);
+    const scores = await this.repository.listScores(strategy, scope);
     const scoreBySymbol = new Map(scores.map((s) => [s.symbol, s]));
 
     return Promise.all(

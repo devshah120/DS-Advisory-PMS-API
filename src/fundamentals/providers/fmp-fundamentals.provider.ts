@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { FundamentalsProvider, RawFundamentals } from './fundamentals-provider.interface';
+import { isFundVehicle } from './is-fund';
 
 const FMP_BASE = 'https://financialmodelingprep.com/stable';
 const REQUEST_TIMEOUT_MS = 8000;
@@ -58,6 +59,15 @@ export class FmpFundamentalsProvider implements FundamentalsProvider {
       ]);
 
     if (!profile) return null;
+
+    // FMP — unlike Finnhub — serves a profile for ETFs and commodity funds, so
+    // without this guard a country/thematic ETF persists a row whose every
+    // metric is null and whose Atlas score therefore renders as 0. Nothing
+    // downstream can tell that 0 apart from a genuinely bad company.
+    if (isFundVehicle({ symbol, company: profile.companyName, industry: profile.industry, isEtf: profile.isEtf, isFund: profile.isFund })) {
+      this.logger.debug(`Skipping ${symbol} — pooled vehicle (ETF/fund), no company fundamentals to score`);
+      return null;
+    }
 
     const nextEarnings = earnings.find((e) => e.epsActual == null) ?? null;
     const forwardEstimate = estimates.find((e) => new Date(e.date).getFullYear() > new Date().getFullYear());

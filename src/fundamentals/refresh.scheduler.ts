@@ -45,7 +45,17 @@ export class RefreshScheduler implements OnModuleInit {
     });
     const totalCount = await this.prisma.fundamentalSnapshot.count();
 
-    if (totalCount > 0 && freshCount === totalCount) {
+    // Freshness alone is not enough to skip: a table full of recently-written
+    // rows for symbols nobody holds is exactly the state this guard used to
+    // preserve. Require that every symbol in the universe actually HAS a
+    // snapshot before deciding there is nothing to do.
+    const universe = await this.repository.listUniverseSymbols();
+    const covered = await this.prisma.fundamentalSnapshot.count({
+      where: { symbol: { in: universe } },
+    });
+    const fullyCovered = covered === universe.length && totalCount === universe.length;
+
+    if (totalCount > 0 && freshCount === totalCount && fullyCovered) {
       this.logger.log(`Skipping startup refresh — all ${totalCount} snapshots are still fresh`);
       return;
     }
@@ -59,10 +69,10 @@ export class RefreshScheduler implements OnModuleInit {
     await this.refreshAll();
   }
 
-  async refreshAll(): Promise<{ refreshed: number; failed: string[] }> {
+  async refreshAll(): Promise<{ refreshed: number; failed: string[]; skipped: string[] }> {
     if (this.running) {
       this.logger.warn('Refresh already in progress — skipping this trigger');
-      return { refreshed: 0, failed: [] };
+      return { refreshed: 0, failed: [], skipped: [] };
     }
     this.running = true;
 
@@ -76,11 +86,15 @@ export class RefreshScheduler implements OnModuleInit {
       // piling up N unbounded in-flight fetches on top of whatever pacing the
       // provider already enforces internally.
       const failed: string[] = [];
+      const skipped: string[] = [];
       for (const symbol of symbols) {
         try {
           const raw = await this.provider.fetchOne(symbol);
           if (!raw) {
-            failed.push(symbol);
+            // A null here means the provider has no COMPANY behind the symbol —
+            // an ETF/fund or a dead ticker. Both are "nothing to score", not a
+            // transient failure, so they're tracked separately from `failed`.
+            skipped.push(symbol);
             continue;
           }
           await this.repository.upsertSnapshot(raw, this.provider.name);
@@ -90,13 +104,55 @@ export class RefreshScheduler implements OnModuleInit {
         }
       }
 
+      // Drop snapshots for symbols the providers now decline to serve. Without
+      // this, a row written under an older provider config (the FMP-only era,
+      // which persisted ETFs) survives forever: refreshAll only ever upserts,
+      // so an unscoreable row is never revisited and keeps rendering as a 0.
+      await this.pruneUnscoreable(skipped);
+
+      // Then drop anything outside the universe entirely — a symbol that was
+      // sold or removed from the watchlist is never in `symbols`, so it is
+      // never fetched, never "skipped", and pruneUnscoreable above can never
+      // reach it. Only this sweep clears it.
+      const orphans = await this.repository.pruneSnapshotsOutside(symbols);
+      if (orphans.length > 0) {
+        this.logger.log(`Pruned ${orphans.length} out-of-universe snapshot(s): ${orphans.join(', ')}`);
+      }
+
       await this.rescoreAll();
 
-      this.logger.log(`Refresh complete: ${symbols.length - failed.length} ok, ${failed.length} failed`);
-      return { refreshed: symbols.length - failed.length, failed };
+      const refreshed = symbols.length - failed.length - skipped.length;
+      this.logger.log(
+        `Refresh complete: ${refreshed} ok, ${failed.length} failed, ${skipped.length} skipped (funds/unknown)`,
+      );
+      return { refreshed, failed, skipped };
     } finally {
       this.running = false;
     }
+  }
+
+  /**
+   * Deletes snapshots (and their cached scores) for symbols the provider
+   * declined to serve this run — ETFs, commodity funds and dead tickers.
+   *
+   * Scores are removed alongside the snapshot because FundamentalScore is keyed
+   * by symbol with no relation to clean it up: leaving one behind would let
+   * `list()` keep serving a score for a symbol that no longer has a snapshot.
+   */
+  private async pruneUnscoreable(symbols: string[]) {
+    if (symbols.length === 0) return;
+
+    const stale = await this.prisma.fundamentalSnapshot.findMany({
+      where: { symbol: { in: symbols } },
+      select: { symbol: true },
+    });
+    if (stale.length === 0) return;
+
+    const staleSymbols = stale.map((s) => s.symbol);
+    await this.prisma.fundamentalScore.deleteMany({ where: { symbol: { in: staleSymbols } } });
+    await this.prisma.fundamentalSnapshot.deleteMany({ where: { symbol: { in: staleSymbols } } });
+
+    this.logger.log(`Pruned ${staleSymbols.length} unscoreable snapshot(s): ${staleSymbols.join(', ')}`);
   }
 
   /** Recomputes every known strategy for every snapshot, grouped by industry so IndustryComparisonEngine sees one consistent peer set per group instead of refetching it per symbol. */
@@ -122,13 +178,15 @@ export class RefreshScheduler implements OnModuleInit {
     }
   }
 
-  /** Every ticker on any client's holdings, plus every ticker on any watchlist slot — deduplicated. */
-  private async symbolUniverse(): Promise<string[]> {
-    const [holdings, watchlist] = await Promise.all([
-      this.prisma.holding.findMany({ select: { ticker: true } }),
-      this.prisma.watchlist.findMany({ select: { ticker: true } }),
-    ]);
-    const symbols = new Set<string>([...holdings.map((h) => h.ticker), ...watchlist.map((w) => w.ticker)]);
-    return [...symbols];
+  /**
+   * Every ticker on any client's holdings, plus every watchlist slot.
+   *
+   * Delegates to ApiRepository so the write path here and the read path in
+   * FundamentalService.list resolve the universe from one definition — when
+   * these were computed separately, the read path was free to serve symbols
+   * this job had never fetched.
+   */
+  private symbolUniverse(): Promise<string[]> {
+    return this.repository.listUniverseSymbols();
   }
 }

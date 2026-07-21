@@ -37,6 +37,56 @@ export class ApiRepository {
     });
   }
 
+  /**
+   * Every ticker the engine is allowed to score: the unique set across ALL
+   * clients' holdings, plus every watchlist slot.
+   *
+   * This is the single definition of the symbol universe. Both the WRITE path
+   * (RefreshScheduler deciding what to fetch and what to prune) and the READ
+   * path (FundamentalService.list scoping what the table may show) call this,
+   * so the Fundamentals table cannot drift from the book the way it did when
+   * the read path served an unfiltered `findMany` — that is what let symbols
+   * nobody owned (MSFT, CAT) and pre-Finnhub ETF rows keep rendering.
+   *
+   * ETFs are NOT filtered here: this is the requested universe, and a symbol
+   * leaves it by the provider declining to serve it (see isFundVehicle), which
+   * prunes the snapshot. Filtering funds here too would only hide them while
+   * leaving the row in the database.
+   */
+  async listUniverseSymbols(): Promise<string[]> {
+    const [holdings, watchlist] = await Promise.all([
+      this.prisma.holding.findMany({ select: { ticker: true } }),
+      this.prisma.watchlist.findMany({ select: { ticker: true } }),
+    ]);
+    const symbols = new Set<string>(
+      [...holdings, ...watchlist]
+        .map((row) => row.ticker?.trim().toUpperCase())
+        .filter((t): t is string => !!t),
+    );
+    return [...symbols];
+  }
+
+  /**
+   * Removes snapshots (and their scores) for symbols outside `keep`.
+   *
+   * Deleting the score alongside the snapshot is required, not tidiness:
+   * FundamentalScore is keyed by symbol with no relation to cascade from, so an
+   * orphaned score would keep being served for a symbol that has no snapshot.
+   */
+  async pruneSnapshotsOutside(keep: string[]): Promise<string[]> {
+    const keepUpper = keep.map((s) => s.toUpperCase());
+    const orphans = await this.prisma.fundamentalSnapshot.findMany({
+      where: { symbol: { notIn: keepUpper } },
+      select: { symbol: true },
+    });
+    if (orphans.length === 0) return [];
+
+    const symbols = orphans.map((o) => o.symbol);
+    await this.prisma.fundamentalScore.deleteMany({ where: { symbol: { in: symbols } } });
+    await this.prisma.fundamentalSnapshot.deleteMany({ where: { symbol: { in: symbols } } });
+    return symbols;
+  }
+
   listSnapshotsByIndustry(industry: string): Promise<FundamentalSnapshot[]> {
     return this.prisma.fundamentalSnapshot.findMany({ where: { industry } });
   }

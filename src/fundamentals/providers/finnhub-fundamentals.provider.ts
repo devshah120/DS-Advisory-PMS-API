@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { FundamentalsProvider, RawFundamentals } from './fundamentals-provider.interface';
+import { isFundVehicle } from './is-fund';
 
 const FINNHUB_BASE = 'https://finnhub.io/api/v1';
 const REQUEST_TIMEOUT_MS = 8000;
@@ -62,6 +63,14 @@ export class FinnhubFundamentalsProvider implements FundamentalsProvider {
     // company fundamentals to score, so skip it rather than persist a row of
     // nulls that renders as a 0.
     if (!profile || Object.keys(profile).length === 0) return null;
+
+    // Belt-and-braces: an empty profile2 is the usual ETF tell, but Finnhub does
+    // answer for some funds. Catch those by name/industry too so the ETF policy
+    // lives in one predicate rather than being implied by an empty response.
+    if (isFundVehicle({ symbol, company: str(profile.name), industry: str(profile.finnhubIndustry) })) {
+      this.logger.debug(`Skipping ${symbol} — pooled vehicle (ETF/fund), no company fundamentals to score`);
+      return null;
+    }
 
     const m = (metricResp?.metric ?? {}) as Record<string, unknown>;
 

@@ -50,7 +50,7 @@ export class HoldingsController {
     const buffer = this.holdingsService.buildImportTemplate();
     res.set({
       'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-      'Content-Disposition': 'attachment; filename="holdings-import-template.xlsx"',
+      'Content-Disposition': 'attachment; filename="transactions-import-sample.xlsx"',
       'Content-Length': buffer.length,
     });
     res.end(buffer);
