@@ -28,6 +28,55 @@ export type FlowBuildResult =
   | { status: 'insufficient'; reason: string };
 
 /**
+ * 30-June-2026 cost rebasing — the single source of truth for it.
+ *
+ * The trade ledger was bulk-imported with every BUY stamped 2026-07-01, though the
+ * positions were actually accumulated over 2–3 prior years we have no history for.
+ * XIRR annualizes, so a real multi-year gain measured over a ~3-week window blew up
+ * into thousands/millions of percent. This rebases the flow series onto the one
+ * window we can honestly price: value each currently-held position at its
+ * 30-June-2026 close and treat that as a single purchase on 2026-06-30.
+ *
+ * It is a PURE transform so the two callers that need it — the Performance service
+ * and the Clients-list `deriveMetrics` — go through the identical logic and cannot
+ * drift apart (they already drifted once, which is the entire reason this lives in
+ * one place). Each caller supplies the 30-June closes it has fetched.
+ *
+ *   • Every BUY is dropped (its date/price are the corrupted import).
+ *   • Each held position becomes ONE synthetic BUY on 2026-06-30 at that day's
+ *     close × current quantity; missing close falls back to recorded average cost.
+ *   • Non-BUY rows (SELL / DIVIDEND / FEES / …) pass through unchanged.
+ *
+ * The result is fed to `buildFlows`, whose existing same-day BUY netting collapses
+ * all the synthetic buys into a single inception flow.
+ */
+export const JUN30_REBASE_DATE = new Date('2026-06-30T00:00:00.000Z');
+
+export interface RebaseHolding {
+  ticker: string;
+  quantity: number;
+  /** Per-share recorded cost — the fallback unit price when no 30-June close exists. */
+  averageCost: number;
+}
+
+export function rebaseLedgerToJun30<T extends LedgerEntry>(
+  holdings: RebaseHolding[],
+  ledger: T[],
+  /** ticker → 30-June-2026 close. */
+  jun30Close: Map<string, number>,
+): LedgerEntry[] {
+  const synthetic: LedgerEntry[] = holdings
+    .filter((h) => h.quantity > 0)
+    .map((h) => {
+      const unit = jun30Close.get(h.ticker) ?? h.averageCost;
+      return { type: 'BUY', amount: unit * h.quantity, date: JUN30_REBASE_DATE };
+    });
+
+  const nonBuys = ledger.filter((r) => r.type !== 'BUY');
+  return [...synthetic, ...nonBuys];
+}
+
+/**
  * CASH_FLOW method: only money that genuinely crossed the boundary between the
  * client and the portfolio.
  *

@@ -7,6 +7,8 @@ import {
   AccountingMethod,
   buildFlows,
   FlowOptions,
+  JUN30_REBASE_DATE,
+  rebaseLedgerToJun30,
   totalContributed,
   totalWithdrawn,
 } from '../calculators/flows';
@@ -571,56 +573,35 @@ export class PerformanceService {
   }
 
   /**
-   * Rebase a transactional ledger onto a 30-June-2026 cost basis.
-   *
-   * See the block comment at the call site for *why*. Mechanically:
-   *
-   *   • Every BUY is dropped. Its date (bulk-imported as 2026-07-01) and price are
-   *     not real, so it cannot contribute an honest flow.
-   *   • Each currently-held position is replaced by ONE synthetic BUY on
-   *     2026-06-30, priced at that day's close from PriceBar (source="yahoo").
-   *     Quantity is the current holding quantity (per the product decision), so
-   *     cost and terminal value cover the same shares.
-   *   • A position with no 30-June bar falls back to its recorded average cost, so
-   *     the series never silently drops a holding.
-   *   • Non-BUY rows (SELL / DIVIDEND / FEES / …) pass through untouched: they are
-   *     real post-basis events and belong in the flow series as-is.
-   *
-   * The result is fed to `buildFlows`, which already knows how to sign and net
-   * BUY rows — so all the synthetic 30-June buys net into a single inception flow.
+   * Fetch the 30-June-2026 closes for a set of tickers from PriceBar.
+   * (Bars were loaded from Yahoo, source="yahoo", keyed by ledger ticker.)
+   */
+  private async jun30Closes(tickers: string[]): Promise<Map<string, number>> {
+    const bars = await this.prisma.priceBar.findMany({
+      where: { symbol: { in: [...new Set(tickers)] }, date: JUN30_REBASE_DATE },
+      select: { symbol: true, adjClose: true },
+    });
+    return new Map(bars.map((b) => [b.symbol, b.adjClose]));
+  }
+
+  /**
+   * Rebase a transactional ledger onto a 30-June-2026 cost basis. The actual
+   * transform is the shared pure `rebaseLedgerToJun30` (see its comment in
+   * flows.ts) so this and the Clients-list `deriveMetrics` cannot drift; this
+   * wrapper only supplies the DB-fetched 30-June closes. `snap.positions.costBasis`
+   * is per-share (= averageCost), which is the fallback unit price the helper wants.
    */
   private async rebaseToJun30(
     snap: Awaited<ReturnType<SnapshotService['forClient']>>,
     ledger: LedgerRow[],
   ): Promise<LedgerRow[]> {
-    const JUN30 = new Date('2026-06-30T00:00:00.000Z');
-
-    const tickers = [...new Set(snap.positions.map((p) => p.ticker))];
-    const bars = await this.prisma.priceBar.findMany({
-      where: { symbol: { in: tickers }, date: JUN30 },
-      select: { symbol: true, adjClose: true },
-    });
-    const closeOf = new Map(bars.map((b) => [b.symbol, b.adjClose]));
-
-    const synthetic: LedgerRow[] = snap.positions
-      .filter((p) => p.quantity > 0)
-      .map((p) => {
-        // 30-June close × current quantity; fall back to recorded average cost
-        // (costBasis is per-share) when no bar exists for this ticker.
-        const jun30 = closeOf.get(p.ticker);
-        const unit = jun30 ?? p.costBasis;
-        return {
-          type: 'BUY',
-          ticker: p.ticker,
-          quantity: p.quantity,
-          price: unit,
-          amount: unit * p.quantity,
-          date: JUN30,
-        };
-      });
-
-    const nonBuys = ledger.filter((r) => r.type !== 'BUY');
-    return [...synthetic, ...nonBuys];
+    const closeOf = await this.jun30Closes(snap.positions.map((p) => p.ticker));
+    const holdings = snap.positions.map((p) => ({
+      ticker: p.ticker,
+      quantity: p.quantity,
+      averageCost: p.costBasis,
+    }));
+    return rebaseLedgerToJun30(holdings, ledger, closeOf) as LedgerRow[];
   }
 
   /**

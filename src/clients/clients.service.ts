@@ -7,7 +7,11 @@ import { Prisma } from '@prisma/client';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { CreateClientDto } from './dto/create-client.dto';
 import { UpdateClientDto } from './dto/update-client.dto';
-import { buildFlows } from '../analytics/calculators/flows';
+import {
+  buildFlows,
+  JUN30_REBASE_DATE,
+  rebaseLedgerToJun30,
+} from '../analytics/calculators/flows';
 import { xirr } from '../analytics/calculators/xirr';
 
 // Prisma persists SCREAMING_CASE enums; the HTTP contract uses lowercase.
@@ -45,17 +49,27 @@ function serialize<T extends { riskProfile: string; status: string; accountingMe
  *                    terminal value = holdings only (idle cash excluded), or 0
  *                    when the ledger has no trades to solve on.
  */
-function deriveMetrics(client: {
-  cashBalance: number;
-  holdings: Array<{ marketValue: number }>;
-  transactions: Array<{ type: string; amount: number; date: Date }>;
-}) {
+function deriveMetrics(
+  client: {
+    cashBalance: number;
+    holdings: Array<{ ticker: string; quantity: number; averageCost: number; marketValue: number }>;
+    transactions: Array<{ type: string; amount: number; date: Date }>;
+  },
+  jun30Close: Map<string, number>,
+) {
   const holdingsValue = client.holdings.reduce((s, h) => s + h.marketValue, 0);
   const portfolioValue = holdingsValue + client.cashBalance;
 
   // Every client is transactional now (see create/update). Terminal value is
   // holdings only — idle cash is excluded from the transactional return.
-  const built = buildFlows(client.transactions, 'TRANSACTIONAL', holdingsValue, new Date());
+  //
+  // The ledger is rebased onto a 30-June-2026 cost basis first — the SAME shared
+  // transform the Performance page uses (rebaseLedgerToJun30 in flows.ts) — so the
+  // list's XIRR matches the Performance page instead of showing the exploded
+  // pre-rebase figure. Without this the two pages disagreed: Performance read
+  // −16.9% while the list still showed +23,000,000%.
+  const rebased = rebaseLedgerToJun30(client.holdings, client.transactions, jun30Close);
+  const built = buildFlows(rebased, 'TRANSACTIONAL', holdingsValue, new Date());
   let rate = 0;
   if (built.status === 'ok') {
     const solved = xirr(built.flows);
@@ -123,11 +137,21 @@ export class ClientsService {
       this.prisma.client.count(),
     ]);
 
+    // 30-June-2026 closes for every ticker held across this page, fetched once and
+    // shared by all clients' deriveMetrics so the list's rebased XIRR matches the
+    // Performance page. Keyed by ledger ticker, matching how the bars were loaded.
+    const tickers = [...new Set(clients.flatMap((c) => c.holdings.map((h) => h.ticker)))];
+    const bars = await this.prisma.priceBar.findMany({
+      where: { symbol: { in: tickers }, date: JUN30_REBASE_DATE },
+      select: { symbol: true, adjClose: true },
+    });
+    const jun30Close = new Map(bars.map((b) => [b.symbol, b.adjClose]));
+
     return {
       // Overlay the derived portfolioValue / xirr onto the serialized record so
       // the list stops showing $0.00 / 0.00% for bulk-imported clients whose
       // stored columns were never written. cashBalance stays as stored.
-      data: clients.map((c) => ({ ...serialize(c), ...deriveMetrics(c) })),
+      data: clients.map((c) => ({ ...serialize(c), ...deriveMetrics(c, jun30Close) })),
       total,
       page: Math.floor(skip / take) + 1,
       limit: take,
