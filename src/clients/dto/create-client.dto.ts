@@ -2,6 +2,7 @@ import { Transform } from 'class-transformer';
 import {
   IsBoolean,
   IsString,
+  IsEmail,
   IsEnum,
   IsNumber,
   IsOptional,
@@ -63,6 +64,16 @@ export class CreateClientDto {
   @MaxLength(64)
   @trim()
   accountNumber: string;
+
+  // Optional contact email for the mandate. Blank is allowed (many legacy
+  // clients have none); the frontend omits it entirely rather than sending "".
+  @IsEmail({}, { message: 'Enter a valid email address' })
+  @IsOptional()
+  @MaxLength(254)
+  @Transform(({ value }) =>
+    typeof value === 'string' ? value.trim().toLowerCase() : value
+  )
+  email?: string;
 
   @IsString()
   @IsNotEmpty({ message: 'Benchmark is required' })

@@ -35,6 +35,9 @@ model Client {
   name            String
   broker          String
   accountNumber   String
+  /// Optional contact email for the mandate. Nullable: legacy clients predate
+  /// this field. Stored lowercased/trimmed by the DTO.
+  email           String?
   /// Free-text label kept for the existing CRUD UI. Analytics joins on benchmarkId
   /// instead: a string like "swderfg" cannot be joined to a price series.
   benchmark       String
