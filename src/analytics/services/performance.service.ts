@@ -121,6 +121,31 @@ export class PerformanceService {
       orderBy: { date: 'asc' },
     });
 
+    /**
+     * 30-June-2026 cost rebasing — the fix for the exploded XIRR.
+     *
+     * The transactions were bulk-imported with every BUY stamped 2026-07-01, even
+     * though the positions were actually accumulated over 2–3 prior years for which
+     * we have no trade history. XIRR annualizes, so a real multi-year gain measured
+     * over a ~3-week window blew up into thousands or millions of percent (the
+     * +15,611,770% on the Clients list was this, not a math error).
+     *
+     * We have no true purchase dates or prices, so we adopt a defensible synthetic
+     * basis: value each currently-held position at its 30-June-2026 close (fetched
+     * from Yahoo into PriceBar, source="yahoo") and treat that as a single purchase
+     * on 2026-06-30. The XIRR then measures only the period since 30 June — the one
+     * window we can actually price — instead of years of unrecorded history.
+     *
+     * This is a CALCULATION-ONLY rebasing: the stored ledger is untouched. The
+     * original BUY rows are dropped from the *flow series* here and replaced by the
+     * synthetic 30-June basis; SELL/DIVIDEND/FEES since then remain real events.
+     * A position without a 30-June bar falls back to its recorded average cost.
+     */
+    const ledgerForFlows =
+      method === 'TRANSACTIONAL'
+        ? await this.rebaseToJun30(snap, ledger)
+        : ledger;
+
     // ── Values ────────────────────────────────────────────────────────────────
     // Holdings are always DERIVED (quantity × price). The stored
     // Holding.marketValue / Client.portfolioValue columns are a display cache for
@@ -173,7 +198,10 @@ export class PerformanceService {
      */
     const terminalValue = method === 'TRANSACTIONAL' ? holdingsValue : portfolioValue;
 
-    const built = buildFlows(ledger, method, terminalValue, asOf, flowOptions);
+    // Flows are built from the 30-June-rebased ledger (transactional only); every
+    // other consumer below keeps the real `ledger` so realized gains, dividends and
+    // deposits still reflect what actually happened.
+    const built = buildFlows(ledgerForFlows, method, terminalValue, asOf, flowOptions);
 
     // The cross-sectional KPIs do not depend on XIRR solving, so they are worth
     // returning even when it cannot. A client with holdings but no recorded
@@ -540,6 +568,59 @@ export class PerformanceService {
     if (code) return this.prisma.benchmark.findUnique({ where: { code } });
     if (benchmarkId) return this.prisma.benchmark.findUnique({ where: { id: benchmarkId } });
     return this.prisma.benchmark.findFirst({ where: { isDefault: true } });
+  }
+
+  /**
+   * Rebase a transactional ledger onto a 30-June-2026 cost basis.
+   *
+   * See the block comment at the call site for *why*. Mechanically:
+   *
+   *   • Every BUY is dropped. Its date (bulk-imported as 2026-07-01) and price are
+   *     not real, so it cannot contribute an honest flow.
+   *   • Each currently-held position is replaced by ONE synthetic BUY on
+   *     2026-06-30, priced at that day's close from PriceBar (source="yahoo").
+   *     Quantity is the current holding quantity (per the product decision), so
+   *     cost and terminal value cover the same shares.
+   *   • A position with no 30-June bar falls back to its recorded average cost, so
+   *     the series never silently drops a holding.
+   *   • Non-BUY rows (SELL / DIVIDEND / FEES / …) pass through untouched: they are
+   *     real post-basis events and belong in the flow series as-is.
+   *
+   * The result is fed to `buildFlows`, which already knows how to sign and net
+   * BUY rows — so all the synthetic 30-June buys net into a single inception flow.
+   */
+  private async rebaseToJun30(
+    snap: Awaited<ReturnType<SnapshotService['forClient']>>,
+    ledger: LedgerRow[],
+  ): Promise<LedgerRow[]> {
+    const JUN30 = new Date('2026-06-30T00:00:00.000Z');
+
+    const tickers = [...new Set(snap.positions.map((p) => p.ticker))];
+    const bars = await this.prisma.priceBar.findMany({
+      where: { symbol: { in: tickers }, date: JUN30 },
+      select: { symbol: true, adjClose: true },
+    });
+    const closeOf = new Map(bars.map((b) => [b.symbol, b.adjClose]));
+
+    const synthetic: LedgerRow[] = snap.positions
+      .filter((p) => p.quantity > 0)
+      .map((p) => {
+        // 30-June close × current quantity; fall back to recorded average cost
+        // (costBasis is per-share) when no bar exists for this ticker.
+        const jun30 = closeOf.get(p.ticker);
+        const unit = jun30 ?? p.costBasis;
+        return {
+          type: 'BUY',
+          ticker: p.ticker,
+          quantity: p.quantity,
+          price: unit,
+          amount: unit * p.quantity,
+          date: JUN30,
+        };
+      });
+
+    const nonBuys = ledger.filter((r) => r.type !== 'BUY');
+    return [...synthetic, ...nonBuys];
   }
 
   /**
