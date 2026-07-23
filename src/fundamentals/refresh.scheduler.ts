@@ -1,33 +1,25 @@
-import { Inject, Injectable, Logger, OnModuleInit } from '@nestjs/common';
-import { Cron, CronExpression } from '@nestjs/schedule';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { ApiRepository } from './api.repository';
 import { FundamentalService } from './fundamental.service';
 import { FundamentalsProvider } from './providers/fundamentals-provider.interface';
 import { FUNDAMENTALS_PROVIDER } from './fundamentals.tokens';
 
-// A snapshot newer than this is left alone on boot — a routine redeploy (or,
-// in dev, `nest --watch` restarting on every file save) must not re-burn
-// provider quota re-fetching data that's still within the day's freshness
-// window. The daily @Cron job is what guarantees a refresh eventually
-// happens regardless of deploy cadence.
-const BOOT_REFRESH_STALE_AFTER_MS = 20 * 60 * 60 * 1000; // 20h — leaves headroom before the 24h @Cron
-
 /**
- * The "automatically refresh every day" requirement. Pulls the symbol
- * universe from the modules the Fundamentals Engine is explicitly allowed to
- * READ from (Holdings, Watchlist) without ever writing back to them, fetches
- * fresh data through whichever FundamentalsProvider is bound (FMP today),
- * persists snapshots, then recomputes scores for every known strategy so a
- * stale score is never served after a refresh.
+ * Refreshes the Fundamentals Engine on demand only. Pulls the symbol universe
+ * from the modules the engine is explicitly allowed to READ from (Holdings,
+ * Watchlist) without ever writing back to them, fetches fresh data through
+ * whichever FundamentalsProvider is bound (FMP today), persists snapshots,
+ * then recomputes scores for every known strategy so a stale score is never
+ * served after a refresh.
  *
- * Runs once on boot (OnModuleInit) ONLY if the existing data has gone stale,
- * so a fresh deploy isn't blank until midnight without re-fetching data that
- * was refreshed an hour ago — then once a day thereafter via @Cron
- * regardless of staleness.
+ * There is intentionally NO automatic trigger — no boot refresh, no daily
+ * cron. `refreshAll()` runs only when POST /fundamentals/refresh is called
+ * (the UI refresh button), so provider quota is never burned by process
+ * restarts, dev hot-reloads, or a timer.
  */
 @Injectable()
-export class RefreshScheduler implements OnModuleInit {
+export class RefreshScheduler {
   private readonly logger = new Logger(RefreshScheduler.name);
   private running = false;
 
@@ -37,37 +29,6 @@ export class RefreshScheduler implements OnModuleInit {
     private fundamentalService: FundamentalService,
     @Inject(FUNDAMENTALS_PROVIDER) private provider: FundamentalsProvider,
   ) {}
-
-  async onModuleInit() {
-    const staleBefore = new Date(Date.now() - BOOT_REFRESH_STALE_AFTER_MS);
-    const freshCount = await this.prisma.fundamentalSnapshot.count({
-      where: { refreshedAt: { gte: staleBefore } },
-    });
-    const totalCount = await this.prisma.fundamentalSnapshot.count();
-
-    // Freshness alone is not enough to skip: a table full of recently-written
-    // rows for symbols nobody holds is exactly the state this guard used to
-    // preserve. Require that every symbol in the universe actually HAS a
-    // snapshot before deciding there is nothing to do.
-    const universe = await this.repository.listUniverseSymbols();
-    const covered = await this.prisma.fundamentalSnapshot.count({
-      where: { symbol: { in: universe } },
-    });
-    const fullyCovered = covered === universe.length && totalCount === universe.length;
-
-    if (totalCount > 0 && freshCount === totalCount && fullyCovered) {
-      this.logger.log(`Skipping startup refresh — all ${totalCount} snapshots are still fresh`);
-      return;
-    }
-
-    // Fire-and-forget: a slow first refresh must not block API startup.
-    this.refreshAll().catch((err) => this.logger.error(`Startup refresh failed: ${err.message}`));
-  }
-
-  @Cron(CronExpression.EVERY_DAY_AT_1AM)
-  async scheduledRefresh() {
-    await this.refreshAll();
-  }
 
   async refreshAll(): Promise<{ refreshed: number; failed: string[]; skipped: string[] }> {
     if (this.running) {

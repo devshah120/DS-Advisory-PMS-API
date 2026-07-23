@@ -1,5 +1,4 @@
 import { Module } from '@nestjs/common';
-import { ScheduleModule } from '@nestjs/schedule';
 import { PrismaModule } from '../common/prisma/prisma.module';
 import { FundamentalsController } from './fundamentals.controller';
 import { FundamentalService } from './fundamental.service';
@@ -14,7 +13,7 @@ import { CompositeFundamentalsProvider } from './providers/composite-fundamental
 import { FUNDAMENTALS_PROVIDER } from './fundamentals.tokens';
 
 @Module({
-  imports: [PrismaModule, ScheduleModule.forRoot()],
+  imports: [PrismaModule],
   controllers: [FundamentalsController],
   providers: [
     FundamentalService,
