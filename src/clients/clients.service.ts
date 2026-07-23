@@ -7,6 +7,8 @@ import { Prisma } from '@prisma/client';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { CreateClientDto } from './dto/create-client.dto';
 import { UpdateClientDto } from './dto/update-client.dto';
+import { buildFlows } from '../analytics/calculators/flows';
+import { xirr } from '../analytics/calculators/xirr';
 
 // Prisma persists SCREAMING_CASE enums; the HTTP contract uses lowercase.
 const toDb = <T extends string>(v: T | undefined) =>
@@ -25,6 +27,42 @@ function serialize<T extends { riskProfile: string; status: string; accountingMe
     // CASH_FLOW -> cash_flow. toApi already lowercases; the underscore survives.
     accountingMethod: toApi(client.accountingMethod),
   };
+}
+
+/**
+ * Portfolio value and XIRR for the Clients list, DERIVED — never read from the
+ * stored Client.portfolioValue / Client.xirr columns.
+ *
+ * Those columns default to 0 and are only written by the workbook importer; the
+ * bulk trade import writes holdings and a transaction ledger but never touches
+ * them, so every bulk-imported client read $0.00 / 0.00% on the list. The
+ * analytics engine already derives value the same way (quantity × price + cash);
+ * this mirrors it so the list agrees with the Performance page.
+ *
+ *   portfolioValue = Σ(holding.marketValue) + cashBalance   (cash is tracked but
+ *                    idle — it inflates value, not the deployed-capital XIRR)
+ *   xirr           = transactional XIRR over the BUY/SELL/DIVIDEND/FEES ledger,
+ *                    terminal value = holdings only (idle cash excluded), or 0
+ *                    when the ledger has no trades to solve on.
+ */
+function deriveMetrics(client: {
+  cashBalance: number;
+  holdings: Array<{ marketValue: number }>;
+  transactions: Array<{ type: string; amount: number; date: Date }>;
+}) {
+  const holdingsValue = client.holdings.reduce((s, h) => s + h.marketValue, 0);
+  const portfolioValue = holdingsValue + client.cashBalance;
+
+  // Every client is transactional now (see create/update). Terminal value is
+  // holdings only — idle cash is excluded from the transactional return.
+  const built = buildFlows(client.transactions, 'TRANSACTIONAL', holdingsValue, new Date());
+  let rate = 0;
+  if (built.status === 'ok') {
+    const solved = xirr(built.flows);
+    if (solved.status === 'ok') rate = solved.rate * 100; // the list renders a percent
+  }
+
+  return { portfolioValue, xirr: rate };
 }
 
 @Injectable()
@@ -52,7 +90,10 @@ export class ClientsService {
           ...dto,
           riskProfile: toDb(dto.riskProfile),
           status: toDb(dto.status),
-          accountingMethod: toDb(dto.accountingMethod),
+          // Every client is transactional now — the cash-flow method has been
+          // retired from the product. Force it regardless of what the payload
+          // carries so an old client or a stale form can't reintroduce it.
+          accountingMethod: 'TRANSACTIONAL',
           inceptionDate: new Date(dto.inceptionDate),
         },
       });
@@ -83,7 +124,10 @@ export class ClientsService {
     ]);
 
     return {
-      data: clients.map(serialize),
+      // Overlay the derived portfolioValue / xirr onto the serialized record so
+      // the list stops showing $0.00 / 0.00% for bulk-imported clients whose
+      // stored columns were never written. cashBalance stays as stored.
+      data: clients.map((c) => ({ ...serialize(c), ...deriveMetrics(c) })),
       total,
       page: Math.floor(skip / take) + 1,
       limit: take,
@@ -114,7 +158,9 @@ export class ClientsService {
         ...dto,
         riskProfile: toDb(dto.riskProfile),
         status: toDb(dto.status),
-        accountingMethod: toDb(dto.accountingMethod),
+        // Retired: always transactional. Saving any client normalizes a
+        // legacy CASH_FLOW record onto the surviving method.
+        accountingMethod: 'TRANSACTIONAL',
         inceptionDate: dto.inceptionDate ? new Date(dto.inceptionDate) : undefined,
       },
     });

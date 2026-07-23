@@ -50,10 +50,11 @@ model Client {
   ///                in and each SELL as money out, so the return is measured on
   ///                capital deployed into positions.
   ///
-  /// Defaults to CASH_FLOW because that is what the engine did for every client
-  /// before this field existed — an existing client's XIRR must not silently
-  /// change method on migration.
-  accountingMethod AccountingMethod @default(CASH_FLOW)
+  /// The cash-flow method has been retired from the product: every client is now
+  /// transactional. The enum value is kept so legacy records still read, but
+  /// nothing writes CASH_FLOW anymore and the default for new rows is
+  /// TRANSACTIONAL. See ClientsService, which forces this on every write.
+  accountingMethod AccountingMethod @default(TRANSACTIONAL)
 
   /// Only meaningful under TRANSACTIONAL. Excluding fees gives the gross-of-fee
   /// return the manager is measured on; including them gives the net-of-fee

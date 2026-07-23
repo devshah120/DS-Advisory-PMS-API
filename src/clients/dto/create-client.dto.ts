@@ -76,15 +76,15 @@ export class CreateClientDto {
   @lower()
   riskProfile: RiskProfile;
 
-  // Required on create: this decides how the client's return is computed for the
-  // life of the mandate, and there is no default that is right for everyone.
-  // (Prisma defaults it to CASH_FLOW so that clients created before this field
-  // existed keep the behaviour they already had.)
+  // Retired: the cash-flow method has been removed from the product and every
+  // client is now transactional. Accepted for backward compatibility with any
+  // caller still sending it, but ignored — ClientsService forces TRANSACTIONAL.
   @IsEnum(AccountingMethod, {
     message: 'accountingMethod must be transactional or cash_flow',
   })
+  @IsOptional()
   @lower()
-  accountingMethod: AccountingMethod;
+  accountingMethod?: AccountingMethod;
 
   // Both default true (see schema.prisma). They only affect TRANSACTIONAL
   // clients: under cash_flow, dividends and fees are already inside the terminal
