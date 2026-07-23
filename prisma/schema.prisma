@@ -23,6 +23,22 @@ model User {
   @@map("users")
 }
 
+/// One-time password issued for the forgot-password flow. A row is created when
+/// a user requests a reset; the 6-digit code is stored hashed (never in the
+/// clear), expires after a few minutes, and is deleted once consumed. Old rows
+/// for the same email are cleared on each new request so only the latest is valid.
+model PasswordReset {
+  id        String   @id @default(cuid()) @map("_id")
+  email     String
+  otpHash   String
+  expiresAt DateTime
+  attempts  Int      @default(0)
+  createdAt DateTime @default(now())
+
+  @@index([email])
+  @@map("password_resets")
+}
+
 enum Role {
   ADMIN
   PORTFOLIO_MANAGER

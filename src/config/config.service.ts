@@ -12,6 +12,12 @@ export class ConfigService {
     jwtSecret: process.env.JWT_SECRET,
     jwtExpiration: process.env.JWT_EXPIRATION || '3600',
     corsOrigin: process.env.CORS_ORIGIN || 'http://localhost:3000',
+    smtpHost: process.env.SMTP_HOST,
+    smtpPort: process.env.SMTP_PORT || '587',
+    smtpUser: process.env.SMTP_USER,
+    smtpPass: process.env.SMTP_PASS,
+    smtpFromName: process.env.SMTP_FROM_NAME || 'DS Advisory',
+    smtpFromEmail: process.env.SMTP_FROM_EMAIL,
   };
 
   get(key: string): string {

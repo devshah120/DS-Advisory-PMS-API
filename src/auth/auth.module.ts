@@ -8,11 +8,13 @@ import { LocalStrategy } from './local.strategy';
 import { PrismaModule } from '../common/prisma/prisma.module';
 import { ConfigModule } from '../config/config.module';
 import { ConfigService } from '../config/config.service';
+import { MailModule } from '../mail/mail.module';
 
 @Module({
   imports: [
     PrismaModule,
     ConfigModule,
+    MailModule,
     PassportModule,
     JwtModule.registerAsync({
       imports: [ConfigModule],
