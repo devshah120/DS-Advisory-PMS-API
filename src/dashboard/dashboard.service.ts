@@ -51,18 +51,25 @@ export class DashboardService {
   ) {}
 
   async getOverview() {
-    const [clients, stored, exposure] = await Promise.all([
+    const [clients, stored, exposure, cashAgg] = await Promise.all([
       this.prisma.client.count(),
       this.prisma.holding.findMany(),
       this.house.exposure(),
+      // House-wide idle cash: summed straight off the client records, so a
+      // client's balance is counted once regardless of how many positions they
+      // hold. This is buying power available for deployment, not deployed capital.
+      this.prisma.client.aggregate({ _sum: { cashBalance: true } }),
     ]);
 
     const holdings = await this.withLiveMarketValue(stored);
     const totalAUM = holdings.reduce((sum, h) => sum + h.marketValue, 0);
+    const totalCash = cashAgg._sum.cashBalance ?? 0;
     const movers = await this.dailyMovers(holdings);
 
     return {
       totalAUM,
+      // Cash the house holds across every client — deployable, not yet invested.
+      totalCash,
       numClients: clients,
       numHoldings: holdings.length,
       topGainers: movers.filter((m) => m.changePercent != null).slice(0, 3),

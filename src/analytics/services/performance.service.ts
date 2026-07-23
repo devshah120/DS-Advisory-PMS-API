@@ -82,7 +82,34 @@ export class PerformanceService {
 
     const snap = await this.snapshots.forClient(clientId);
     const asOf = asOfOverride ?? new Date();
-    const method = client.accountingMethod as AccountingMethod;
+
+    /**
+     * The cash-flow method has been retired from the product: every client's
+     * reported return is transactional (see ClientsService, which forces
+     * TRANSACTIONAL on every write, and the schema note on Client.accountingMethod).
+     *
+     * ClientsService and the Clients-list `deriveMetrics` already do this, but this
+     * service still read `client.accountingMethod` — so a legacy row left as
+     * CASH_FLOW in the database kept computing the old way HERE, on the Performance
+     * page, while the Clients list showed the transactional figure for the same
+     * client. That split is the bug this line closes: we ignore whatever is stored
+     * and treat the client as transactional, matching everywhere else. Idle cash is
+     * therefore excluded from the return (terminal value = holdings only) and is
+     * reported separately as a balance/weight for deployment, never as a flow.
+     *
+     * The stored value and the CASH_FLOW enum member are kept only so legacy rows
+     * still deserialize; a one-off script normalizes them (see
+     * src/analytics/scripts/normalize-accounting-method.ts).
+     *
+     * `method` keeps the wide `AccountingMethod` type on purpose: the CASH_FLOW
+     * branches below are unreachable now but documented and intact, and widening
+     * here keeps them valid rather than forcing their deletion. `_storedMethod` is
+     * read only to be deliberately ignored — a reader sees the override, not a
+     * silent drop.
+     */
+    const _storedMethod = client.accountingMethod as AccountingMethod;
+    void _storedMethod;
+    const method: AccountingMethod = 'TRANSACTIONAL' as AccountingMethod;
 
     const flowOptions: FlowOptions = {
       includeDividends: client.includeDividends ?? true,
