@@ -72,8 +72,14 @@ export class DashboardService {
       totalCash,
       numClients: clients,
       numHoldings: holdings.length,
-      topGainers: movers.filter((m) => m.changePercent != null).slice(0, 3),
-      topLosers: [...movers].reverse().slice(0, 3),
+      // movers is sorted best-to-worst. Split by sign so a flat/green day
+      // can't list a riser under "losers" (and vice versa) just to fill three
+      // slots — either card is allowed to come back short.
+      topGainers: movers.filter((m) => m.changePercent > 0).slice(0, 3),
+      topLosers: movers
+        .filter((m) => m.changePercent < 0)
+        .reverse()
+        .slice(0, 3),
       // House-wide, not per-client: every client's holdings merged into one
       // book before grouping by sector, with ETFs exploded via look-through.
       sectorAllocation: exposure.data.sectors,
@@ -142,9 +148,10 @@ export class DashboardService {
   }
 
   /**
-   * Day-over-day % change per holding (today's close vs. the prior trading
+   * Day-over-day % change per ticker (today's close vs. the prior trading
    * day's close), ranked. One ticker held by multiple clients is fetched
-   * once and reused — Yahoo doesn't care which client owns it.
+   * once and reused — Yahoo doesn't care which client owns it — and collapses
+   * to a single row, so a widely-held name can't fill the board on its own.
    */
   private async dailyMovers(holdings: Array<{ ticker: string; company: string; clientId: string; marketValue: number }>): Promise<HoldingMover[]> {
     const tickers = [...new Set(holdings.map((h) => h.ticker))];
@@ -163,13 +170,24 @@ export class DashboardService {
       }),
     );
 
-    const movers: HoldingMover[] = [];
+    // Collapse to one row per ticker. The % move belongs to the security, not
+    // to any one client's lot, so multiple holders would otherwise produce
+    // identical duplicate rows and crowd out genuinely different names.
+    // marketValue is summed across holders to keep it house-wide, matching
+    // how topHoldingsByTicker reports the same book.
+    const byTicker = new Map<string, HoldingMover>();
     for (const h of holdings) {
+      const existing = byTicker.get(h.ticker);
+      if (existing) {
+        existing.marketValue += h.marketValue;
+        continue;
+      }
+
       const bars = closesByTicker.get(h.ticker) ?? [];
       if (bars.length < 2) continue;
       const [prior, last] = bars.slice(-2);
       if (prior.close === 0) continue;
-      movers.push({
+      byTicker.set(h.ticker, {
         ticker: h.ticker,
         company: h.company,
         clientId: h.clientId,
@@ -179,7 +197,7 @@ export class DashboardService {
       });
     }
 
-    return movers.sort((a, b) => b.changePercent - a.changePercent);
+    return [...byTicker.values()].sort((a, b) => b.changePercent - a.changePercent);
   }
 
   /** Live daily and YTD % change for the tracked indices and commodities. */
