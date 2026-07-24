@@ -1,9 +1,11 @@
 import {
+  BadRequestException,
   ConflictException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
+import * as bcrypt from 'bcrypt';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { MarketService } from '../market/market.service';
 import { CreateClientDto } from './dto/create-client.dto';
@@ -21,6 +23,15 @@ const toDb = <T extends string>(v: T | undefined) =>
 
 const toApi = (v: string | null | undefined) =>
   v == null ? v : (v.toLowerCase() as any);
+
+// The User model splits names into first/last; a client only carries a single
+// display name. Split on the first space so "Evergreen Capital" → ("Evergreen",
+// "Capital") and a one-word name keeps an empty last name.
+const firstNameOf = (name: string) => name.trim().split(/\s+/)[0] || name.trim();
+const lastNameOf = (name: string) => {
+  const parts = name.trim().split(/\s+/);
+  return parts.length > 1 ? parts.slice(1).join(' ') : '';
+};
 
 function serialize<T extends { riskProfile: string; status: string; accountingMethod?: string }>(
   client: T
@@ -113,10 +124,32 @@ export class ClientsService {
       );
     }
 
+    // The login account is a User row keyed by a unique email, so a client login
+    // needs an email. Password is required on create (DTO), so require the email
+    // alongside it rather than silently creating a client with no way to sign in.
+    const { password, ...clientData } = dto;
+    if (!dto.email) {
+      throw new BadRequestException({
+        message: 'Please correct the highlighted fields.',
+        errors: { email: 'An email is required to create the login account' },
+      });
+    }
+    // The email must be free across all users (staff and other client logins).
+    const emailTaken = await this.prisma.user.findUnique({
+      where: { email: dto.email },
+      select: { id: true },
+    });
+    if (emailTaken) {
+      throw new ConflictException({
+        message: 'Please correct the highlighted fields.',
+        errors: { email: 'An account with this email already exists' },
+      });
+    }
+
     try {
       const client = await this.prisma.client.create({
         data: {
-          ...dto,
+          ...clientData,
           riskProfile: toDb(dto.riskProfile),
           status: toDb(dto.status),
           // Every client is transactional now — the cash-flow method has been
@@ -124,6 +157,17 @@ export class ClientsService {
           // carries so an old client or a stale form can't reintroduce it.
           accountingMethod: 'TRANSACTIONAL',
           inceptionDate: new Date(dto.inceptionDate),
+          // Create the client's own login (role VIEWER) in the same write, linked
+          // by clientId. Reuses the existing /auth/login + JWT + reset flow.
+          loginUsers: {
+            create: {
+              email: dto.email,
+              firstName: firstNameOf(dto.name),
+              lastName: lastNameOf(dto.name),
+              password: await bcrypt.hash(password, 10),
+              role: 'VIEWER',
+            },
+          },
         },
       });
       return serialize(client);
@@ -208,10 +252,66 @@ export class ClientsService {
   async update(id: string, dto: UpdateClientDto) {
     await this.findOne(id);
 
+    // Password is edit-optional: a blank/absent value leaves the login unchanged.
+    // Never persist it on the client row — hash it into the linked User instead.
+    const { password, ...clientData } = dto;
+    if (password) {
+      const login = await this.prisma.user.findFirst({
+        where: { clientId: id },
+        select: { id: true },
+      });
+      const hashed = await bcrypt.hash(password, 10);
+      if (login) {
+        await this.prisma.user.update({
+          where: { id: login.id },
+          data: { password: hashed },
+        });
+      } else {
+        // The client predates client logins (or never had one). Create it now —
+        // this needs an email, which comes from the payload or the stored record.
+        const email = dto.email ?? (await this.findOne(id)).email;
+        if (!email) {
+          throw new BadRequestException({
+            message: 'Please correct the highlighted fields.',
+            errors: { email: 'An email is required to create the login account' },
+          });
+        }
+        const emailTaken = await this.prisma.user.findUnique({
+          where: { email },
+          select: { id: true },
+        });
+        if (emailTaken) {
+          throw new ConflictException({
+            message: 'Please correct the highlighted fields.',
+            errors: { email: 'An account with this email already exists' },
+          });
+        }
+        const name = dto.name ?? (await this.findOne(id)).name;
+        await this.prisma.user.create({
+          data: {
+            email,
+            firstName: firstNameOf(name),
+            lastName: lastNameOf(name),
+            password: hashed,
+            role: 'VIEWER',
+            clientId: id,
+          },
+        });
+      }
+    }
+
+    // Keep the login's email in sync when the client's contact email changes.
+    if (dto.email) {
+      await this.prisma.user.updateMany({
+        where: { clientId: id },
+        data: { email: dto.email },
+      });
+    }
+
     const client = await this.prisma.client.update({
       where: { id },
       data: {
-        ...dto,
+        ...clientData,
         riskProfile: toDb(dto.riskProfile),
         status: toDb(dto.status),
         // Retired: always transactional. Saving any client normalizes a

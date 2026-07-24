@@ -9,6 +9,7 @@ import {
   IsNotEmpty,
   IsDateString,
   MaxLength,
+  MinLength,
   Min,
   Max,
 } from 'class-validator';
@@ -64,6 +65,17 @@ export class CreateClientDto {
   @MaxLength(64)
   @trim()
   accountNumber: string;
+
+  // Login password for the client's own account (a User row, role VIEWER,
+  // linked by clientId). Required on create; UpdateClientDto (PartialType) makes
+  // it optional on edit, where a blank/absent value leaves the password
+  // unchanged. Never persisted on the Client — ClientsService hashes it into the
+  // linked User and strips it before writing the client row.
+  @IsString()
+  @IsNotEmpty({ message: 'A login password is required' })
+  @MinLength(8, { message: 'Password must be at least 8 characters' })
+  @MaxLength(128)
+  password: string;
 
   // Optional contact email for the mandate. Blank is allowed (many legacy
   // clients have none); the frontend omits it entirely rather than sending "".
