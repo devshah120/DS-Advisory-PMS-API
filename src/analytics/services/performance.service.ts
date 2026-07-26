@@ -452,9 +452,9 @@ export class PerformanceService {
     if (!bm) return null;
 
     const closes = await this.closesOn(bm.symbol, flows.map((f) => f.date));
-    const terminalClose = await this.latestClose(bm.symbol);
+    const terminal = await this.latestBar(bm.symbol);
 
-    if (closes.some((c) => c === null) || terminalClose === null) {
+    if (closes.some((c) => c === null) || terminal === null) {
       return {
         code: bm.code,
         name: bm.name,
@@ -463,6 +463,50 @@ export class PerformanceService {
         units: null,
         value: null,
         reason: `No price history for ${bm.symbol} covering the flow dates. Load the index series before comparing against it.`,
+      };
+    }
+
+    const terminalClose = terminal.adjClose;
+
+    /**
+     * Refuse to value the benchmark on a bar that predates the last flow.
+     *
+     * This is the guard for the bug that made this panel read +0.00%. The index
+     * series had been loaded from the workbook and stopped at 2026-06-25, while
+     * the flows are rebased onto a synthetic 2026-06-30 BUY. `closesOn` fell back
+     * to the last prior bar (06-25) and `latestBar` returned the newest bar in
+     * the table — the SAME 06-25 bar. The benchmark therefore bought units and
+     * valued them at one identical price, returning exactly the capital invested:
+     * 0.00% XIRR, 0.00% interim.
+     *
+     * That is far worse than an error, because Alpha = Portfolio XIRR − Benchmark
+     * XIRR then silently degenerates into just the portfolio return wearing
+     * Alpha's label. It looked like a confident +10.79% of outperformance; the
+     * index had actually fallen over the window, so even the SIGN of the
+     * conclusion was unreliable.
+     *
+     * A stale series is a data-freshness problem, so say so and report null
+     * rather than emitting a number that cannot be true. Fix by running
+     * `npm run backfill:benchmark-bars`.
+     */
+    const lastFlowDate = flows.reduce(
+      (max, f) => (f.date > max ? f.date : max),
+      flows[0]?.date ?? asOf,
+    );
+
+    if (terminal.date < lastFlowDate) {
+      const iso = (d: Date) => d.toISOString().slice(0, 10);
+      return {
+        code: bm.code,
+        name: bm.name,
+        xirr: null,
+        interim: null,
+        units: null,
+        value: null,
+        reason:
+          `${bm.symbol} price history ends ${iso(terminal.date)}, before the last cash flow on ` +
+          `${iso(lastFlowDate)}. Valuing the benchmark on a stale bar would report a 0% return and ` +
+          `turn Alpha into the portfolio return. Run \`npm run backfill:benchmark-bars\` to refresh the index series.`,
       };
     }
 
@@ -624,11 +668,18 @@ export class PerformanceService {
     return out;
   }
 
-  private async latestClose(symbol: string): Promise<number | null> {
+  /**
+   * The newest bar for a symbol. Returns the DATE alongside the close because the
+   * caller has to know how stale the valuation price is — a terminal close taken
+   * from a bar that predates the flows silently produces a 0% benchmark (see the
+   * staleness guard in `benchmark`).
+   */
+  private async latestBar(symbol: string): Promise<{ date: Date; adjClose: number } | null> {
     const bar = await this.prisma.priceBar.findFirst({
       where: { symbol },
       orderBy: { date: 'desc' },
+      select: { date: true, adjClose: true },
     });
-    return bar ? bar.adjClose : null;
+    return bar ?? null;
   }
 }

@@ -20,7 +20,8 @@
     "test:debug": "node --inspect-brk -r tsconfig-paths/register node_modules/.bin/jest --runInBand",
     "import:workbook": "ts-node -r tsconfig-paths/register src/analytics/ingestion/import-workbook.cli.ts",
     "seed:scoring-rules": "ts-node -r tsconfig-paths/register src/fundamentals/seed-scoring-rules.ts",
-    "normalize:accounting-method": "ts-node -r tsconfig-paths/register src/analytics/scripts/normalize-accounting-method.ts"
+    "normalize:accounting-method": "ts-node -r tsconfig-paths/register src/analytics/scripts/normalize-accounting-method.ts",
+    "backfill:benchmark-bars": "ts-node -r tsconfig-paths/register src/analytics/scripts/backfill-benchmark-bars.ts"
   },
   "dependencies": {
     "@nestjs/common": "^10.2.8",
