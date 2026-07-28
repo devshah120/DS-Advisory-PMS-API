@@ -39,6 +39,23 @@ model User {
   notifyCorporateActions  Boolean?
   notifyProductUpdates    Boolean?
 
+  /// Settings > Security, Two-Factor Authentication (TOTP).
+  ///
+  /// `twoFactorSecret` holds the base32 shared secret. It is written during
+  /// setup — before the user has proven they can generate a code — so
+  /// `twoFactorEnabled` is the only flag the login gate reads. A secret with the
+  /// flag still false means "setup started but never confirmed", and is simply
+  /// overwritten by the next setup attempt.
+  twoFactorEnabled Boolean @default(false)
+  twoFactorSecret  String?
+  /// bcrypt hashes of the single-use recovery codes shown once at enrolment.
+  /// Hashed for the same reason passwords are: a database leak must not hand
+  /// over a working second factor. A consumed code is spliced out of the array.
+  twoFactorRecoveryCodes String[] @default([])
+  twoFactorEnabledAt     DateTime?
+
+  sessions Session[]
+
   /// When set, this User is a client login (role VIEWER) created from the client
   /// add/edit form, scoped to a single mandate. Staff logins leave this null.
   ///
@@ -69,6 +86,39 @@ model PasswordReset {
 
   @@index([email])
   @@map("password_resets")
+}
+
+/// One row per signed-in device, created when a login completes and deleted when
+/// that device is revoked or signs out. This is what Settings > Security lists.
+///
+/// The refresh token is stored as a SHA-256 hash, not in the clear: the row's
+/// whole purpose is to let a user kill a session they don't recognise, and a
+/// readable token would let anyone with database access resume it instead.
+/// AuthService checks every refresh against this table, so deleting the row is
+/// what actually ends the session — the access token then expires on its own.
+model Session {
+  id     String @id @default(cuid()) @map("_id")
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// SHA-256 of the refresh token. Rotated on every successful refresh so a
+  /// stolen-and-replayed token can't outlive the legitimate device's next call.
+  refreshTokenHash String @unique
+
+  /// Raw User-Agent plus what we parsed out of it, denormalized so the list
+  /// endpoint doesn't re-parse on every read. Nullable: a non-browser client
+  /// (curl, a test) may send no User-Agent at all.
+  userAgent String?
+  browser   String?
+  os        String?
+  ip        String?
+
+  lastSeenAt DateTime @default(now())
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+
+  @@index([userId])
+  @@map("sessions")
 }
 
 enum Role {

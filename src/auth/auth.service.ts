@@ -6,22 +6,48 @@ import {
 import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcrypt';
 import * as crypto from 'crypto';
+import { UAParser } from 'ua-parser-js';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { MailService } from '../mail/mail.service';
+import { SecurityService } from '../users/security.service';
 import { LoginDto } from './dto/login.dto';
 import { ForgotPasswordDto } from './dto/forgot-password.dto';
 import { ResetPasswordDto } from './dto/reset-password.dto';
+import { TwoFactorLoginDto } from './dto/two-factor-login.dto';
 
 /** How long a reset code stays valid, and how many wrong tries are allowed. */
 const OTP_TTL_MINUTES = 10;
 const OTP_MAX_ATTEMPTS = 5;
+
+/** Lifetime of a refresh token, mirrored onto the Session row it creates. */
+const REFRESH_TOKEN_DAYS = 7;
+
+/**
+ * How long the user has to enter their 2FA code before the challenge expires.
+ * Short on purpose: it is a bearer token that has already cleared the password
+ * check, so it should not outlive the screen that consumes it.
+ */
+const TWO_FACTOR_CHALLENGE_TTL = '5m';
+
+/**
+ * Marks a JWT as "password accepted, awaiting second factor". Checked when the
+ * challenge is redeemed so a normal access token can't be passed off as one.
+ */
+const TWO_FACTOR_PURPOSE = '2fa_challenge';
+
+/** Details of the calling device, passed down from the controller. */
+export interface RequestContext {
+  userAgent?: string;
+  ip?: string;
+}
 
 @Injectable()
 export class AuthService {
   constructor(
     private prisma: PrismaService,
     private jwtService: JwtService,
-    private mailService: MailService
+    private mailService: MailService,
+    private securityService: SecurityService
   ) {}
 
   private get bypassEnabled() {
@@ -38,11 +64,11 @@ export class AuthService {
     };
   }
 
-  async login(loginDto: LoginDto) {
+  async login(loginDto: LoginDto, context: RequestContext = {}) {
     const { email, password } = loginDto;
 
     if (this.bypassEnabled) {
-      return this.generateTokens(this.bypassUser(email));
+      return this.generateTokens(this.bypassUser(email), context);
     }
 
     const user = await this.prisma.user.findUnique({
@@ -53,7 +79,61 @@ export class AuthService {
       throw new UnauthorizedException('Invalid credentials');
     }
 
-    return this.generateTokens(user);
+    // Password was correct but the account has a second factor: hand back a
+    // short-lived challenge instead of tokens. No session is recorded yet —
+    // the sign-in isn't complete until the code is verified.
+    if (user.twoFactorEnabled) {
+      return {
+        twoFactorRequired: true as const,
+        challengeToken: this.jwtService.sign(
+          { sub: user.id, purpose: TWO_FACTOR_PURPOSE },
+          { expiresIn: TWO_FACTOR_CHALLENGE_TTL }
+        ),
+      };
+    }
+
+    return this.generateTokens(user, context);
+  }
+
+  /**
+   * Step 2 of a two-factor login: exchange the challenge for real tokens.
+   *
+   * The `purpose` claim is checked explicitly so an access or refresh token
+   * can't be replayed here as a challenge — without it, any valid token signed
+   * with the same secret would satisfy this endpoint.
+   */
+  async loginTwoFactor(dto: TwoFactorLoginDto, context: RequestContext = {}) {
+    let payload: any;
+    try {
+      payload = this.jwtService.verify(dto.challengeToken);
+    } catch {
+      throw new UnauthorizedException(
+        'Your sign-in attempt has expired. Please sign in again.'
+      );
+    }
+
+    if (payload?.purpose !== TWO_FACTOR_PURPOSE || !payload?.sub) {
+      throw new UnauthorizedException('Invalid sign-in attempt. Please start again.');
+    }
+
+    const user = await this.prisma.user.findUnique({ where: { id: payload.sub } });
+    if (!user || !user.twoFactorEnabled || !user.twoFactorSecret) {
+      throw new UnauthorizedException('Invalid sign-in attempt. Please start again.');
+    }
+
+    const valid = dto.isRecoveryCode
+      ? await this.securityService.consumeRecoveryCode(user.id, dto.code)
+      : this.securityService.verifyTotp(dto.code, user.twoFactorSecret);
+
+    if (!valid) {
+      throw new UnauthorizedException(
+        dto.isRecoveryCode
+          ? 'That recovery code is not valid or has already been used.'
+          : "That code isn't valid. Check your authenticator app and try again."
+      );
+    }
+
+    return this.generateTokens(user, context);
   }
 
   async validateUser(email: string, password: string) {
@@ -69,21 +149,52 @@ export class AuthService {
     return null;
   }
 
-  async refreshTokens(refreshToken: string) {
-    try {
-      const payload = this.jwtService.verify(refreshToken);
-      const user = await this.prisma.user.findUnique({
-        where: { id: payload.sub },
-      });
-
-      if (!user) {
-        throw new UnauthorizedException('User not found');
+  /**
+   * Exchanges a refresh token for a fresh pair, and is what makes "Revoke"
+   * actually end a session: the token must still match a Session row, so once
+   * that row is deleted the device can no longer refresh and is signed out as
+   * soon as its short-lived access token expires.
+   */
+  async refreshTokens(refreshToken: string, context: RequestContext = {}) {
+    if (this.bypassEnabled) {
+      try {
+        const payload = this.jwtService.verify(refreshToken);
+        return this.generateTokens(this.bypassUser(payload.email), context);
+      } catch {
+        throw new UnauthorizedException('Invalid refresh token');
       }
+    }
 
-      return this.generateTokens(user);
+    let payload: any;
+    try {
+      payload = this.jwtService.verify(refreshToken);
     } catch {
       throw new UnauthorizedException('Invalid refresh token');
     }
+
+    const user = await this.prisma.user.findUnique({
+      where: { id: payload.sub },
+    });
+    if (!user) {
+      throw new UnauthorizedException('User not found');
+    }
+
+    const session = await this.prisma.session.findUnique({
+      where: { refreshTokenHash: this.securityService.hashToken(refreshToken) },
+    });
+
+    if (!session || session.userId !== user.id) {
+      throw new UnauthorizedException('This session has been signed out');
+    }
+
+    if (session.expiresAt.getTime() < Date.now()) {
+      await this.prisma.session.delete({ where: { id: session.id } });
+      throw new UnauthorizedException('This session has expired');
+    }
+
+    // Rotate in place rather than creating a new row, so the device keeps one
+    // stable entry in the session list across refreshes instead of multiplying.
+    return this.generateTokens(user, context, session.id);
   }
 
   /**
@@ -170,7 +281,18 @@ export class AuthService {
     return { message: 'Your password has been reset. You can now sign in.' };
   }
 
-  private generateTokens(user: any) {
+  /**
+   * Issues a token pair and records the device against it.
+   *
+   * `sessionId` rotates an existing row (a refresh from a known device);
+   * omitting it creates one (a fresh sign-in). Session tracking is skipped
+   * entirely under AUTH_BYPASS, where the user has no database row to relate to.
+   */
+  private async generateTokens(
+    user: any,
+    context: RequestContext = {},
+    sessionId?: string
+  ) {
     const payload = {
       sub: user.id,
       email: user.email,
@@ -179,8 +301,32 @@ export class AuthService {
 
     const accessToken = this.jwtService.sign(payload);
     const refreshToken = this.jwtService.sign(payload, {
-      expiresIn: '7d',
-    });
+      // A random claim so two logins from the same account never produce an
+      // identical refresh token. Without it, signing in twice in the same
+      // second yields the same JWT, and `refreshTokenHash` is @unique — the
+      // second device's session row would collide instead of being created.
+      ...{ jti: crypto.randomUUID() },
+      expiresIn: `${REFRESH_TOKEN_DAYS}d`,
+    } as any);
+
+    if (!this.bypassEnabled) {
+      const device = this.parseUserAgent(context.userAgent);
+      const data = {
+        refreshTokenHash: this.securityService.hashToken(refreshToken),
+        userAgent: context.userAgent ?? null,
+        browser: device.browser,
+        os: device.os,
+        ip: context.ip ?? null,
+        lastSeenAt: new Date(),
+        expiresAt: new Date(Date.now() + REFRESH_TOKEN_DAYS * 24 * 60 * 60 * 1000),
+      };
+
+      if (sessionId) {
+        await this.prisma.session.update({ where: { id: sessionId }, data });
+      } else {
+        await this.prisma.session.create({ data: { ...data, userId: user.id } });
+      }
+    }
 
     return {
       accessToken,
@@ -193,5 +339,32 @@ export class AuthService {
         role: user.role,
       },
     };
+  }
+
+  /**
+   * Turns a User-Agent into the two labels the session list shows. Deliberately
+   * coarse — this exists so a user can recognise their own devices ("Safari ·
+   * iPhone"), not to fingerprint them.
+   */
+  private parseUserAgent(userAgent?: string) {
+    if (!userAgent) return { browser: null, os: null };
+
+    const { browser, os } = new UAParser(userAgent).getResult();
+    return {
+      browser: browser.name ?? null,
+      // Version is included because "Windows" alone reads oddly next to
+      // "iOS 17"; both come straight from the parser.
+      os: os.name ? [os.name, os.version].filter(Boolean).join(' ') : null,
+    };
+  }
+
+  /** Ends the calling device's session. Signing out elsewhere is a Settings action. */
+  async logout(refreshToken?: string) {
+    if (refreshToken && !this.bypassEnabled) {
+      await this.prisma.session.deleteMany({
+        where: { refreshTokenHash: this.securityService.hashToken(refreshToken) },
+      });
+    }
+    return { success: true };
   }
 }

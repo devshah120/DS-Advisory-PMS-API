@@ -9,12 +9,15 @@ import { PrismaModule } from '../common/prisma/prisma.module';
 import { ConfigModule } from '../config/config.module';
 import { ConfigService } from '../config/config.service';
 import { MailModule } from '../mail/mail.module';
+import { UsersModule } from '../users/users.module';
 
 @Module({
   imports: [
     PrismaModule,
     ConfigModule,
     MailModule,
+    // For SecurityService: verifying TOTP codes and recording sessions at login.
+    UsersModule,
     PassportModule,
     JwtModule.registerAsync({
       imports: [ConfigModule],
