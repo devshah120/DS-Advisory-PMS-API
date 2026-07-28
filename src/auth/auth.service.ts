@@ -300,14 +300,20 @@ export class AuthService {
     };
 
     const accessToken = this.jwtService.sign(payload);
-    const refreshToken = this.jwtService.sign(payload, {
-      // A random claim so two logins from the same account never produce an
-      // identical refresh token. Without it, signing in twice in the same
-      // second yields the same JWT, and `refreshTokenHash` is @unique — the
-      // second device's session row would collide instead of being created.
-      ...{ jti: crypto.randomUUID() },
-      expiresIn: `${REFRESH_TOKEN_DAYS}d`,
-    } as any);
+    const refreshToken = this.jwtService.sign(
+      {
+        ...payload,
+        // A random claim so two logins from the same account never produce an
+        // identical refresh token. Without it, signing in twice in the same
+        // second yields the same JWT, and `refreshTokenHash` is @unique — the
+        // second device's session row would collide instead of being created.
+        //
+        // This is a payload claim, not a sign option: jsonwebtoken validates
+        // its options object strictly and throws on anything it doesn't own.
+        jti: crypto.randomUUID(),
+      },
+      { expiresIn: `${REFRESH_TOKEN_DAYS}d` }
+    );
 
     if (!this.bypassEnabled) {
       const device = this.parseUserAgent(context.userAgent);
