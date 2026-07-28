@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { ConfigModule } from './config/config.module';
 import { PrismaModule } from './common/prisma/prisma.module';
 import { AuthModule } from './auth/auth.module';
+import { UsersModule } from './users/users.module';
 import { ClientsModule } from './clients/clients.module';
 import { HoldingsModule } from './holdings/holdings.module';
 import { TransactionsModule } from './transactions/transactions.module';
@@ -19,6 +20,7 @@ import { FundamentalsModule } from './fundamentals/fundamentals.module';
     ConfigModule,
     PrismaModule,
     AuthModule,
+    UsersModule,
     ClientsModule,
     HoldingsModule,
     TransactionsModule,

@@ -8,14 +8,36 @@ datasource db {
 }
 
 model User {
-  id        String  @id @default(cuid()) @map("_id")
-  email     String  @unique
-  firstName String
-  lastName  String
-  password  String
-  role      Role    @default(PORTFOLIO_MANAGER)
-  avatar    String?
-  active    Boolean @default(true)
+  id           String  @id @default(cuid()) @map("_id")
+  email        String  @unique
+  firstName    String
+  lastName     String
+  password     String
+  role         Role    @default(PORTFOLIO_MANAGER)
+  avatar       String?
+  active       Boolean @default(true)
+  /// Firm the user belongs to, shown on the Settings > Profile tab. Free text —
+  /// there is no Organization model; this is a label, not a tenancy boundary.
+  organization String?
+
+  /// Settings > Preferences. Every field is optional at the DB level so existing
+  /// rows read back as null; UsersService substitutes the documented defaults
+  /// (system / USD / MMM D, YYYY / en-US / comfortable) so the API always
+  /// returns a fully-populated object and the UI never renders an empty select.
+  theme        String?
+  baseCurrency String?
+  dateFormat   String?
+  numberFormat String?
+  density      String?
+
+  /// Settings > Notifications. Nullable for the same reason as above: absent
+  /// means "never chosen", which resolves to the default in UsersService rather
+  /// than to `false` — otherwise every existing user would silently be opted out.
+  notifyTradeAlerts       Boolean?
+  notifyPriceTargets      Boolean?
+  notifyWeeklyDigest      Boolean?
+  notifyCorporateActions  Boolean?
+  notifyProductUpdates    Boolean?
 
   /// When set, this User is a client login (role VIEWER) created from the client
   /// add/edit form, scoped to a single mandate. Staff logins leave this null.
