@@ -1,6 +1,7 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { AmendBaselineDto } from './dto/amend-baseline.dto';
+import { BaselineService } from './baseline.service';
 
 /**
  * The one and only path that can change a baseline after BaselineService has
@@ -17,7 +18,10 @@ import { AmendBaselineDto } from './dto/amend-baseline.dto';
  */
 @Injectable()
 export class BaselineAdminService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private baselineService: BaselineService,
+  ) {}
 
   async amend(clientId: string, dto: AmendBaselineDto, amendedBy?: string) {
     const baseline = await this.prisma.portfolioBaseline.findUnique({ where: { clientId } });
@@ -46,6 +50,56 @@ export class BaselineAdminService {
             industry: h.industry,
           })),
         },
+      },
+      include: { holdings: true },
+    });
+  }
+
+  /**
+   * Deletes a client's existing baseline and rebuilds it from scratch via
+   * BaselineService.autoSeed — for correcting a baseline that was seeded
+   * before a bug in the auto-seed math (or the price lookup it depends on)
+   * was fixed, without requiring an admin to hand-type the right numbers via
+   * `amend`. Also clears any PortfolioValuation/HoldingSnapshot rows for the
+   * client: they were computed FROM the bad baseline (via
+   * PortfolioReconstructionService), so they are just as wrong and must not
+   * survive as stale cached "truth" that the fixed baseline can no longer
+   * explain — PortfolioHistoryService.getPortfolioAsOf would otherwise keep
+   * serving the old, wrong snapshot instead of ever reconstructing again.
+   */
+  async reseedFromHoldings(clientId: string, reason: string, amendedBy?: string) {
+    const existing = await this.prisma.portfolioBaseline.findUnique({ where: { clientId } });
+
+    // HoldingSnapshot has no direct clientId column (it hangs off
+    // PortfolioValuation), and a nested-relation filter on deleteMany is not
+    // reliably supported by Prisma's MongoDB connector for writes — so this
+    // resolves the parent ids first rather than filtering through the
+    // relation in one call.
+    const valuations = await this.prisma.portfolioValuation.findMany({
+      where: { clientId },
+      select: { id: true },
+    });
+    const valuationIds = valuations.map((v) => v.id);
+
+    if (valuationIds.length > 0) {
+      await this.prisma.holdingSnapshot.deleteMany({ where: { snapshotId: { in: valuationIds } } });
+    }
+    await this.prisma.portfolioValuation.deleteMany({ where: { clientId } });
+
+    if (existing) {
+      await this.prisma.baselineHolding.deleteMany({ where: { baselineId: existing.id } });
+      await this.prisma.portfolioBaseline.delete({ where: { clientId } });
+    }
+
+    await this.baselineService.autoSeed(clientId);
+
+    const stamp = new Date().toISOString();
+    const who = amendedBy ?? 'unknown admin';
+
+    return this.prisma.portfolioBaseline.update({
+      where: { clientId },
+      data: {
+        remarks: `[re-seeded ${stamp} by ${who}] ${reason}`,
       },
       include: { holdings: true },
     });

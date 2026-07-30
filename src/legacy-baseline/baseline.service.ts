@@ -123,18 +123,66 @@ export class BaselineService {
       }),
     );
 
+    const openingCash = await this.backOutOpeningCash(clientId, baselineDate, client.cashBalance);
+
     const openingPortfolioValue =
-      holdings.reduce((sum, h) => sum + h.quantity * h.averageCost, 0) + client.cashBalance;
+      holdings.reduce((sum, h) => sum + h.quantity * h.averageCost, 0) + openingCash;
 
     const dto: CreateBaselineDto = {
       baselineDate: baselineDate.toISOString().slice(0, 10),
       openingPortfolioValue,
-      openingCash: client.cashBalance,
+      openingCash,
       remarks: `Auto-seeded from Holdings + PriceBar on ${baselineDate.toISOString().slice(0, 10)}`,
       holdings,
     };
 
     return this.create(clientId, dto);
+  }
+
+  /**
+   * `client.cashBalance` is today's live buying-power balance — it already
+   * reflects every BUY/SELL/deposit/withdrawal/fee/dividend recorded since
+   * the baseline date. Seeding the baseline's `openingCash` with that figure
+   * directly double-counts: PortfolioReconstructionService starts from
+   * `openingCash` and replays the SAME post-baseline transactions on top of
+   * it, subtracting their cash effect a second time — which is why the
+   * reconstructed cash on a later date went negative even though the live
+   * balance is not.
+   *
+   * The fix is to back those same transactions' net cash effect OUT of
+   * today's balance first, using the identical sign convention
+   * PortfolioReconstructionService.applyTransaction uses, so that replaying
+   * them forward from `openingCash` lands back on today's real balance.
+   */
+  private async backOutOpeningCash(
+    clientId: string,
+    baselineDate: Date,
+    currentCashBalance: number,
+  ): Promise<number> {
+    const ledger = await this.prisma.transaction.findMany({
+      where: { clientId, date: { gt: baselineDate } },
+    });
+
+    let netCashSinceBaseline = 0;
+    for (const t of ledger) {
+      switch (t.type) {
+        case 'BUY':
+        case 'FEES':
+        case 'CASH_WITHDRAWAL':
+          netCashSinceBaseline -= Math.abs(t.amount);
+          break;
+        case 'SELL':
+        case 'DIVIDEND':
+        case 'CASH_DEPOSIT':
+          netCashSinceBaseline += Math.abs(t.amount);
+          break;
+        // SPLIT / BONUS / TRANSFER move no cash — see applyTransaction.
+        default:
+          break;
+      }
+    }
+
+    return currentCashBalance - netCashSinceBaseline;
   }
 
   async autoSeedAllClients(baselineDate: Date = JUN30_REBASE_DATE): Promise<AutoSeedSummary> {

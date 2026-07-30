@@ -26,13 +26,27 @@ export class HistoricalPriceService {
     private market: MarketService,
   ) {}
 
+  /**
+   * A bar is "close enough" to satisfy `date` without a live fetch only if
+   * it falls within this many days of it. Weekends/holidays can legitimately
+   * push the nearest real trading day back a few days, but a bar this stale
+   * means PriceBar was simply never backfilled past some earlier date — the
+   * exact failure mode that made a 30-July request for AAPL silently return
+   * its 30-June close (a month-old price, reused for a whole month of
+   * requests), making a reconstructed portfolio's value identical to its
+   * baseline even though 20 real trading days had passed.
+   */
+  private static readonly MAX_STALE_DAYS = 5;
+
   /** Closing price for `ticker` on or before `date`. Null if truly no history exists. */
   async closeOn(ticker: string, date: Date): Promise<number | null> {
     const bar = await this.prisma.priceBar.findFirst({
       where: { symbol: ticker, date: { lte: date } },
       orderBy: { date: 'desc' },
     });
-    if (bar) return bar.adjClose;
+
+    const staleDays = bar ? (date.getTime() - bar.date.getTime()) / 86_400_000 : Infinity;
+    if (bar && staleDays <= HistoricalPriceService.MAX_STALE_DAYS) return bar.adjClose;
 
     await this.backfill(ticker, date);
 
@@ -40,7 +54,12 @@ export class HistoricalPriceService {
       where: { symbol: ticker, date: { lte: date } },
       orderBy: { date: 'desc' },
     });
-    return retried?.adjClose ?? null;
+
+    // The backfill may still legitimately miss the exact date (a fetch
+    // failure, or `date` itself being a non-trading day with no bar yet) —
+    // fall back to whatever bar we found before backfilling rather than
+    // returning null and dropping the position's price entirely.
+    return retried?.adjClose ?? bar?.adjClose ?? null;
   }
 
   /** Batched convenience wrapper — one query per ticker, run concurrently. */
