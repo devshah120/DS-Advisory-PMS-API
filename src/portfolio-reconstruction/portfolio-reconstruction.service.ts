@@ -1,7 +1,7 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { BaselineService } from '../legacy-baseline/baseline.service';
-import { HistoricalPriceService } from './historical-price.service';
+import { HistoricalPriceService } from '../historical-price/historical-price.service';
 import { allocationBy } from '../analytics/calculators/weights';
 import { Classification, PortfolioSnapshot, Position } from '../analytics/calculators/types';
 import { ReconstructedPortfolio, ReconstructedPosition } from './types';

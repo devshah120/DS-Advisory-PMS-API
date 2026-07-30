@@ -1,5 +1,8 @@
 import { Injectable } from '@nestjs/common';
+import { PrismaService } from '../common/prisma/prisma.service';
 import { PortfolioHistoryService } from './portfolio-history.service';
+import { BenchmarkHistoryService, BenchmarkWindowResult } from './benchmark-history.service';
+import { CashFlow } from '../analytics/calculators/xirr';
 
 export type PerformancePeriod = 'MTD' | 'QTD' | 'YTD' | 'CUSTOM';
 
@@ -13,6 +16,9 @@ export interface PeriodReturn {
    *  callers wanting a flow-adjusted figure feed `openingValue` into their
    *  own TWRR chain instead of using this field directly. */
   returnPct: number | null;
+  /** The index over the SAME window, same unit-purchase method as the
+   *  Current tab's Alpha card. Null when the client has no benchmark set. */
+  benchmark: BenchmarkWindowResult | null;
 }
 
 /**
@@ -35,7 +41,11 @@ export interface PeriodReturn {
  */
 @Injectable()
 export class PerformanceBaselineService {
-  constructor(private history: PortfolioHistoryService) {}
+  constructor(
+    private prisma: PrismaService,
+    private history: PortfolioHistoryService,
+    private benchmarkHistory: BenchmarkHistoryService,
+  ) {}
 
   /**
    * PART 5 resolution order:
@@ -57,7 +67,8 @@ export class PerformanceBaselineService {
     period: PerformancePeriod,
     range: { from: Date; to: Date },
   ): Promise<PeriodReturn> {
-    const [openingValue, closingPortfolio] = await Promise.all([
+    const [client, openingValue, closingPortfolio] = await Promise.all([
+      this.prisma.client.findUnique({ where: { id: clientId } }),
       this.openingValue(clientId, range.from),
       this.history.getPortfolioAsOf(clientId, range.to),
     ]);
@@ -65,7 +76,52 @@ export class PerformanceBaselineService {
     const closingValue = closingPortfolio.portfolioValue;
     const returnPct = openingValue > 0 ? (closingValue - openingValue) / openingValue : null;
 
-    return { period, from: range.from, to: range.to, openingValue, closingValue, returnPct };
+    const flows = await this.windowFlows(clientId, range.from, range.to, openingValue, closingValue);
+    const benchmark = client
+      ? await this.benchmarkHistory.windowReturn(undefined, client.benchmarkId, flows, range.to)
+      : null;
+
+    return { period, from: range.from, to: range.to, openingValue, closingValue, returnPct, benchmark };
+  }
+
+  /**
+   * The unit-purchase flow series for one window: the opening value stands
+   * in for "money invested at the start of the window" (negative — money
+   * in), the closing value is the terminal flow (positive — money out /
+   * still held). Any real deposit/withdrawal that falls strictly inside the
+   * window is added as its own flow, using the same TYPE → sign convention
+   * as buildFlows in analytics/calculators/flows.ts (CASH_DEPOSIT is money
+   * in, CASH_WITHDRAWAL is money out) — so a QTD window that happens to
+   * contain a real contribution still prices the benchmark correctly rather
+   * than pretending the whole window's money arrived on day one.
+   */
+  private async windowFlows(
+    clientId: string,
+    from: Date,
+    to: Date,
+    openingValue: number,
+    closingValue: number,
+  ): Promise<CashFlow[]> {
+    const midWindowDeposits = await this.prisma.transaction.findMany({
+      where: {
+        clientId,
+        type: { in: ['CASH_DEPOSIT', 'CASH_WITHDRAWAL'] },
+        date: { gt: from, lt: to },
+      },
+      orderBy: { date: 'asc' },
+    });
+
+    const flows: CashFlow[] = [{ date: from, amount: -openingValue }];
+
+    for (const t of midWindowDeposits) {
+      flows.push({
+        date: t.date,
+        amount: t.type === 'CASH_DEPOSIT' ? -Math.abs(t.amount) : Math.abs(t.amount),
+      });
+    }
+
+    flows.push({ date: to, amount: closingValue });
+    return flows;
   }
 
   /** Convenience windows — calendar MTD/QTD/YTD anchored on `asOf` (defaults to now). */

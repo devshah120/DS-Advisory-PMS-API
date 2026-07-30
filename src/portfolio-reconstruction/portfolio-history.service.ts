@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { PortfolioReconstructionService } from './portfolio-reconstruction.service';
+import { BenchmarkHistoryService } from './benchmark-history.service';
 import { ReconstructedPortfolio } from './types';
 
 function utcDay(d: Date): Date {
@@ -27,6 +28,7 @@ export class PortfolioHistoryService {
   constructor(
     private prisma: PrismaService,
     private reconstruction: PortfolioReconstructionService,
+    private benchmarkHistory: BenchmarkHistoryService,
   ) {}
 
   /** Exact-date lookup only — no fallback. Used by getPortfolioAsOf and PerformanceBaselineService. */
@@ -60,6 +62,7 @@ export class PortfolioHistoryService {
   ): Promise<void> {
     const day = utcDay(date);
     const portfolio = await this.reconstruction.reconstruct(clientId, day);
+    const benchmarkValue = await this.benchmarkValueFor(clientId, portfolio.baselineDate, day, portfolio);
 
     const valuation = await this.prisma.portfolioValuation.upsert({
       where: { clientId_date: { clientId, date: day } },
@@ -72,6 +75,7 @@ export class PortfolioHistoryService {
         totalCost: portfolio.totalCost,
         unrealizedPnL: portfolio.unrealizedGain,
         realizedPnL: portfolio.realizedGain,
+        benchmarkValue,
         positionCount: portfolio.positions.length,
         isQuarterEnd: opts.isQuarterEnd ?? false,
         source: 'snapshot-scheduler',
@@ -83,6 +87,7 @@ export class PortfolioHistoryService {
         totalCost: portfolio.totalCost,
         unrealizedPnL: portfolio.unrealizedGain,
         realizedPnL: portfolio.realizedGain,
+        benchmarkValue,
         positionCount: portfolio.positions.length,
         // Re-running the daily job must not un-flag a quarter-end snapshot
         // that already ran for the same date; only turn it on, never off.
@@ -116,6 +121,36 @@ export class PortfolioHistoryService {
       `Snapshot written: client=${clientId} date=${day.toISOString().slice(0, 10)} ` +
         `value=${portfolio.portfolioValue.toFixed(2)} quarterEnd=${opts.isQuarterEnd ?? false}`,
     );
+  }
+
+  /**
+   * Benchmark units notionally bought at the baseline date with the
+   * baseline's opening value, valued at this snapshot's date — gives every
+   * stored snapshot its own "what if this had been the index instead"
+   * comparison point without a live recompute later. Returns null (not an
+   * error) when the client has no benchmark set or price coverage is
+   * missing — a snapshot must still write successfully either way.
+   */
+  private async benchmarkValueFor(
+    clientId: string,
+    baselineDate: Date,
+    snapshotDate: Date,
+    portfolio: ReconstructedPortfolio,
+  ): Promise<number | undefined> {
+    const client = await this.prisma.client.findUnique({ where: { id: clientId } });
+    if (!client) return undefined;
+
+    const baseline = await this.prisma.portfolioBaseline.findUnique({ where: { clientId } });
+    const openingValue = baseline?.openingPortfolioValue ?? portfolio.portfolioValue;
+
+    const value = await this.benchmarkHistory.notionalValue(
+      undefined,
+      client.benchmarkId,
+      openingValue,
+      baselineDate,
+      snapshotDate,
+    );
+    return value ?? undefined;
   }
 
   private fromSnapshotRow(

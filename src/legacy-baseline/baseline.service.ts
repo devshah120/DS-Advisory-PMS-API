@@ -1,6 +1,14 @@
-import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { ConflictException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../common/prisma/prisma.service';
+import { HistoricalPriceService } from '../historical-price/historical-price.service';
+import { JUN30_REBASE_DATE } from '../analytics/calculators/flows';
 import { CreateBaselineDto } from './dto/create-baseline.dto';
+
+export interface AutoSeedSummary {
+  created: string[];
+  skipped: string[];
+  failed: Array<{ clientId: string; reason: string }>;
+}
 
 /**
  * The Legacy Portfolio Baseline: the immutable opening position imported for
@@ -16,7 +24,12 @@ import { CreateBaselineDto } from './dto/create-baseline.dto';
  */
 @Injectable()
 export class BaselineService {
-  constructor(private prisma: PrismaService) {}
+  private readonly logger = new Logger(BaselineService.name);
+
+  constructor(
+    private prisma: PrismaService,
+    private prices: HistoricalPriceService,
+  ) {}
 
   async create(clientId: string, dto: CreateBaselineDto, createdBy?: string) {
     const client = await this.prisma.client.findUnique({ where: { id: clientId } });
@@ -68,5 +81,84 @@ export class BaselineService {
       where: { clientId },
       include: { holdings: true },
     });
+  }
+
+  /**
+   * Builds a baseline for `clientId` from data already in Atlas, instead of
+   * requiring hand-typed holdings: current `Holding` rows, valued at their
+   * `baselineDate` close (falls back to the holding's own `averageCost` when
+   * no price bar exists for that date — the identical fallback order
+   * `rebaseLedgerToJun30` already uses in analytics/calculators/flows.ts, so
+   * the Current tab's rebase and this baseline agree on the same position's
+   * opening value).
+   *
+   * Idempotent: if the client already has a baseline, it is returned
+   * unchanged rather than re-created — safe to call from a "seed all
+   * clients" sweep without double-creating or needing a pre-check per call.
+   */
+  async autoSeed(clientId: string, baselineDate: Date = JUN30_REBASE_DATE) {
+    const existing = await this.findOrNull(clientId);
+    if (existing) return existing;
+
+    const client = await this.prisma.client.findUnique({
+      where: { id: clientId },
+      include: { holdings: true },
+    });
+    if (!client) throw new NotFoundException(`Client ${clientId} not found`);
+
+    const open = client.holdings.filter((h) => h.quantity !== 0);
+
+    const holdings = await Promise.all(
+      open.map(async (h) => {
+        const close = await this.prices.closeOn(h.ticker, baselineDate);
+        const price = close ?? h.averageCost;
+        return {
+          ticker: h.ticker,
+          quantity: h.quantity,
+          averageCost: price,
+          currency: client.currency,
+          sector: h.sector,
+          industry: h.industry,
+        };
+      }),
+    );
+
+    const openingPortfolioValue =
+      holdings.reduce((sum, h) => sum + h.quantity * h.averageCost, 0) + client.cashBalance;
+
+    const dto: CreateBaselineDto = {
+      baselineDate: baselineDate.toISOString().slice(0, 10),
+      openingPortfolioValue,
+      openingCash: client.cashBalance,
+      remarks: `Auto-seeded from Holdings + PriceBar on ${baselineDate.toISOString().slice(0, 10)}`,
+      holdings,
+    };
+
+    return this.create(clientId, dto);
+  }
+
+  async autoSeedAllClients(baselineDate: Date = JUN30_REBASE_DATE): Promise<AutoSeedSummary> {
+    const clients = await this.prisma.client.findMany({
+      where: { status: 'ACTIVE' },
+      select: { id: true, name: true },
+    });
+
+    const summary: AutoSeedSummary = { created: [], skipped: [], failed: [] };
+
+    for (const client of clients) {
+      try {
+        const alreadyExisted = await this.findOrNull(client.id);
+        await this.autoSeed(client.id, baselineDate);
+        (alreadyExisted ? summary.skipped : summary.created).push(client.name);
+      } catch (error) {
+        // One client's failure (e.g. no holdings, no client record) must not
+        // block the rest — matches the same tolerance pattern used by
+        // SnapshotScheduler.runForAllClients.
+        this.logger.warn(`Auto-seed failed for ${client.name} (${client.id}): ${(error as Error).message}`);
+        summary.failed.push({ clientId: client.id, reason: (error as Error).message });
+      }
+    }
+
+    return summary;
   }
 }
