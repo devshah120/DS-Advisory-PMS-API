@@ -29,6 +29,13 @@ export interface MarketQuote {
   ytdChangePercent: number | null;
 }
 
+export interface ClientMover {
+  clientId: string;
+  clientName: string;
+  marketValue: number;
+  changePercent: number;
+}
+
 const TRACKED_INDICES = [
   { code: 'SP500', label: 'S&P 500', symbol: '^GSPC' },
   { code: 'NASDAQ', label: 'Nasdaq', symbol: '^IXIC' },
@@ -52,7 +59,7 @@ export class DashboardService {
 
   async getOverview() {
     const [clients, stored, exposure, cashAgg] = await Promise.all([
-      this.prisma.client.count(),
+      this.prisma.client.findMany({ select: { id: true, name: true } }),
       this.prisma.holding.findMany(),
       this.house.exposure(),
       // House-wide idle cash: summed straight off the client records, so a
@@ -64,13 +71,14 @@ export class DashboardService {
     const holdings = await this.withLiveMarketValue(stored);
     const totalAUM = holdings.reduce((sum, h) => sum + h.marketValue, 0);
     const totalCash = cashAgg._sum.cashBalance ?? 0;
-    const movers = await this.dailyMovers(holdings);
+    const closesByTicker = await this.closesForTickers(holdings.map((h) => h.ticker));
+    const movers = this.dailyMovers(holdings, closesByTicker);
 
     return {
       totalAUM,
       // Cash the house holds across every client — deployable, not yet invested.
       totalCash,
-      numClients: clients,
+      numClients: clients.length,
       numHoldings: holdings.length,
       // movers is sorted best-to-worst. Split by sign so a flat/green day
       // can't list a riser under "losers" (and vice versa) just to fill three
@@ -86,6 +94,9 @@ export class DashboardService {
       // Same book, grouped by ticker instead of sector: one row per stock
       // regardless of how many clients hold it, ranked by combined market value.
       topHoldings: this.topHoldingsByTicker(holdings, totalAUM),
+      // Per-client day change, weighted by each client's own holdings — reuses
+      // the same closes fetched for movers so this doesn't double the Yahoo calls.
+      clientMovers: this.clientDailyMovers(holdings, clients, closesByTicker),
     };
   }
 
@@ -147,21 +158,16 @@ export class DashboardService {
       .sort((a, b) => b.marketValue - a.marketValue);
   }
 
-  /**
-   * Day-over-day % change per ticker (today's close vs. the prior trading
-   * day's close), ranked. One ticker held by multiple clients is fetched
-   * once and reused — Yahoo doesn't care which client owns it — and collapses
-   * to a single row, so a widely-held name can't fill the board on its own.
-   */
-  private async dailyMovers(holdings: Array<{ ticker: string; company: string; clientId: string; marketValue: number }>): Promise<HoldingMover[]> {
-    const tickers = [...new Set(holdings.map((h) => h.ticker))];
+  /** Fetches recent daily closes for every distinct ticker, once, shared by movers and client movers. */
+  private async closesForTickers(tickers: string[]): Promise<Map<string, DailyClose[]>> {
+    const distinct = [...new Set(tickers)];
     // A short window comfortably spans the last two trading days through any
     // weekend/holiday gap without pulling a year of history per ticker.
     const from = toIsoDate(daysAgo(10));
 
     const closesByTicker = new Map<string, DailyClose[]>();
     await Promise.all(
-      tickers.map(async (ticker) => {
+      distinct.map(async (ticker) => {
         try {
           closesByTicker.set(ticker, await this.market.history(ticker, from));
         } catch {
@@ -169,7 +175,18 @@ export class DashboardService {
         }
       }),
     );
+    return closesByTicker;
+  }
 
+  /**
+   * Day-over-day % change per ticker (today's close vs. the prior trading
+   * day's close), ranked. One ticker held by multiple clients collapses
+   * to a single row, so a widely-held name can't fill the board on its own.
+   */
+  private dailyMovers(
+    holdings: Array<{ ticker: string; company: string; clientId: string; marketValue: number }>,
+    closesByTicker: Map<string, DailyClose[]>,
+  ): HoldingMover[] {
     // Collapse to one row per ticker. The % move belongs to the security, not
     // to any one client's lot, so multiple holders would otherwise produce
     // identical duplicate rows and crowd out genuinely different names.
@@ -198,6 +215,43 @@ export class DashboardService {
     }
 
     return [...byTicker.values()].sort((a, b) => b.changePercent - a.changePercent);
+  }
+
+  /**
+   * Day-over-day % change per client, weighted by each holding's market value
+   * (today's close vs. prior close), so a client's box mirrors a market
+   * index's day change rather than a simple average across their tickers.
+   * Clients with no priceable holdings (e.g. all-cash, or every ticker
+   * missing two closes) are omitted rather than shown as a false 0%.
+   */
+  private clientDailyMovers(
+    holdings: Array<{ ticker: string; clientId: string; marketValue: number; quantity: number }>,
+    clients: Array<{ id: string; name: string }>,
+    closesByTicker: Map<string, DailyClose[]>,
+  ): ClientMover[] {
+    const nameById = new Map(clients.map((c) => [c.id, c.name]));
+    const byClient = new Map<string, { priorValue: number; currentValue: number }>();
+
+    for (const h of holdings) {
+      const bars = closesByTicker.get(h.ticker) ?? [];
+      if (bars.length < 2) continue;
+      const [prior, last] = bars.slice(-2);
+      if (prior.close === 0) continue;
+
+      const entry = byClient.get(h.clientId) ?? { priorValue: 0, currentValue: 0 };
+      entry.priorValue += h.quantity * prior.close;
+      entry.currentValue += h.quantity * last.close;
+      byClient.set(h.clientId, entry);
+    }
+
+    return [...byClient.entries()]
+      .map(([clientId, v]) => ({
+        clientId,
+        clientName: nameById.get(clientId) ?? 'Unknown',
+        marketValue: v.currentValue,
+        changePercent: v.priorValue !== 0 ? ((v.currentValue - v.priorValue) / v.priorValue) * 100 : 0,
+      }))
+      .sort((a, b) => b.changePercent - a.changePercent);
   }
 
   /** Live daily and YTD % change for the tracked indices and commodities. */
