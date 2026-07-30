@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { ScheduleModule } from '@nestjs/schedule';
 import { ConfigModule } from './config/config.module';
 import { PrismaModule } from './common/prisma/prisma.module';
 import { AuthModule } from './auth/auth.module';
@@ -14,10 +15,15 @@ import { AnalyticsModule } from './analytics/analytics.module';
 import { ReportsModule } from './reports/reports.module';
 import { EventsModule } from './events/events.module';
 import { FundamentalsModule } from './fundamentals/fundamentals.module';
+import { LegacyBaselineModule } from './legacy-baseline/legacy-baseline.module';
+import { PortfolioReconstructionModule } from './portfolio-reconstruction/portfolio-reconstruction.module';
 
 @Module({
   imports: [
     ConfigModule,
+    // Enables @Cron() in SnapshotScheduler (portfolio-reconstruction module).
+    // Not used anywhere else in the codebase before this change.
+    ScheduleModule.forRoot(),
     PrismaModule,
     AuthModule,
     UsersModule,
@@ -32,6 +38,8 @@ import { FundamentalsModule } from './fundamentals/fundamentals.module';
     ReportsModule,
     EventsModule,
     FundamentalsModule,
+    LegacyBaselineModule,
+    PortfolioReconstructionModule,
   ],
 })
 export class AppModule {}

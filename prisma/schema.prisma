@@ -195,6 +195,16 @@ model Client {
   /// MongoDB (see User.clientId), but ClientsService keeps it to at most one.
   loginUsers User[]
 
+  /// The immutable legacy import baseline (see PortfolioBaseline). Not
+  /// `@unique` here — the one-per-client rule is a Prisma-relation-field
+  /// convenience only; PortfolioBaseline.clientId carries the real @unique
+  /// constraint that enforces it at the database level.
+  baseline   PortfolioBaseline?
+  /// Historical daily NAV rows written by the snapshot scheduler — see
+  /// PortfolioHistoryService. Empty until the first snapshot runs for this
+  /// client.
+  valuations PortfolioValuation[]
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -444,6 +454,7 @@ enum AssetClass {
 model PortfolioValuation {
   id       String   @id @default(cuid()) @map("_id")
   clientId String
+  client   Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
   date     DateTime
 
   securitiesValue Float
@@ -466,10 +477,75 @@ model PortfolioValuation {
   stale         Boolean @default(false)
   source        String  @default("eod-job")
 
+  /// Sum of quantity * averageCost across positions as of `date` — the
+  /// accounting-cost figure, distinct from `totalValue` (market value). Used by
+  /// gain/loss reporting; never fed into performance-return math.
+  totalCost Float @default(0)
+  /// totalValue's securities leg minus totalCost. Derived at write time and
+  /// cached here so historical reports don't need a live replay to show it.
+  unrealizedPnL Float @default(0)
+  /// Cumulative realized gain from every SELL replayed up to and including
+  /// `date`. Cumulative (not "since last snapshot") so any single row is a
+  /// complete answer on its own.
+  realizedPnL Float @default(0)
+  /// Benchmark value on the same unit-purchase basis as PerformanceService,
+  /// valued as of `date`. Null until a benchmark is resolved for the client.
+  benchmarkValue Float?
+  /// Portfolio XIRR as of `date`, using PortfolioHistoryService's own flow
+  /// build (not PerformanceService's) — see PortfolioHistoryService for why
+  /// the two are computed independently rather than sharing one call site.
+  xirr Float?
+  /// True only for the row the quarter-end scheduler wrote (or backfilled) for
+  /// a given quarter. A quarter can also acquire an ordinary daily row on the
+  /// same date before the scheduler runs; the scheduler upserts and sets this
+  /// flag rather than assuming its row is the first to exist for that date.
+  isQuarterEnd Boolean @default(false)
+
+  holdings HoldingSnapshot[]
+
   createdAt DateTime @default(now())
 
   @@unique([clientId, date])
   @@map("portfolio_valuations")
+}
+
+/// One row = one position's state on a specific PortfolioValuation date. Together
+/// with its parent this is the full "portfolio as it existed on that day" record
+/// that PortfolioHistoryService reads before falling back to a live reconstruction
+/// (see PART 7 in the architecture note / PortfolioHistoryService.getPortfolioAsOf).
+///
+/// Written once, atomically, alongside its parent PortfolioValuation row and never
+/// edited afterward — a re-run of the snapshot job deletes and reinserts the full
+/// set for that date rather than patching individual rows, so there is never a
+/// partial write visible to a reader.
+model HoldingSnapshot {
+  id         String             @id @default(cuid()) @map("_id")
+  snapshotId String
+  snapshot   PortfolioValuation @relation(fields: [snapshotId], references: [id], onDelete: Cascade)
+
+  ticker       String
+  quantity     Float
+  averageCost  Float
+  closingPrice Float
+  marketValue  Float
+  /// Weight against the parent snapshot's totalValue (TOTAL_ASSETS basis, matching
+  /// weights.ts elsewhere in the codebase).
+  allocation Float
+  sector     String
+  industry   String
+  /// Not in the original Part 6 field list, but needed so a snapshot-served
+  /// read (PortfolioHistoryService.getPortfolioAsOf) can rebuild country and
+  /// asset allocation from stored data alone — without them, a snapshot-served
+  /// date silently returns empty breakdowns while a reconstructed one doesn't,
+  /// breaking "the user should not know whether Snapshot or Reconstruction was
+  /// used" (PART 7).
+  country    String @default("Unknown")
+  assetClass String @default("EQUITY")
+
+  createdAt DateTime @default(now())
+
+  @@index([snapshotId])
+  @@map("holding_snapshots")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -688,4 +764,72 @@ model AnalyticsCache {
   @@unique([scope, metric, asOf])
   @@index([scope, asOf])
   @@map("analytics_cache")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Legacy Portfolio Baseline & Historical Reconstruction
+//
+// Real transaction history before the baseline date does not exist — clients
+// were bulk-imported as a snapshot of positions on a single date. Everything
+// from that date forward IS tracked transactionally in the existing
+// Transaction table. PortfolioReconstructionService replays Transaction rows
+// on top of BaselineHolding[] to answer "what did this portfolio look like on
+// date X", for any X after the baseline; PortfolioHistoryService caches that
+// answer as a PortfolioValuation + HoldingSnapshot[] row so most historical
+// reads don't require a full replay.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The immutable opening position for one client — what was imported before
+/// Atlas started recording transactions. Exactly one per client, and normally
+/// never touched again after creation: `@unique` on `clientId` is the database
+/// half of that guarantee, and BaselineService exposes no update method at all.
+/// The only path that can change a locked baseline is BaselineAdminService,
+/// gated to ADMIN and required to append to `remarks` rather than overwrite —
+/// see that service for the audit-trail rationale.
+model PortfolioBaseline {
+  id       String @id @default(cuid()) @map("_id")
+  clientId String @unique
+  client   Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  /// e.g. 2026-06-30. PortfolioReconstructionService refuses to reconstruct any
+  /// date before this one — there is nothing to replay onto.
+  baselineDate          DateTime
+  openingPortfolioValue Float
+  openingCash           Float
+  remarks               String?
+
+  createdAt DateTime  @default(now())
+  /// User id of whoever created (or, via BaselineAdminService, amended) this
+  /// row. Not a relation: the creating user may later be deactivated, and the
+  /// baseline must still show who set it.
+  createdBy String?
+  /// Set once the baseline is confirmed correct. Null briefly covers the
+  /// window between import and manual confirmation; BaselineService.create()
+  /// currently sets it immediately, but the field exists so a future
+  /// "review before locking" step doesn't need a migration.
+  lockedAt  DateTime?
+
+  holdings BaselineHolding[]
+
+  @@map("portfolio_baselines")
+}
+
+/// One imported position as of the baseline date. Never updated after the
+/// baseline is created — a correction goes through BaselineAdminService,
+/// which replaces the full set for the baseline rather than patching a row,
+/// so there is never a partially-corrected baseline visible to a reader.
+model BaselineHolding {
+  id         String            @id @default(cuid()) @map("_id")
+  baselineId String
+  baseline   PortfolioBaseline @relation(fields: [baselineId], references: [id], onDelete: Cascade)
+
+  ticker      String
+  quantity    Float
+  averageCost Float
+  currency    String
+  sector      String
+  industry    String
+
+  @@index([baselineId])
+  @@map("baseline_holdings")
 }
