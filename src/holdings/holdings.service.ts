@@ -220,8 +220,22 @@ export class HoldingsService {
    * only draw the position down, leaving averageCost untouched, so realised
    * gains never distort the basis of the remaining shares.
    */
+  /**
+   * Records a trade: it moves the position *and* writes the matching ledger
+   * row, because a position that no transaction explains is invisible to the
+   * Transactions screen and — more importantly — to XIRR, which reads its cash
+   * flows straight out of the ledger. The two writes live together here so
+   * every caller gets both; no caller should be writing a Transaction for a
+   * trade itself.
+   */
   async create(createHoldingDto: CreateHoldingDto) {
-    const { clientId, marketValue: _ignored, ...data } = createHoldingDto;
+    const {
+      clientId,
+      marketValue: _ignored,
+      date: tradeDate,
+      amountInvested,
+      ...data
+    } = createHoldingDto;
     const { ticker, quantity, averageCost, currentPrice } = data;
 
     if (quantity === 0) {
@@ -246,12 +260,21 @@ export class HoldingsService {
       if (quantity < 0) {
         throw new BadRequestException(`No open position in ${ticker} to sell`);
       }
-      return this.prisma.holding.create({
+      const created = await this.prisma.holding.create({
         data: {
           ...classified,
           ...derive(quantity, averageCost, currentPrice),
           client: { connect: { id: clientId } },
         },
+      });
+      return this.withLedgerRow(created, null, {
+        clientId,
+        ticker,
+        quantity,
+        averageCost,
+        currentPrice,
+        tradeDate,
+        amountInvested,
       });
     }
 
@@ -277,7 +300,7 @@ export class HoldingsService {
     // Closing the position out entirely resets the basis rather than leaving a stale one.
     if (newQuantity === 0) newAverageCost = 0;
 
-    return this.prisma.holding.update({
+    const updated = await this.prisma.holding.update({
       where: { id: existing.id },
       data: {
         ...classified,
@@ -288,6 +311,74 @@ export class HoldingsService {
         ...derive(newQuantity, newAverageCost, currentPrice),
       },
     });
+
+    return this.withLedgerRow(updated, existing, {
+      clientId,
+      ticker,
+      quantity,
+      averageCost,
+      currentPrice,
+      tradeDate,
+      amountInvested,
+    });
+  }
+
+  /**
+   * Writes the ledger row for a position change that has already been applied.
+   *
+   * Prisma's Mongo connector gives us no transaction to wrap the pair in, so an
+   * unwritable ledger row undoes the position change by hand rather than
+   * leaving the blotter and the book disagreeing. `before` is the pre-change
+   * holding, or null when the position was newly created.
+   */
+  private async withLedgerRow<T extends { id: string }>(
+    holding: T,
+    before: Record<string, unknown> | null,
+    trade: {
+      clientId: string;
+      ticker: string;
+      quantity: number;
+      averageCost: number;
+      currentPrice: number;
+      tradeDate?: string;
+      amountInvested?: number;
+    },
+  ): Promise<T> {
+    const isSell = trade.quantity < 0;
+    const absQuantity = Math.abs(trade.quantity);
+
+    // A sell is booked at the price it was sold at; a buy at what it cost.
+    const price = isSell ? trade.currentPrice : trade.averageCost;
+    const amount = trade.amountInvested ?? absQuantity * price;
+
+    try {
+      await this.prisma.transaction.create({
+        data: {
+          clientId: trade.clientId,
+          ticker: trade.ticker,
+          type: isSell ? 'SELL' : 'BUY',
+          quantity: absQuantity,
+          price,
+          amount,
+          date: trade.tradeDate ? new Date(trade.tradeDate) : new Date(),
+          description: `${isSell ? 'Sell' : 'Buy'} ${absQuantity} ${trade.ticker}`,
+        },
+      });
+    } catch (error) {
+      if (before) {
+        // Prisma rejects the immutable keys in an update payload, so restore
+        // only the mutable snapshot of the position.
+        const { id: _id, clientId: _c, createdAt: _ca, updatedAt: _ua, ...restorable } = before;
+        await this.prisma.holding.update({ where: { id: holding.id }, data: restorable });
+      } else {
+        await this.prisma.holding.delete({ where: { id: holding.id } });
+      }
+      throw new BadRequestException(
+        `Trade not recorded — could not write the transaction: ${(error as Error).message}`,
+      );
+    }
+
+    return holding;
   }
 
   async findAll() {
@@ -611,39 +702,13 @@ export class HoldingsService {
       country: looked.country,
       exchange: looked.exchange,
       theme: looked.theme,
+      // create() writes the matching ledger row itself, dated to the row's own
+      // trade date and booked at the file's consideration rather than a
+      // recomputed one.
+      date: date.toISOString(),
+      amountInvested,
     };
 
-    const before = await this.prisma.holding.findUnique({
-      where: { clientId_ticker: { clientId, ticker } },
-    });
-
-    const holding = await this.create(dto);
-
-    // The position and the ledger have to agree. Prisma's Mongo connector has
-    // no transaction to lean on here, so an unwritable ledger row undoes the
-    // position change by hand rather than leaving the two out of step.
-    try {
-      await this.prisma.transaction.create({
-        data: {
-          clientId,
-          ticker,
-          type: side,
-          quantity,
-          price: tradePrice,
-          amount: amountInvested,
-          date,
-          description: `Bulk import — ${side === 'SELL' ? 'sell' : 'buy'} ${quantity} ${ticker}`,
-        },
-      });
-    } catch (error) {
-      if (before) {
-        await this.prisma.holding.update({ where: { id: before.id }, data: before });
-      } else {
-        await this.prisma.holding.delete({ where: { id: holding.id } });
-      }
-      throw new Error(
-        `Position not imported — could not record the transaction: ${(error as Error).message}`,
-      );
-    }
+    await this.create(dto);
   }
 }

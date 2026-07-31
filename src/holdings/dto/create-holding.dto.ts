@@ -1,4 +1,4 @@
-import { IsString, IsNumber, IsOptional } from 'class-validator';
+import { IsString, IsNumber, IsOptional, IsDateString } from 'class-validator';
 
 export class CreateHoldingDto {
   @IsString()
@@ -40,6 +40,20 @@ export class CreateHoldingDto {
 
   @IsNumber()
   currentPrice: number;
+
+  // When the trade actually happened. XIRR weights every flow by its date, so a
+  // back-dated trade booked as "now" would misprice the return — the caller
+  // passes the real trade date and only a same-day trade defaults to now.
+  @IsDateString()
+  @IsOptional()
+  date?: string;
+
+  // What the trade actually cost (or realised, on a sell). Defaults to
+  // quantity x averageCost, which is the same number whenever the caller
+  // derived averageCost from an amount in the first place.
+  @IsNumber()
+  @IsOptional()
+  amountInvested?: number;
 
   // Accepted for backwards compatibility but ignored: marketValue and
   // unrealizedPnL are always derived server-side from quantity, averageCost
