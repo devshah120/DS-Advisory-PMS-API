@@ -22,7 +22,7 @@
     "seed:scoring-rules": "ts-node -r tsconfig-paths/register src/fundamentals/seed-scoring-rules.ts",
     "normalize:accounting-method": "ts-node -r tsconfig-paths/register src/analytics/scripts/normalize-accounting-method.ts",
     "backfill:benchmark-bars": "ts-node -r tsconfig-paths/register src/analytics/scripts/backfill-benchmark-bars.ts",
-    "reconcile:ledger": "ts-node -T -r tsconfig-paths/register scripts/reconcile-ledger.ts"
+    "reconcile:ledger": "ts-node -T --project scripts/tsconfig.json scripts/reconcile-ledger.ts"
   },
   "dependencies": {
     "@nestjs/common": "^10.2.8",

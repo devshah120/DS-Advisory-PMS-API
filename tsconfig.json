@@ -9,6 +9,11 @@
     "target": "ES2020",
     "sourceMap": true,
     "outDir": "./dist",
+    // Pinned so the build emits dist/main.js. Without it TypeScript infers the
+    // root from the common parent of every input file, so adding a .ts file
+    // outside src/ silently moves the whole build to dist/src/ and pm2 can no
+    // longer find its entry point.
+    "rootDir": "./src",
     "baseUrl": "./",
     "incremental": true,
     "skipLibCheck": true,
@@ -20,5 +25,9 @@
     "paths": {
       "src/*": ["src/*"]
     }
-  }
+  },
+  // The build compiles the application only. scripts/ holds standalone
+  // maintenance tools that are run through ts-node, never bundled.
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist", "scripts", "test"]
 }

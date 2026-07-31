@@ -1,0 +1,12 @@
+{
+  // The root tsconfig excludes scripts/ so the build stays application-only.
+  // ts-node still needs somewhere to read compiler options from, so the
+  // maintenance scripts get their own — no outDir, nothing is ever emitted.
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "noEmit": true
+  },
+  "include": ["**/*.ts"],
+  "exclude": []
+}
