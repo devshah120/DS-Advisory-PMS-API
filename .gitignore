@@ -4,6 +4,10 @@ node_modules/
 # Build output
 dist/
 build/
+# The incremental-build cache. If this is ever committed, tsc trusts it over
+# the (ignored, therefore absent) dist/ on a fresh checkout and skips emitting
+# entirely — nest build exits 0 and produces no main.js.
+*.tsbuildinfo
 
 # Environment variables
 .env
