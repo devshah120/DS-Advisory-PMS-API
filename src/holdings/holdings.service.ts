@@ -491,6 +491,7 @@ export class HoldingsService {
         clientId,
         date: { lte: asOfDate },
         type: { in: ['BUY', 'SELL'] },
+        ticker: { not: 'HEI' }, // Exclude old HEI transactions
       },
       orderBy: { date: 'asc' },
     });
