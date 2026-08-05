@@ -204,6 +204,10 @@ model Client {
   /// PortfolioHistoryService. Empty until the first snapshot runs for this
   /// client.
   valuations PortfolioValuation[]
+  /// Frozen per-quarter fee records, one per CLOSED quarter. Note that these
+  /// carry their own copy of feeRatePercent: editing the rate above changes
+  /// future billing only, never a quarter already closed.
+  feeSchedules ClientFeeSchedule[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -832,4 +836,63 @@ model BaselineHolding {
 
   @@index([baselineId])
   @@map("baseline_holdings")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Fee billing history — see ReportsService.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One client's management fee for one closed calendar quarter, frozen at the
+/// moment the quarter closed.
+///
+/// This exists because every input to a fee is mutable but an invoice is not.
+/// `Client.feeRatePercent` is a single current-value column with no history: if
+/// a mandate renegotiates 2% down to 1.5%, recomputing last quarter from the
+/// live client row would silently reprice an invoice that was already issued.
+/// So the numbers are copied here rather than referenced — a row is a record of
+/// what was billed, not a view onto what would be billed today.
+///
+/// Written once per (client, quarter) by ReportsService.closeQuarter, driven by
+/// the same quarter-end trigger that flags PortfolioValuation.isQuarterEnd.
+/// Only the CLOSED quarters live here; the in-progress quarter is computed live
+/// as an estimate and deliberately never stored, because its portfolio value is
+/// still moving.
+model ClientFeeSchedule {
+  id       String @id @default(cuid()) @map("_id")
+  clientId String
+  client   Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  /// Canonical quarter code, e.g. "Q3-CY26" — the same vocabulary
+  /// periods.ts/resolvePeriod speaks, so a fee quarter and a performance
+  /// quarter can never mean different windows.
+  quarter      String
+  quarterLabel String
+  quarterStart DateTime
+  quarterEnd   DateTime
+
+  /// Copied from Client at close, NOT read through the relation. See the note
+  /// above: the client's rate may since have changed.
+  feeRatePercent Float
+  /// The quarter-end NAV the fee was charged on, per the Client model's stated
+  /// basis ("quarterly at feeRatePercent / 4 of quarter-end portfolio value").
+  portfolioValue Float
+
+  /// Billable days, prorated from the later of (quarter start, inception).
+  daysBilled   Int
+  daysInQuarter Int
+  feeAmount    Float
+
+  /// Where portfolioValue came from: "snapshot" when the quarter-end
+  /// PortfolioValuation row existed, "reconstruction" when the scheduler had
+  /// missed that date and the value was replayed from the baseline. Recorded
+  /// because the two are equally correct but not equally auditable.
+  valuationSource String @default("snapshot")
+
+  createdAt DateTime @default(now())
+
+  /// One fee row per client per quarter — this is what makes closeQuarter
+  /// idempotent and re-runnable rather than double-billing on a retry.
+  @@unique([clientId, quarter])
+  @@index([quarter])
+  @@map("client_fee_schedules")
 }
