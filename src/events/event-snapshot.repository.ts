@@ -18,21 +18,32 @@ export class EventSnapshotRepository {
   }
 
   /**
-   * Replaces the snapshot with a freshly-fetched calendar. FMP no longer
-   * listing an event (it fell out of the lookahead window, or a date changed)
-   * must remove the stale row, so this is a full replace rather than a
-   * blind upsert that would leave orphans behind forever.
+   * Replaces the snapshot with a freshly-fetched calendar. The upstream no
+   * longer listing an event (it fell out of the lookahead window, or a date
+   * changed) must remove the stale row, so this is a full replace rather than
+   * a blind upsert that would leave orphans behind forever.
    */
-  async replaceAll(events: WatchlistEvent[]): Promise<number> {
+  async replaceAll(events: WatchlistEvent[], source = 'yahoo'): Promise<number> {
     const refreshedAt = new Date();
-    const rows = events.map((e) => ({
+
+    // (ticker, type, date) is unique in the schema, but one ticker can produce
+    // two DIVIDEND events on a single day — an issuer whose pay date falls on
+    // the ex-date. First one wins rather than letting createMany throw and
+    // lose the entire refresh over one collision.
+    const byKey = new Map<string, WatchlistEvent>();
+    for (const e of events) {
+      const key = `${e.ticker}|${e.type}|${e.date}`;
+      if (!byKey.has(key)) byKey.set(key, e);
+    }
+
+    const rows = [...byKey.values()].map((e) => ({
       ticker: e.ticker,
       type: e.type,
       code: e.code,
       label: e.label,
       date: e.date,
       status: e.status,
-      source: 'fmp',
+      source,
       refreshedAt,
     }));
 

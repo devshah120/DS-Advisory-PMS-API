@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../common/prisma/prisma.service';
-import { EventsService, WatchlistEvent } from '../market/events.service';
+import { WatchlistEvent } from '../market/events.service';
+import { YahooEventsService } from '../market/yahoo-events.service';
 import { EventSnapshotRepository } from './event-snapshot.repository';
 
 export interface PortfolioEvent extends WatchlistEvent {
@@ -21,8 +22,8 @@ export interface EventRefreshResult {
  * watchlist it, so that is the list this page has to be complete over.
  *
  * DB-first, exactly like the Fundamentals page: reads serve the EventSnapshot
- * store and never call FMP, so the page keeps rendering when the FMP request
- * budget is exhausted or the API just restarted. FMP is only ever touched by
+ * store and never call upstream, so the page keeps rendering when Yahoo is
+ * throttling or the API just restarted. Yahoo is only ever touched by
  * refresh(), which the manual POST /events/refresh endpoint triggers.
  */
 @Injectable()
@@ -31,11 +32,11 @@ export class PortfolioEventsService {
 
   constructor(
     private prisma: PrismaService,
-    private events: EventsService,
+    private events: YahooEventsService,
     private snapshots: EventSnapshotRepository,
   ) {}
 
-  /** DB-first read — serves the last saved snapshot, no FMP call. */
+  /** DB-first read — serves the last saved snapshot, no upstream call. */
   async forAllHoldings(): Promise<PortfolioEvent[]> {
     const byTicker = await this.holdingsByTicker();
     const stored = await this.snapshots.listAll();
@@ -55,8 +56,9 @@ export class PortfolioEventsService {
   }
 
   /**
-   * Fetches the FMP calendars for every held ticker and replaces the snapshot.
-   * The one place in the Event Center that spends the FMP request budget.
+   * Fetches Yahoo's calendar for every held ticker and replaces the snapshot.
+   * The one place in the Event Center that goes out to the network — one
+   * request per held ticker, since Yahoo has no whole-market calendar feed.
    */
   async refresh(): Promise<EventRefreshResult> {
     const byTicker = await this.holdingsByTicker();
