@@ -2,6 +2,7 @@ import { BadRequestException, Injectable, Logger } from '@nestjs/common';
 import * as XLSX from 'xlsx';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { MarketService } from '../market/market.service';
+import { HistoricalPriceService } from '../historical-price/historical-price.service';
 import { CreateHoldingDto } from './dto/create-holding.dto';
 import { UpdateHoldingDto } from './dto/update-holding.dto';
 import { BulkImportRowResult, BulkImportSummary } from './dto/bulk-import-result.dto';
@@ -174,6 +175,7 @@ export class HoldingsService {
   constructor(
     private prisma: PrismaService,
     private market: MarketService,
+    private historicalPrice: HistoricalPriceService,
   ) {}
 
   /**
@@ -469,9 +471,10 @@ export class HoldingsService {
    * Reconstructs a client's portfolio as it existed on a specific date by replaying
    * all BUY and SELL transactions up to (and including) that date.
    *
-   * Returns holdings with quantities as of that date. For pricing, it uses:
-   * - The last recorded price from a transaction on or before the date (if available)
-   * - Falls back to the current price if no historical price is found
+   * Returns holdings with quantities as of that date, priced at each ticker's
+   * closing price on `asOfDate` (resolved via HistoricalPriceService, which
+   * walks back over non-trading days and backfills PriceBar from Yahoo). Only
+   * if a ticker has no history at all does it fall back to the transaction price.
    *
    * Only BUY/SELL transactions are replayed. Other transaction types (dividends,
    * fees, splits) are tracked separately and don't affect quantity reconstruction.
@@ -491,7 +494,6 @@ export class HoldingsService {
         clientId,
         date: { lte: asOfDate },
         type: { in: ['BUY', 'SELL'] },
-        ticker: { not: 'HEI' }, // Exclude old HEI transactions
       },
       orderBy: { date: 'asc' },
     });
@@ -540,17 +542,30 @@ export class HoldingsService {
       positions.set(tx.ticker, pos);
     }
 
+    const openPositions = [...positions.values()].filter((p) => p.quantity > 0);
+
+    // Price every position at its close on `asOfDate` — not at the price of the
+    // transaction that happened to be last, which made Current Value identical
+    // to Cost Basis and reported P&L as a flat zero for every row.
+    // HistoricalPriceService walks back over weekends/holidays and backfills
+    // PriceBar from Yahoo on a miss, so a non-trading as-of date still prices.
+    const closes = await this.historicalPrice.closesOn(
+      openPositions.map((p) => p.ticker),
+      asOfDate,
+    );
+
     // Get current holding details (company, sector, etc.) for each ticker
     const holdings = await Promise.all(
-      [...positions.values()]
-        .filter((p) => p.quantity > 0) // Only include open positions
+      openPositions
         .map(async (pos) => {
           const holding = await this.prisma.holding.findUnique({
             where: { clientId_ticker: { clientId, ticker: pos.ticker } },
           });
 
           const averageCost = pos.quantity > 0 ? pos.totalCostBasis / pos.quantity : 0;
-          const currentPrice = pos.lastPrice;
+          // No history at all for the ticker (delisted, bad symbol) leaves the
+          // transaction price as the only defensible fallback.
+          const currentPrice = closes.get(pos.ticker) ?? pos.lastPrice;
 
           return {
             id: holding?.id || `historical_${pos.ticker}`,
