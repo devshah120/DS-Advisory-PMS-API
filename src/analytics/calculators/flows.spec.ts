@@ -1,4 +1,4 @@
-import { buildFlows, totalContributed, totalWithdrawn, LedgerEntry } from './flows';
+import { buildFlows, isImportArtifact, totalContributed, totalWithdrawn, LedgerEntry } from './flows';
 import { xirr } from './xirr';
 
 const d = (s: string) => new Date(s);
@@ -231,5 +231,66 @@ describe('totals', () => {
 
     expect(totalContributed(r.flows)).toBe(100000);
     expect(totalWithdrawn(r.flows)).toBe(15000); // NOT 110000 — terminal excluded
+  });
+});
+
+/**
+ * The bulk-import artifact rule.
+ *
+ * The legacy book was imported with every pre-existing position written as a
+ * fresh BUY stamped 2026-07-01. Those rows are the opening position, not trades,
+ * and the 30-June baseline already represents them — so replaying them on top of
+ * the baseline books each purchase twice and drives reconstructed cash negative
+ * (it reached −$25,596 on a client whose real balance is zero, which in turn
+ * corrupted every allocation weight computed from portfolioValue).
+ */
+describe('isImportArtifact', () => {
+  it('treats an import-dated BUY as part of the opening position', () => {
+    expect(isImportArtifact({ type: 'BUY', date: d('2026-07-01') })).toBe(true);
+  });
+
+  it('covers a BUY dated on the inception date itself', () => {
+    expect(isImportArtifact({ type: 'BUY', date: d('2026-06-30') })).toBe(true);
+  });
+
+  /**
+   * The baseline is a POSITION snapshot, not a cash history — it cannot account
+   * for a sale or a dividend, so those must still replay even inside the import
+   * window, or their cash effect would be lost entirely.
+   */
+  it('does not skip non-BUY rows inside the import window', () => {
+    expect(isImportArtifact({ type: 'SELL', date: d('2026-07-01') })).toBe(false);
+    expect(isImportArtifact({ type: 'DIVIDEND', date: d('2026-07-01') })).toBe(false);
+    expect(isImportArtifact({ type: 'FEES', date: d('2026-07-01') })).toBe(false);
+    expect(isImportArtifact({ type: 'CASH_WITHDRAWAL', date: d('2026-07-01') })).toBe(false);
+  });
+
+  it('does not skip a genuine BUY made after the import window', () => {
+    expect(isImportArtifact({ type: 'BUY', date: d('2026-07-02') })).toBe(false);
+    expect(isImportArtifact({ type: 'BUY', date: d('2026-08-05') })).toBe(false);
+  });
+
+  /**
+   * The end-to-end property that matters: filtering the artifacts out of a
+   * replay leaves cash at the real maintained balance instead of deep negative.
+   */
+  it('leaves replayed cash non-negative once artifacts are excluded', () => {
+    const imported: LedgerEntry[] = [
+      { type: 'BUY', amount: 40000, date: d('2026-07-01') },
+      { type: 'BUY', amount: 25000, date: d('2026-07-01') },
+      { type: 'SELL', amount: 5000, date: d('2026-07-20') },
+      { type: 'BUY', amount: 3000, date: d('2026-07-25') },
+    ];
+
+    const cashOf = (rows: LedgerEntry[]) =>
+      rows.reduce((c, t) => (t.type === 'BUY' || t.type === 'FEES' ? c - t.amount : c + t.amount), 0);
+
+    // Replaying everything double-counts the imported book.
+    expect(cashOf(imported)).toBeLessThan(0);
+
+    // Replaying only the real activity does not.
+    const replayed = cashOf(imported.filter((t) => !isImportArtifact(t)));
+    expect(replayed).toBe(2000); // +5,000 sale − 3,000 genuine buy
+    expect(replayed).toBeGreaterThanOrEqual(0);
   });
 });
