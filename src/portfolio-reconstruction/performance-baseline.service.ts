@@ -3,13 +3,26 @@ import { PrismaService } from '../common/prisma/prisma.service';
 import { PortfolioHistoryService } from './portfolio-history.service';
 import { BenchmarkHistoryService, BenchmarkWindowResult } from './benchmark-history.service';
 import { CashFlow } from '../analytics/calculators/xirr';
+import { ResolvedPeriod } from './periods';
 
-export type PerformancePeriod = 'MTD' | 'QTD' | 'YTD' | 'CUSTOM';
+/**
+ * Widened from the original four-value union to any code `resolvePeriod`
+ * understands — which now includes 'INCEPTION' and named quarters like
+ * 'Q3-CY26'. Kept as a string alias rather than a closed union because the
+ * quarter codes are generated from the calendar, not enumerated.
+ */
+export type PerformancePeriod = string;
 
 export interface PeriodReturn {
   period: PerformancePeriod;
+  /** Human label for the selected window, e.g. "Q3 CY26". */
+  label: string;
   from: Date;
   to: Date;
+  /** True when `from` was pulled forward to the 30-June-2026 inception. */
+  clampedToInception: boolean;
+  /** True when the period has not closed yet and `to` is today. */
+  openPeriod: boolean;
   openingValue: number;
   closingValue: number;
   /** Simple (openingValue -> closingValue) return. Not flow-adjusted TWRR —
@@ -62,26 +75,40 @@ export class PerformanceBaselineService {
     return portfolio.portfolioValue;
   }
 
-  async periodReturn(
-    clientId: string,
-    period: PerformancePeriod,
-    range: { from: Date; to: Date },
-  ): Promise<PeriodReturn> {
+  /**
+   * Accepts a resolved window (see periods.ts) rather than a bare code, so the
+   * inception clamp and the open-quarter clamp are applied in exactly one place
+   * and this service never has to re-derive a calendar boundary.
+   */
+  async periodReturn(clientId: string, resolved: ResolvedPeriod): Promise<PeriodReturn> {
+    const { from, to } = resolved;
+
     const [client, openingValue, closingPortfolio] = await Promise.all([
       this.prisma.client.findUnique({ where: { id: clientId } }),
-      this.openingValue(clientId, range.from),
-      this.history.getPortfolioAsOf(clientId, range.to),
+      this.openingValue(clientId, from),
+      this.history.getPortfolioAsOf(clientId, to),
     ]);
 
     const closingValue = closingPortfolio.portfolioValue;
     const returnPct = openingValue > 0 ? (closingValue - openingValue) / openingValue : null;
 
-    const flows = await this.windowFlows(clientId, range.from, range.to, openingValue, closingValue);
+    const flows = await this.windowFlows(clientId, from, to, openingValue, closingValue);
     const benchmark = client
-      ? await this.benchmarkHistory.windowReturn(undefined, client.benchmarkId, flows, range.to)
+      ? await this.benchmarkHistory.windowReturn(undefined, client.benchmarkId, flows, to)
       : null;
 
-    return { period, from: range.from, to: range.to, openingValue, closingValue, returnPct, benchmark };
+    return {
+      period: resolved.period,
+      label: resolved.label,
+      from,
+      to,
+      clampedToInception: resolved.clampedToInception,
+      openPeriod: resolved.openPeriod,
+      openingValue,
+      closingValue,
+      returnPct,
+      benchmark,
+    };
   }
 
   /**
@@ -124,18 +151,4 @@ export class PerformanceBaselineService {
     return flows;
   }
 
-  /** Convenience windows — calendar MTD/QTD/YTD anchored on `asOf` (defaults to now). */
-  static windowFor(period: 'MTD' | 'QTD' | 'YTD', asOf: Date = new Date()): { from: Date; to: Date } {
-    const y = asOf.getUTCFullYear();
-    const m = asOf.getUTCMonth();
-
-    if (period === 'MTD') {
-      return { from: new Date(Date.UTC(y, m, 1)), to: asOf };
-    }
-    if (period === 'QTD') {
-      const q = Math.floor(m / 3);
-      return { from: new Date(Date.UTC(y, q * 3, 1)), to: asOf };
-    }
-    return { from: new Date(Date.UTC(y, 0, 1)), to: asOf }; // YTD
-  }
 }

@@ -174,14 +174,25 @@ export class PortfolioHistoryService {
       weight: h.allocation,
     }));
 
+    /**
+     * Rows written before the import-artifact fix can carry a negative
+     * `cashValue` (and a `totalValue` depressed by it). Apply the same floor the
+     * live reconstruction applies, and recompute the total from its parts, so a
+     * stale stored row cannot reintroduce the negative-cash weights through the
+     * snapshot path — the two paths are supposed to be indistinguishable.
+     */
+    const cash = Math.max(0, row.cashValue);
+    const cashShortfall = row.cashValue < 0 ? -row.cashValue : 0;
+    const portfolioValue = row.securitiesValue + cash;
+
     // Cash is a real allocation line everywhere else in this codebase
     // (weights.ts#allocationBy) — included here too so a snapshot-served
     // breakdown matches a reconstructed one exactly, not just for holdings.
-    const total = row.totalValue || 1;
+    const total = portfolioValue || 1;
     const group = (key: (p: (typeof positions)[number]) => string) => {
       const byKey = new Map<string, number>();
       for (const p of positions) byKey.set(key(p), (byKey.get(key(p)) ?? 0) + p.marketValue);
-      if (row.cashValue > 0) byKey.set('Cash', (byKey.get('Cash') ?? 0) + row.cashValue);
+      if (cash > 0) byKey.set('Cash', (byKey.get('Cash') ?? 0) + cash);
 
       const slices = [...byKey.entries()]
         .map(([k, value]) => ({ key: k, value, weight: value / total }))
@@ -194,9 +205,10 @@ export class PortfolioHistoryService {
       clientId,
       asOfDate: row.date,
       baselineDate: row.date, // not tracked per-row; not needed for a snapshot-served read
-      cash: row.cashValue,
+      cash,
+      cashShortfall,
       holdingsValue: row.securitiesValue,
-      portfolioValue: row.totalValue,
+      portfolioValue,
       totalCost: row.totalCost,
       unrealizedGain: row.unrealizedPnL,
       realizedGain: row.realizedPnL,

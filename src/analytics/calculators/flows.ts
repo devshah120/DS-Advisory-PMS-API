@@ -52,6 +52,47 @@ export type FlowBuildResult =
  */
 export const JUN30_REBASE_DATE = new Date('2026-06-30T00:00:00.000Z');
 
+/**
+ * The house inception date. Every client's reported history starts here: the
+ * 30-June-2026 portfolio value is the base for since-inception XIRR, and it is
+ * also the opening value of the quarter (Q2 CY26 close / Q3 CY26 open), which is
+ * why a QTD figure computed today lands on the same base as inception.
+ *
+ * Aliased to JUN30_REBASE_DATE rather than redeclared: the rebase date and the
+ * inception date are the same instant by design, and two constants that must
+ * stay equal are two constants that will eventually drift.
+ */
+export const INCEPTION_DATE = JUN30_REBASE_DATE;
+
+/**
+ * The last date carrying bulk-import artifacts.
+ *
+ * The legacy book was imported with every pre-existing position written as a
+ * fresh BUY stamped 2026-07-01, even though those shares had been held for years.
+ * They are not trades — they are the opening position wearing a transaction's
+ * clothing, and the 30-June baseline already represents them in full.
+ *
+ * Anything on or before this date is therefore part of INCEPTION, not activity
+ * since it. Replaying such a row on top of the baseline books the same purchase
+ * twice: once as the baseline's shares, once as a cash outflow that never
+ * happened. That is precisely what drove reconstructed cash to −25,596 on a
+ * client whose real balance is zero, and — because portfolioValue = holdings +
+ * cash — corrupted every weight and the sector allocation computed from it.
+ */
+export const IMPORT_CUTOVER_DATE = new Date('2026-07-01T23:59:59.999Z');
+
+/**
+ * Is this ledger row a bulk-import artifact that the 30-June baseline already
+ * accounts for?
+ *
+ * Only BUY rows qualify. A SELL, DIVIDEND or FEES row dated in the same window is
+ * a real event that the baseline does NOT represent — the baseline is a position
+ * snapshot, not a cash history — so those must still replay.
+ */
+export function isImportArtifact(row: { type: string; date: Date }): boolean {
+  return row.type === 'BUY' && row.date <= IMPORT_CUTOVER_DATE;
+}
+
 export interface RebaseHolding {
   ticker: string;
   quantity: number;

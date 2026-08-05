@@ -1,0 +1,30 @@
+[
+  {
+    "id": "cmrx45ocm009qlmiioo4uwnt4",
+    "clientId": "cmrtg70i6002fpin64jasjtqy",
+    "ticker": "HEI",
+    "type": "BUY",
+    "quantity": 17,
+    "price": 257.48,
+    "amount": 4377.16,
+    "date": "2026-07-01T00:00:00.000Z",
+    "description": "Bulk import — buy 17 HEI",
+    "reference": null,
+    "createdAt": "2026-07-23T06:11:40.294Z",
+    "updatedAt": "2026-07-23T06:11:40.294Z"
+  },
+  {
+    "id": "cmrx4jkug00czlmiivnu37nge",
+    "clientId": "cmrx4jft100cqlmiiw8fatlna",
+    "ticker": "HEI",
+    "type": "BUY",
+    "quantity": 40.714359,
+    "price": 248.48,
+    "amount": 10116.70392432,
+    "date": "2026-07-01T00:00:00.000Z",
+    "description": "Bulk import — buy 40.714359 HEI",
+    "reference": null,
+    "createdAt": "2026-07-23T06:22:28.936Z",
+    "updatedAt": "2026-07-23T06:22:28.936Z"
+  }
+]

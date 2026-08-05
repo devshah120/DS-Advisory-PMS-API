@@ -3,6 +3,7 @@ import { PrismaService } from '../common/prisma/prisma.service';
 import { BaselineService } from '../legacy-baseline/baseline.service';
 import { HistoricalPriceService } from '../historical-price/historical-price.service';
 import { allocationBy } from '../analytics/calculators/weights';
+import { isImportArtifact } from '../analytics/calculators/flows';
 import { Classification, PortfolioSnapshot, Position } from '../analytics/calculators/types';
 import { ReconstructedPortfolio, ReconstructedPosition } from './types';
 
@@ -78,7 +79,24 @@ export class PortfolioReconstructionService {
       orderBy: { date: 'asc' },
     });
 
-    for (const t of ledger) {
+    /**
+     * Drop the bulk-import BUY rows before replaying.
+     *
+     * Those rows are stamped 2026-07-01 but describe positions the client already
+     * held on 30 June — the import wrote the opening book as a day of trading. The
+     * baseline loaded above ALREADY contains every one of those shares, so
+     * replaying the BUYs adds nothing to `positions` that isn't there and simply
+     * subtracts their cost from cash a second time. See `isImportArtifact`.
+     *
+     * Filtering here rather than in the Prisma `where` is deliberate: the query
+     * stays a plain date-window read, and the one rule that decides what counts as
+     * an import artifact lives in flows.ts next to the rebase that follows the same
+     * convention — so the Current tab and this tab cannot disagree about which
+     * rows are real trades.
+     */
+    const replayable = ledger.filter((t) => !isImportArtifact(t));
+
+    for (const t of replayable) {
       realizedGain += this.applyTransaction(positions, t, (delta) => (cash += delta));
     }
 
@@ -120,6 +138,23 @@ export class PortfolioReconstructionService {
       });
     }
 
+    /**
+     * Never report a negative cash balance.
+     *
+     * With the import artifacts filtered out above, replayed cash should now track
+     * the real maintained balance. A residual negative can still arise from a
+     * genuine data gap — a SELL recorded without its matching BUY, say — and if it
+     * reached the response it would understate `portfolioValue` and inflate every
+     * position weight computed from it, which is the visible symptom this whole
+     * change exists to remove.
+     *
+     * A negative buying-power balance is not a thing this book models: cash is
+     * floored at zero and the shortfall is surfaced on `cashShortfall` so the gap
+     * is reported rather than silently absorbed into the weights.
+     */
+    const cashShortfall = cash < 0 ? -cash : 0;
+    if (cash < 0) cash = 0;
+
     const portfolioValue = holdingsValue + cash;
     for (const p of reconstructedPositions) {
       p.weight = portfolioValue > 0 ? p.marketValue / portfolioValue : 0;
@@ -139,6 +174,7 @@ export class PortfolioReconstructionService {
       asOfDate,
       baselineDate: baselineRow.baselineDate,
       cash,
+      cashShortfall,
       holdingsValue,
       portfolioValue,
       totalCost,

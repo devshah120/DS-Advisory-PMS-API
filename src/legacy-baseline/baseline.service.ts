@@ -1,7 +1,7 @@
 import { ConflictException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { HistoricalPriceService } from '../historical-price/historical-price.service';
-import { JUN30_REBASE_DATE } from '../analytics/calculators/flows';
+import { JUN30_REBASE_DATE, isImportArtifact } from '../analytics/calculators/flows';
 import { CreateBaselineDto } from './dto/create-baseline.dto';
 
 export interface AutoSeedSummary {
@@ -165,6 +165,21 @@ export class BaselineService {
 
     let netCashSinceBaseline = 0;
     for (const t of ledger) {
+      /**
+       * Skip the bulk-import BUY rows for the same reason
+       * PortfolioReconstructionService skips them on replay: they restate the
+       * opening position rather than record a purchase, and the holdings half of
+       * this baseline already captures them.
+       *
+       * These two filters have to agree. `openingCash` is defined as "the balance
+       * that, replayed forward, lands on today's real balance" — so if
+       * reconstruction no longer subtracts these rows going forward, backing them
+       * out here would over-credit the opening balance by the full cost of the
+       * book and push the reconstructed cash just as far positive as it used to
+       * sit negative.
+       */
+      if (isImportArtifact(t)) continue;
+
       switch (t.type) {
         case 'BUY':
         case 'FEES':

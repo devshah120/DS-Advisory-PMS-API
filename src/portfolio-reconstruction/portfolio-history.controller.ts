@@ -2,6 +2,7 @@ import { BadRequestException, Controller, Get, Param, Query, UseGuards } from '@
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { PortfolioHistoryService } from './portfolio-history.service';
 import { PerformanceBaselineService, PerformancePeriod } from './performance-baseline.service';
+import { availablePeriods, resolvePeriod } from './periods';
 
 /**
  * PART 7 / PART 9's read side: "portfolio as it existed on any date after
@@ -24,11 +25,23 @@ export class PortfolioHistoryController {
   }
 
   /**
-   * ?period=MTD|QTD|YTD, or ?from=YYYY-MM-DD&to=YYYY-MM-DD for CUSTOM.
-   * Returns the opening/closing portfolio value and simple return over the
-   * window — NOT the XIRR/benchmark figures on the Performance page
-   * (analytics/services/performance.service.ts), which are unaffected by
-   * this endpoint.
+   * The period vocabulary the sheet's dropdown renders — inception, the rolling
+   * windows, and every quarter from inception to today, newest first. Served
+   * from the backend rather than hard-coded in the UI so the list cannot drift
+   * from what `resolvePeriod` will actually accept.
+   */
+  @Get('periods')
+  periods() {
+    return availablePeriods();
+  }
+
+  /**
+   * ?period=INCEPTION|MTD|QTD|YTD|Q3-CY26|…, or ?from=YYYY-MM-DD&to=YYYY-MM-DD
+   * for a custom range.
+   *
+   * Every window is clamped so it can never open before the 30-June-2026
+   * inception (see periods.ts). Returns the opening/closing portfolio value and
+   * the simple return over the window, plus the benchmark over the same window.
    */
   @Get('return')
   async periodReturn(
@@ -37,21 +50,14 @@ export class PortfolioHistoryController {
     @Query('from') from?: string,
     @Query('to') to?: string,
   ) {
-    const to_ = to ? this.parseDate(to) : new Date();
+    const to_ = to ? this.parseDate(to) : undefined;
+    const from_ = from ? this.parseDate(from) : undefined;
 
-    if (period === 'MTD' || period === 'QTD' || period === 'YTD') {
-      const range = PerformanceBaselineService.windowFor(period, to_);
-      return this.performanceBaseline.periodReturn(clientId, period as PerformancePeriod, range);
-    }
+    // An explicit ?from= with no ?period= is the custom-range call.
+    const code: PerformancePeriod = period ?? (from_ ? 'CUSTOM' : 'INCEPTION');
 
-    if (!from) {
-      throw new BadRequestException('Provide either ?period=MTD|QTD|YTD or ?from=YYYY-MM-DD (with optional &to=)');
-    }
-
-    return this.performanceBaseline.periodReturn(clientId, 'CUSTOM', {
-      from: this.parseDate(from),
-      to: to_,
-    });
+    const resolved = resolvePeriod(code, { from: from_, to: to_ });
+    return this.performanceBaseline.periodReturn(clientId, resolved);
   }
 
   private parseDate(raw: string): Date {
