@@ -295,8 +295,18 @@ export class HoldingsService {
       const totalInvested = existing.averageCost * existing.quantity + averageCost * quantity;
       newAverageCost = totalInvested / newQuantity;
     } else {
-      // Sold shares realise (sale price - basis) and leave averageCost alone.
-      realizedPnL += (currentPrice - existing.averageCost) * Math.abs(quantity);
+      // Sold shares realise (proceeds - basis given up) and leave averageCost
+      // alone, so the remaining shares keep the basis they were bought at.
+      //
+      // Proceeds come from the amount the caller actually transacted; falling
+      // back to currentPrice only when none was supplied. Pricing the sale off
+      // currentPrice regardless would book a gain against the last close rather
+      // than the fill, and a back-dated sell — where currentPrice is today's
+      // quote and the trade happened weeks ago — would realise a number that
+      // never occurred.
+      const soldQuantity = Math.abs(quantity);
+      const proceeds = amountInvested ?? soldQuantity * currentPrice;
+      realizedPnL += proceeds - existing.averageCost * soldQuantity;
     }
 
     // Closing the position out entirely resets the basis rather than leaving a stale one.
@@ -349,9 +359,16 @@ export class HoldingsService {
     const isSell = trade.quantity < 0;
     const absQuantity = Math.abs(trade.quantity);
 
-    // A sell is booked at the price it was sold at; a buy at what it cost.
-    const price = isSell ? trade.currentPrice : trade.averageCost;
-    const amount = trade.amountInvested ?? absQuantity * price;
+    // The cash the trade moved. On a sell this is the proceeds, and it is what
+    // XIRR reads as money coming out of the portfolio — so it has to be the
+    // amount actually transacted, not a quantity x last-close estimate.
+    const amount =
+      trade.amountInvested ??
+      absQuantity * (isSell ? trade.currentPrice : trade.averageCost);
+
+    // Booked at the per-share price the cash implies, so price x quantity and
+    // amount can never disagree on the blotter.
+    const price = absQuantity > 0 ? amount / absQuantity : 0;
 
     try {
       await this.prisma.transaction.create({
