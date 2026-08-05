@@ -85,6 +85,18 @@ export class HoldingsController {
     return this.holdingsService.getSectorExposure(clientId);
   }
 
+  @Get('client/:clientId/as-of-date/:date')
+  async getPortfolioAsOfDate(
+    @Param('clientId') clientId: string,
+    @Param('date') dateStr: string,
+  ) {
+    const asOfDate = new Date(dateStr);
+    if (Number.isNaN(asOfDate.getTime())) {
+      throw new BadRequestException('Invalid date format. Use ISO format (YYYY-MM-DD)');
+    }
+    return this.holdingsService.getPortfolioAsOfDate(clientId, asOfDate);
+  }
+
   @Get(':id')
   findOne(@Param('id') id: string) {
     return this.holdingsService.findOne(id);

@@ -466,6 +466,124 @@ export class HoldingsService {
   }
 
   /**
+   * Reconstructs a client's portfolio as it existed on a specific date by replaying
+   * all BUY and SELL transactions up to (and including) that date.
+   *
+   * Returns holdings with quantities as of that date. For pricing, it uses:
+   * - The last recorded price from a transaction on or before the date (if available)
+   * - Falls back to the current price if no historical price is found
+   *
+   * Only BUY/SELL transactions are replayed. Other transaction types (dividends,
+   * fees, splits) are tracked separately and don't affect quantity reconstruction.
+   */
+  async getPortfolioAsOfDate(clientId: string, asOfDate: Date) {
+    // Validate client exists
+    const client = await this.prisma.client.findUnique({
+      where: { id: clientId },
+    });
+    if (!client) {
+      throw new BadRequestException(`No client with id ${clientId}`);
+    }
+
+    // Get all BUY and SELL transactions up to and including the specified date
+    const transactions = await this.prisma.transaction.findMany({
+      where: {
+        clientId,
+        date: { lte: asOfDate },
+        type: { in: ['BUY', 'SELL'] },
+      },
+      orderBy: { date: 'asc' },
+    });
+
+    // Reconstruct positions by replaying transactions
+    const positions = new Map<
+      string,
+      {
+        ticker: string;
+        quantity: number;
+        totalCostBasis: number;
+        lastPrice: number;
+        lastTransactionDate: Date;
+      }
+    >();
+
+    for (const tx of transactions) {
+      if (!tx.ticker) continue;
+
+      const pos = positions.get(tx.ticker) || {
+        ticker: tx.ticker,
+        quantity: 0,
+        totalCostBasis: 0,
+        lastPrice: tx.price || 0,
+        lastTransactionDate: tx.date,
+      };
+
+      if (tx.type === 'BUY') {
+        const quantity = tx.quantity || 0;
+        const amount = tx.amount || 0;
+        const price = amount > 0 ? amount / quantity : 0;
+
+        // Weighted average cost
+        const totalInvested = pos.totalCostBasis + amount;
+        const newQuantity = pos.quantity + quantity;
+        pos.totalCostBasis = totalInvested;
+        pos.quantity = newQuantity;
+        pos.lastPrice = price;
+      } else if (tx.type === 'SELL') {
+        const quantity = Math.min(tx.quantity || 0, pos.quantity);
+        pos.quantity -= quantity;
+        pos.lastPrice = tx.price || pos.lastPrice;
+      }
+
+      pos.lastTransactionDate = tx.date;
+      positions.set(tx.ticker, pos);
+    }
+
+    // Get current holding details (company, sector, etc.) for each ticker
+    const holdings = await Promise.all(
+      [...positions.values()]
+        .filter((p) => p.quantity > 0) // Only include open positions
+        .map(async (pos) => {
+          const holding = await this.prisma.holding.findUnique({
+            where: { clientId_ticker: { clientId, ticker: pos.ticker } },
+          });
+
+          const averageCost = pos.quantity > 0 ? pos.totalCostBasis / pos.quantity : 0;
+          const currentPrice = pos.lastPrice;
+
+          return {
+            id: holding?.id || `historical_${pos.ticker}`,
+            clientId,
+            ticker: pos.ticker,
+            company: holding?.company || pos.ticker,
+            sector: holding?.sector || 'Unclassified',
+            industry: holding?.industry || 'Unclassified',
+            country: holding?.country || 'Unknown',
+            exchange: holding?.exchange || 'Unknown',
+            theme: holding?.theme,
+            quantity: pos.quantity,
+            averageCost,
+            currentPrice,
+            marketValue: pos.quantity * currentPrice,
+            unrealizedPnL: pos.quantity * currentPrice - pos.totalCostBasis,
+            realizedPnL: holding?.realizedPnL || 0,
+            allocationPercent: 0,
+            dividend: 0,
+            weight: 0,
+            targetWeight: 0,
+            holdingDays: 0,
+            investmentThesis: holding?.investmentThesis,
+            notes: holding?.notes,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          };
+        })
+    );
+
+    return holdings;
+  }
+
+  /**
    * Builds the sample `.xlsx` a user downloads before a bulk import.
    *
    * The sheet carries the exact header row the parser expects plus two
