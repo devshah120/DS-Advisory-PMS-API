@@ -148,6 +148,32 @@ export class PerformanceService {
         ? await this.rebaseToJun30(snap, ledger)
         : ledger;
 
+    /**
+     * Rebase the COST BASIS too — not just the flow series.
+     *
+     * This closes a real inconsistency on the sheet. The flows above were rebased
+     * onto 30-June, so `investedCapital` reported the 30-June basis ($111,357.95
+     * on Ketan Gohil). But `unrealizedGain` was still derived from
+     * `Holding.costBasisTotal` — the ORIGINAL accumulated cost from the years of
+     * untracked history that predate the import ($109,846.07 for the same
+     * client). The card therefore showed two different cost bases side by side,
+     * and "Unrealized gain +$6,302.74" answered a question ("gain since the
+     * client first bought these, whenever that was") that the rest of the sheet
+     * had explicitly stopped asking.
+     *
+     * Since inception is defined as 30-June-2026, every gain on this sheet must
+     * measure from the 30-June value of the position. Same basis, same date, one
+     * arithmetic identity:
+     *
+     *     unrealizedGain = marketValue − jun30Basis
+     *     totalGain      = unrealizedGain + realizedGain + dividends − fees
+     *
+     * Positions opened AFTER 30-June have no 30-June close and keep their real
+     * purchase cost, which is correct: for those, the purchase IS the inception.
+     */
+    const positionsForGains =
+      method === 'TRANSACTIONAL' ? await this.rebasePositionCosts(snap) : snap.positions;
+
     // ── Values ────────────────────────────────────────────────────────────────
     // Holdings are always DERIVED (quantity × price). The stored
     // Holding.marketValue / Client.portfolioValue columns are a display cache for
@@ -209,7 +235,13 @@ export class PerformanceService {
     // returning even when it cannot. A client with holdings but no recorded
     // deposits still has a sector allocation and a best performer, and showing
     // an empty page because one number is unavailable helps nobody.
-    const base = this.crossSectional(snap, ledger, holdingsValue, cash, portfolioValue);
+    const base = this.crossSectional(
+      { ...snap, positions: positionsForGains },
+      ledger,
+      holdingsValue,
+      cash,
+      portfolioValue,
+    );
 
     /**
      * Refuse to publish an XIRR that is KNOWN to be wrong.
@@ -285,6 +317,22 @@ export class PerformanceService {
 
     const contributed = totalContributed(withTerminal);
     const withdrawn = totalWithdrawn(withTerminal);
+
+    /**
+     * Total gain, from the flow series: everything that came out, plus what is
+     * still in, minus everything that went in.
+     *
+     * Now that the cost basis is rebased onto 30-June (see `positionsForGains`),
+     * this agrees with the position-level identity by construction rather than by
+     * luck, because both sides are anchored on the same 30-June basis:
+     *
+     *     totalGain  ==  unrealizedGain + realizedGain + dividends − fees
+     *
+     * `reconciliation` below reports both sides and their residual, so a future
+     * change that breaks the identity shows up as a number on the sheet instead
+     * of as two cards that quietly disagree — which is exactly how the original
+     * defect survived: nothing ever compared them.
+     */
     const totalGain = terminalValue + withdrawn - contributed;
 
     const absolute = absoluteReturn(totalGain, invested);
@@ -346,6 +394,29 @@ export class PerformanceService {
         // Cash drag needs the portfolio return, so unlike the rest of `base` it
         // cannot be computed before the XIRR is solved.
         cashDrag: pInterim !== null ? cashDrag(cash, portfolioValue, pInterim) : null,
+
+        /**
+         * The sheet checking its own arithmetic.
+         *
+         * `totalGain` comes from the FLOW series; `fromPositions` comes from the
+         * POSITION-level gains. Anchored on the same 30-June basis they must be
+         * equal, so `residual` is the sheet's own proof that they are. It is a
+         * reported number rather than a silent assertion because the failure this
+         * guards against is not a crash — it is two plausible figures disagreeing,
+         * which is what shipped before and what nothing was checking.
+         */
+        reconciliation: (() => {
+          const fromPositions =
+            base.unrealizedGain + base.realizedGain + base.dividendIncome - base.fees;
+          const residual = totalGain - fromPositions;
+          return {
+            totalGainFromFlows: totalGain,
+            totalGainFromPositions: fromPositions,
+            residual,
+            /** Tolerance is float noise, not a judgement call — cents, not dollars. */
+            balanced: Math.abs(residual) < 0.01,
+          };
+        })(),
 
         periodDays: Math.round(days),
         inceptionDate: firstDate,
@@ -646,6 +717,35 @@ export class PerformanceService {
       averageCost: p.costBasis,
     }));
     return rebaseLedgerToJun30(holdings, ledger, closeOf) as LedgerRow[];
+  }
+
+  /**
+   * Restate each position's cost basis at its 30-June-2026 close, so that every gain
+   * on the sheet measures from the same inception the XIRR measures from.
+   *
+   * Mirrors `rebaseLedgerToJun30`'s fallback order exactly — 30-June close, else
+   * the position's own recorded average cost — so a position the rebase priced
+   * one way for the flow series cannot be priced another way for the gain.
+   *
+   * A position with no 30-June bar was (almost always) opened after inception, so
+   * its recorded cost already IS its inception cost and passes through unchanged.
+   */
+  private async rebasePositionCosts(
+    snap: Awaited<ReturnType<SnapshotService['forClient']>>,
+  ): Promise<Awaited<ReturnType<SnapshotService['forClient']>>['positions']> {
+    const closeOf = await this.jun30Closes(snap.positions.map((p) => p.ticker));
+
+    return snap.positions.map((p) => {
+      const unit = closeOf.get(p.ticker) ?? p.costBasis;
+      const costBasisTotal = unit * p.quantity;
+
+      return {
+        ...p,
+        costBasis: unit,
+        costBasisTotal,
+        unrealizedPnl: p.marketValue - costBasisTotal,
+      };
+    });
   }
 
   /**

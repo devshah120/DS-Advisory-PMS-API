@@ -34,7 +34,37 @@ async function main() {
   console.log(`Re-seeding baselines for ${clients.length} clients at ${INCEPTION_DATE.toISOString().slice(0, 10)}\n`);
 
   for (const client of clients) {
-    const open = client.holdings.filter((h) => h.quantity !== 0);
+    const ledgerAll = await prisma.transaction.findMany({
+      where: { clientId: client.id, date: { gt: INCEPTION_DATE } },
+      orderBy: { date: 'asc' },
+    });
+
+    /**
+     * Roll today's holdings back to the baseline date — see the long comment in
+     * BaselineService.autoSeed. Copying current quantities forward asserts the
+     * client held post-baseline purchases on 30-June, and reconstruction then
+     * replays those same BUYs on top, doubling the position.
+     */
+    const sharesAddedSince = new Map<string, number>();
+    for (const t of ledgerAll) {
+      if (!t.ticker || !t.quantity) continue;
+      if (isImportArtifact(t)) continue;
+
+      const delta =
+        t.type === 'BUY' || t.type === 'SPLIT' || t.type === 'BONUS'
+          ? t.quantity
+          : t.type === 'SELL'
+            ? -t.quantity
+            : 0;
+
+      if (delta !== 0) {
+        sharesAddedSince.set(t.ticker, (sharesAddedSince.get(t.ticker) ?? 0) + delta);
+      }
+    }
+
+    const open = client.holdings
+      .map((h) => ({ ...h, quantity: h.quantity - (sharesAddedSince.get(h.ticker) ?? 0) }))
+      .filter((h) => h.quantity > 1e-9);
 
     // Same fallback order as BaselineService.autoSeed and rebaseLedgerToJun30:
     // the 30-June close, else the holding's own average cost.
@@ -58,12 +88,8 @@ async function main() {
 
     // Mirrors the fixed BaselineService.backOutOpeningCash: real post-baseline
     // cash movements only, import artifacts excluded.
-    const ledger = await prisma.transaction.findMany({
-      where: { clientId: client.id, date: { gt: INCEPTION_DATE } },
-    });
-
     let netCashSinceBaseline = 0;
-    for (const t of ledger) {
+    for (const t of ledgerAll) {
       if (isImportArtifact(t)) continue;
       switch (t.type) {
         case 'BUY':

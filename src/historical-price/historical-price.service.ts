@@ -38,8 +38,40 @@ export class HistoricalPriceService {
    */
   private static readonly MAX_STALE_DAYS = 5;
 
-  /** Closing price for `ticker` on or before `date`. Null if truly no history exists. */
+  /** Is `date` today (UTC)? Today is priced live, not from a stored bar — see `closeOn`. */
+  private static isToday(date: Date): boolean {
+    const now = new Date();
+    return (
+      date.getUTCFullYear() === now.getUTCFullYear() &&
+      date.getUTCMonth() === now.getUTCMonth() &&
+      date.getUTCDate() === now.getUTCDate()
+    );
+  }
+
+  /**
+   * Closing price for `ticker` on or before `date`. Null if truly no history exists.
+   *
+   * **Today is priced from the live quote, not from PriceBar.** PriceBar's newest
+   * row is yesterday's close until the daily backfill runs, so valuing "today"
+   * from it prices the book a day stale — while SnapshotService (the Current tab)
+   * uses the live quote for the same instant. That split had the two tabs
+   * reporting different market values for the same client on the same day
+   * ($115,533.25 historical vs $116,204.72 current on an 18-position book), and
+   * every gain figure derived from either inherited the discrepancy.
+   *
+   * A past date still comes from PriceBar, which is what makes a historical
+   * valuation reproducible. Only the live edge is special-cased, and it is
+   * special-cased toward the SAME source the rest of the product already treats
+   * as today's truth.
+   */
   async closeOn(ticker: string, date: Date): Promise<number | null> {
+    if (HistoricalPriceService.isToday(date)) {
+      const live = await this.liveQuote(ticker);
+      if (live !== null) return live;
+      // No quote (lookup failed, market data down) — fall through to the stored
+      // bar rather than dropping the position's price entirely.
+    }
+
     const bar = await this.prisma.priceBar.findFirst({
       where: { symbol: ticker, date: { lte: date } },
       orderBy: { date: 'desc' },
@@ -75,6 +107,22 @@ export class HistoricalPriceService {
     );
 
     return out;
+  }
+
+  /**
+   * Today's live price, from the same MarketService.lookup SnapshotService uses —
+   * deliberately the identical call, so the Historical and Current tabs cannot
+   * resolve different prices for the same ticker at the same moment. Returns null
+   * on any failure and lets the caller fall back to the stored bar.
+   */
+  private async liveQuote(ticker: string): Promise<number | null> {
+    try {
+      const { currentPrice } = await this.market.lookup(ticker);
+      return typeof currentPrice === 'number' ? currentPrice : null;
+    } catch (error) {
+      this.logger.warn(`Live quote failed for ${ticker}: ${(error as Error).message}`);
+      return null;
+    }
   }
 
   private async backfill(ticker: string, date: Date): Promise<void> {

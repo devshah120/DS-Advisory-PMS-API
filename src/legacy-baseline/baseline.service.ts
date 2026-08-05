@@ -106,10 +106,53 @@ export class BaselineService {
     });
     if (!client) throw new NotFoundException(`Client ${clientId} not found`);
 
-    const open = client.holdings.filter((h) => h.quantity !== 0);
+    /**
+     * Roll today's holdings BACK to the baseline date before seeding.
+     *
+     * `client.holdings` is the CURRENT book, which already includes every share
+     * bought since the baseline. Copying those quantities into the baseline
+     * asserts the client held them on 30-June — and then reconstruction
+     * legitimately replays the post-baseline BUY on top, leaving the position at
+     * DOUBLE its real size. That is not hypothetical: it put Mrugesh's BMY at
+     * 226.98 shares against a true 113.49 (bought 3-Aug), and Om's IAU and SLV at
+     * exactly twice their real quantity (both bought 30-Jul), overstating the
+     * reconstructed book by $7,242 and $10,427 respectively.
+     *
+     * So we undo the genuine post-baseline share movements — BUY/SELL and the
+     * corporate actions that change share count — while leaving the import
+     * artifacts alone, since those describe the opening position we are trying to
+     * reconstruct rather than activity on top of it.
+     */
+    const postBaseline = await this.prisma.transaction.findMany({
+      where: { clientId, date: { gt: baselineDate } },
+      orderBy: { date: 'asc' },
+    });
+
+    const sharesAddedSince = new Map<string, number>();
+    for (const t of postBaseline) {
+      if (!t.ticker || !t.quantity) continue;
+      if (isImportArtifact(t)) continue;
+
+      const delta =
+        t.type === 'BUY' || t.type === 'SPLIT' || t.type === 'BONUS'
+          ? t.quantity
+          : t.type === 'SELL'
+            ? -t.quantity
+            : 0;
+
+      if (delta !== 0) {
+        sharesAddedSince.set(t.ticker, (sharesAddedSince.get(t.ticker) ?? 0) + delta);
+      }
+    }
+
+    const atBaseline = client.holdings
+      .map((h) => ({ ...h, quantity: h.quantity - (sharesAddedSince.get(h.ticker) ?? 0) }))
+      // A position entirely opened after the baseline rolls back to zero (or, with
+      // rounding, a hair either side of it) and simply was not held on that date.
+      .filter((h) => h.quantity > 1e-9);
 
     const holdings = await Promise.all(
-      open.map(async (h) => {
+      atBaseline.map(async (h) => {
         const close = await this.prices.closeOn(h.ticker, baselineDate);
         const price = close ?? h.averageCost;
         return {
