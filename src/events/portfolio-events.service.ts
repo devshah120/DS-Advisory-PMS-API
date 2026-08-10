@@ -71,11 +71,19 @@ export class PortfolioEventsService {
     return { refreshed, tickers: tickers.length };
   }
 
-  /** Deduplicated held tickers -> { company, set of clientIds }. */
+  /**
+   * Deduplicated held tickers -> { company, set of clientIds }.
+   *
+   * "Held" means an open position. A sold-out lot keeps its row for the
+   * realized P&L it booked, but its earnings and dividend dates are no longer
+   * this desk's business — surfacing them would alert an advisor about a name
+   * their client has already exited.
+   */
   private async holdingsByTicker(): Promise<Map<string, { company: string; clientIds: Set<string> }>> {
-    const holdings = await this.prisma.holding.findMany({
-      select: { ticker: true, company: true, clientId: true },
+    const stored = await this.prisma.holding.findMany({
+      select: { ticker: true, company: true, clientId: true, quantity: true },
     });
+    const holdings = stored.filter((h) => Math.abs(h.quantity) > 1e-9);
 
     const byTicker = new Map<string, { company: string; clientIds: Set<string> }>();
     for (const h of holdings) {

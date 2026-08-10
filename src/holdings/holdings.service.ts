@@ -168,6 +168,31 @@ function derive(quantity: number, averageCost: number, currentPrice: number) {
   return { marketValue, unrealizedPnL: marketValue - costBasis };
 }
 
+/**
+ * Below this, a position is closed rather than merely small.
+ *
+ * Quantities are fractional (46.414 shares), so selling a lot out in full
+ * rarely lands on a clean 0 — the subtraction leaves float dust like 7e-15.
+ * Comparing against zero would let a fully-exited position keep showing up as
+ * an open holding worth $0.00. Matches the threshold the analytics layer
+ * already uses for the same judgement.
+ */
+const CLOSED_POSITION_EPSILON = 1e-9;
+
+/**
+ * Open positions only — what the client actually still owns.
+ *
+ * A sold-out holding keeps its DB row on purpose: it carries the realizedPnL
+ * that the sale booked, and deleting it would erase the gain from the record.
+ * But it is no longer a *holding*, so it must not reach the holdings table, the
+ * exports, or any exposure/allocation rollup built off them. Filtering on read
+ * keeps that distinction in one place rather than asking every caller to
+ * remember it.
+ */
+function openOnly<T extends { quantity: number }>(holdings: T[]): T[] {
+  return holdings.filter((h) => Math.abs(h.quantity) > CLOSED_POSITION_EPSILON);
+}
+
 @Injectable()
 export class HoldingsService {
   private readonly logger = new Logger(HoldingsService.name);
@@ -280,12 +305,19 @@ export class HoldingsService {
       });
     }
 
-    const newQuantity = existing.quantity + quantity;
-    if (newQuantity < 0) {
+    const rawQuantity = existing.quantity + quantity;
+    if (rawQuantity < -CLOSED_POSITION_EPSILON) {
       throw new BadRequestException(
         `Cannot sell ${Math.abs(quantity)} shares of ${ticker}; only ${existing.quantity} held`,
       );
     }
+
+    // Selling the whole lot must land on a clean zero. Fractional quantities
+    // mean `held - sold` can leave dust (7e-15) instead, and that dust is
+    // exactly what keeps a fully-exited name rendering as a $0.00 position.
+    // Snapping here closes it at the source rather than relying on every
+    // reader to filter it out afterwards.
+    const newQuantity = Math.abs(rawQuantity) < CLOSED_POSITION_EPSILON ? 0 : rawQuantity;
 
     let newAverageCost = existing.averageCost;
     let realizedPnL = existing.realizedPnL;
@@ -406,14 +438,14 @@ export class HoldingsService {
         client: true,
       },
     });
-    return this.withLivePrices(holdings);
+    return this.withLivePrices(openOnly(holdings));
   }
 
   async findByClient(clientId: string) {
     const holdings = await this.prisma.holding.findMany({
       where: { clientId },
     });
-    return this.withLivePrices(holdings);
+    return this.withLivePrices(openOnly(holdings));
   }
 
   findOne(id: string) {
@@ -463,14 +495,14 @@ export class HoldingsService {
         client: true,
       },
     });
-    return this.withLivePrices(holdings);
+    return this.withLivePrices(openOnly(holdings));
   }
 
   async getSectorExposure(clientId: string) {
     const stored = await this.prisma.holding.findMany({
       where: { clientId },
     });
-    const holdings = await this.withLivePrices(stored);
+    const holdings = await this.withLivePrices(openOnly(stored));
 
     const sectors = holdings.reduce((acc: Record<string, { value: number; holdings: number }>, h: any) => {
       if (!acc[h.sector]) {
@@ -559,7 +591,12 @@ export class HoldingsService {
       positions.set(tx.ticker, pos);
     }
 
-    const openPositions = [...positions.values()].filter((p) => p.quantity > 0);
+    // Same epsilon as the live book: replaying fractional buys and sells that
+    // net to a full exit leaves float dust, not a clean zero, and a position
+    // sold out before the as-of date must not reappear in a back-dated export.
+    const openPositions = [...positions.values()].filter(
+      (p) => p.quantity > CLOSED_POSITION_EPSILON,
+    );
 
     // Price every position at its close on `asOfDate` — not at the price of the
     // transaction that happened to be last, which made Current Value identical

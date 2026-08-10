@@ -68,7 +68,11 @@ export class DashboardService {
       this.prisma.client.aggregate({ _sum: { cashBalance: true } }),
     ]);
 
-    const holdings = await this.withLiveMarketValue(stored);
+    // Closed lots keep their row for the realized P&L they booked, but they are
+    // not positions: counting them would inflate numHoldings and let a
+    // sold-out name sit in top holdings at $0.
+    const open = stored.filter((h) => Math.abs(h.quantity) > 1e-9);
+    const holdings = await this.withLiveMarketValue(open);
     const totalAUM = holdings.reduce((sum, h) => sum + h.marketValue, 0);
     const totalCash = cashAgg._sum.cashBalance ?? 0;
     const closesByTicker = await this.closesForTickers(holdings.map((h) => h.ticker));
