@@ -6,6 +6,7 @@ import { HistoricalPriceService } from '../historical-price/historical-price.ser
 import { CreateHoldingDto } from './dto/create-holding.dto';
 import { UpdateHoldingDto } from './dto/update-holding.dto';
 import { BulkImportRowResult, BulkImportSummary } from './dto/bulk-import-result.dto';
+import { Market, marketForSymbol, normalizeSymbol } from '../common/market-scope';
 
 /**
  * The bulk-import sheet, in the order the columns appear in the sample workbook.
@@ -220,7 +221,9 @@ export class HoldingsService {
     await Promise.all(
       tickers.map(async (ticker) => {
         try {
-          const { currentPrice } = await this.market.lookup(ticker);
+          // Stored tickers are fully qualified, so the book is read off the
+          // symbol's own suffix — no caller-supplied hint is needed here.
+          const { currentPrice } = await this.market.lookup(ticker, marketForSymbol(ticker));
           if (typeof currentPrice === 'number') quotes.set(ticker, currentPrice);
         } catch (error) {
           this.logger.warn(`Live price lookup failed for ${ticker}: ${(error as Error).message}`);
@@ -432,8 +435,15 @@ export class HoldingsService {
     return holding;
   }
 
-  async findAll() {
+  /**
+   * Every open position, optionally narrowed to one book of business.
+   *
+   * Scoped through the client relation rather than the ticker, because market is
+   * a property of the mandate — see the note on Client.market in schema.prisma.
+   */
+  async findAll(market?: Market) {
     const holdings = await this.prisma.holding.findMany({
+      where: market ? { client: { market } } : {},
       include: {
         client: true,
       },
@@ -800,19 +810,23 @@ export class HoldingsService {
   }
 
   /**
-   * Client ids keyed by lowercased name. A name owned by more than one client
-   * maps to null, which the row loop reports as an ambiguity rather than
-   * guessing which account a trade belongs to.
+   * Client ids (and their book) keyed by lowercased name. A name owned by more
+   * than one client maps to null, which the row loop reports as an ambiguity
+   * rather than guessing which account a trade belongs to.
+   *
+   * The market travels with the id because a blotter written for an Indian
+   * mandate says "RELIANCE", not "RELIANCE.NS" — the row needs the client's book
+   * to qualify that symbol before it can be priced.
    */
-  private async clientNameIndex(): Promise<Map<string, string | null>> {
+  private async clientNameIndex(): Promise<Map<string, { id: string; market: Market } | null>> {
     const clients = await this.prisma.client.findMany({
-      select: { id: true, name: true },
+      select: { id: true, name: true, market: true },
     });
 
-    const index = new Map<string, string | null>();
+    const index = new Map<string, { id: string; market: Market } | null>();
     for (const c of clients) {
       const key = c.name.trim().toLowerCase();
-      index.set(key, index.has(key) ? null : c.id);
+      index.set(key, index.has(key) ? null : { id: c.id, market: c.market as Market });
     }
     return index;
   }
@@ -824,17 +838,17 @@ export class HoldingsService {
    */
   private async importRow(
     raw: Record<string, unknown>,
-    clientsByName: Map<string, string | null>,
+    clientsByName: Map<string, { id: string; market: Market } | null>,
   ): Promise<void> {
     const side = toSide(raw.action);
     const date = toDate(raw.date);
     const clientName = toText(raw.clientName);
-    const ticker = toText(raw.symbol)?.toUpperCase();
+    const rawTicker = toText(raw.symbol)?.toUpperCase();
     const quantity = toNumber(raw.quantity);
     const amountInvested = toNumber(raw.amountInvested);
 
     if (!clientName) throw new Error('Client Name is required');
-    if (!ticker) throw new Error('Symbol is required');
+    if (!rawTicker) throw new Error('Symbol is required');
     if (quantity === null) throw new Error('Quantity is required and must be a number');
     if (quantity <= 0) {
       throw new Error('Quantity must be greater than zero — use the Action column for a sell');
@@ -844,13 +858,19 @@ export class HoldingsService {
     }
     if (amountInvested <= 0) throw new Error('Amount Invested must be greater than zero');
 
-    const clientId = clientsByName.get(clientName.toLowerCase());
-    if (clientId === undefined) {
+    const matched = clientsByName.get(clientName.toLowerCase());
+    if (matched === undefined) {
       throw new Error(`No client named "${clientName}"`);
     }
-    if (clientId === null) {
+    if (matched === null) {
       throw new Error(`More than one client is named "${clientName}"`);
     }
+    const { id: clientId, market } = matched;
+
+    // Qualify the symbol against the owning client's book, so an Indian
+    // blotter's "RELIANCE" becomes "RELIANCE.NS" and prices correctly. A symbol
+    // that already carries a suffix is left exactly as typed.
+    const ticker = normalizeSymbol(rawTicker, market);
 
     // The price the trade actually happened at. For a sell this is what
     // realises the P&L in create(), which is why the file's proceeds are used
@@ -871,7 +891,7 @@ export class HoldingsService {
       currentPrice: number;
     }> = {};
     try {
-      looked = await this.market.lookup(ticker);
+      looked = await this.market.lookup(ticker, market);
     } catch (error) {
       this.logger.warn(`Import lookup failed for ${ticker}: ${(error as Error).message}`);
     }

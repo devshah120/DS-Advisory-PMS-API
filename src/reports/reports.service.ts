@@ -2,6 +2,7 @@ import { BadRequestException, Injectable, Logger, NotFoundException } from '@nes
 import { PrismaService } from '../common/prisma/prisma.service';
 import { PortfolioHistoryService } from '../portfolio-reconstruction/portfolio-history.service';
 import { INCEPTION_DATE } from '../analytics/calculators/flows';
+import { Market } from '../common/market-scope';
 
 export interface ClientFeeRow {
   clientId: string;
@@ -25,6 +26,11 @@ export interface ClientFeeRow {
   feeAmount: number;
   /** 'snapshot' | 'reconstruction' | 'live' — where portfolioValue came from. */
   valuationSource: string;
+  /**
+   * The client's own reporting currency, so a fee row renders in the unit it
+   * was billed in rather than in whatever the viewer's selector happens to say.
+   */
+  currency: string;
 }
 
 /** One entry in the quarter dropdown. */
@@ -93,15 +99,19 @@ export class ReportsService {
    *      snapshot and freeze it now, so the first read locks it in.
    *   3. The quarter is still open → compute live and store nothing.
    */
-  async feesForQuarter(quarter?: string): Promise<ClientFeeRow[]> {
+  async feesForQuarter(quarter?: string, market?: Market): Promise<ClientFeeRow[]> {
     const today = new Date();
     const code = quarter ?? currentQuarterCode(today);
     const { start, end, label } = parseQuarterCode(code);
 
     const isClosed = utcDay(today) > end;
 
+    // Scoped to one book. The fee table sums a Total column across its rows,
+    // and an unscoped read put USD and INR mandates in the same table under one
+    // total — a figure in no currency at all. Optional so an unscoped
+    // firm-wide read still works.
     const clients = await this.prisma.client.findMany({
-      where: { status: 'ACTIVE' },
+      where: { status: 'ACTIVE', ...(market ? { market } : {}) },
       include: { holdings: true },
       orderBy: { name: 'asc' },
     });
@@ -116,7 +126,7 @@ export class ReportsService {
     for (const client of clients) {
       const frozen = storedByClient.get(client.id);
       if (frozen) {
-        rows.push(fromStoredRow(frozen, client.name));
+        rows.push(fromStoredRow(frozen, client.name, client.currency));
         continue;
       }
 
@@ -126,7 +136,13 @@ export class ReportsService {
       if (utcDay(client.inceptionDate) > end) continue;
 
       const computed = await this.computeFee(
-        { id: client.id, name: client.name, feeRatePercent: client.feeRatePercent, inceptionDate: client.inceptionDate },
+        {
+          id: client.id,
+          name: client.name,
+          feeRatePercent: client.feeRatePercent,
+          inceptionDate: client.inceptionDate,
+          currency: client.currency,
+        },
         { code, label, start, end },
         { isClosed, liveValue: client.holdings.reduce((sum, h) => sum + h.marketValue, 0), asOf: today },
       );
@@ -154,7 +170,7 @@ export class ReportsService {
    * holdings total stands in as a running estimate.
    */
   private async computeFee(
-    client: { id: string; name: string; feeRatePercent: number; inceptionDate: Date },
+    client: { id: string; name: string; feeRatePercent: number; inceptionDate: Date; currency: string },
     quarter: { code: string; label: string; start: Date; end: Date },
     ctx: { isClosed: boolean; liveValue: number; asOf: Date },
   ): Promise<ClientFeeRow> {
@@ -193,6 +209,7 @@ export class ReportsService {
       isEstimate: !ctx.isClosed,
       feeAmount: portfolioValue * (client.feeRatePercent / 100 / 4) * proration,
       valuationSource,
+      currency: client.currency,
     };
   }
 
@@ -343,10 +360,12 @@ function fromStoredRow(
     valuationSource: string;
   },
   clientName: string,
+  currency: string,
 ): ClientFeeRow {
   return {
     clientId: row.clientId,
     clientName,
+    currency,
     feeRatePercent: row.feeRatePercent,
     portfolioValue: row.portfolioValue,
     quarter: row.quarter,

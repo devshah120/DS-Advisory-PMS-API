@@ -1,10 +1,21 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { FALLBACK_SYMBOLS, SymbolProfile, deriveTheme } from './symbol-fallback';
+import {
+  Market,
+  currencyForMarket,
+  displaySymbol,
+  marketForSymbol,
+  normalizeSymbol,
+} from '../common/market-scope';
 
 export interface LookupResult extends SymbolProfile {
   theme: string;
   /** Where the classification came from, so the UI can flag guessed data. */
   source: 'yahoo' | 'fallback';
+  /** Which book this symbol trades in, derived from its suffix. */
+  market: Market;
+  /** The ticker without its exchange suffix — 'RELIANCE.NS' reads as 'RELIANCE'. */
+  displayTicker: string;
 }
 
 export interface DailyClose {
@@ -38,16 +49,36 @@ export class MarketService {
   private session: { cookie: string; crumb: string; expiresAt: number } | null = null;
   private static readonly SESSION_TTL_MS = 30 * 60 * 1000;
 
-  async lookup(rawTicker: string): Promise<LookupResult> {
-    const ticker = rawTicker.trim().toUpperCase();
-    if (!ticker) throw new NotFoundException('Ticker is required');
+  /**
+   * Resolves a ticker to its profile and live price.
+   *
+   * `market` is a hint for how to interpret a BARE ticker, not a filter: an
+   * Indian mandate's user types "RELIANCE", which Yahoo knows nothing about
+   * until it becomes "RELIANCE.NS". A symbol that already carries a suffix (or a
+   * '^' index) is passed through untouched, so this stays a no-op for the US
+   * book and for anyone who types the fully-qualified symbol themselves.
+   */
+  async lookup(rawTicker: string, market?: Market): Promise<LookupResult> {
+    const input = rawTicker.trim().toUpperCase();
+    if (!input) throw new NotFoundException('Ticker is required');
+
+    const ticker = market ? normalizeSymbol(input, market) : input;
 
     const cached = this.cache.get(ticker);
     if (cached && cached.expiresAt > Date.now()) return cached.value;
 
-    const result = (await this.fromYahoo(ticker)) ?? this.fromFallback(ticker);
+    let result = (await this.fromYahoo(ticker)) ?? this.fromFallback(ticker);
+
+    // A bare Indian ticker that Yahoo rejects on the NSE may still be a BSE-only
+    // listing. Retrying '.BO' here (rather than making the user discover the
+    // suffix) is what makes a smallcap resolve on first entry.
+    if (!result && market === 'INDIA' && !input.includes('.')) {
+      const bse = `${input}.BO`;
+      result = (await this.fromYahoo(bse)) ?? this.fromFallback(bse);
+    }
+
     if (!result) {
-      throw new NotFoundException(`No symbol found for "${ticker}"`);
+      throw new NotFoundException(`No symbol found for "${input}"`);
     }
 
     this.cache.set(ticker, {
@@ -104,11 +135,18 @@ export class MarketService {
   private fromFallback(ticker: string): LookupResult | null {
     const hit = FALLBACK_SYMBOLS[ticker];
     if (!hit) return null;
+    const market = marketForSymbol(ticker);
     return {
       ticker,
       ...hit,
+      // The offline table predates multi-market support and carries no currency,
+      // so derive it from the symbol rather than letting an Indian fallback
+      // report a US dollar price.
+      currency: hit.currency ?? currencyForMarket(market),
       theme: deriveTheme(hit.sector, hit.industry),
       source: 'fallback',
+      market,
+      displayTicker: displaySymbol(ticker),
     };
   }
 
@@ -152,9 +190,13 @@ export class MarketService {
       country,
       exchange: quote?.exchDisp || meta?.fullExchangeName || meta?.exchangeName || fallback?.exchange || '',
       currentPrice: typeof meta?.regularMarketPrice === 'number' ? meta.regularMarketPrice : undefined,
-      currency: meta?.currency,
+      // Yahoo reports the quote's own currency (INR for an NSE listing), which is
+      // authoritative — fall back to the market's currency only when it's absent.
+      currency: meta?.currency || currencyForMarket(marketForSymbol(ticker)),
       theme: deriveTheme(sector, industry),
       source: 'yahoo',
+      market: marketForSymbol(ticker),
+      displayTicker: displaySymbol(ticker),
     };
   }
 

@@ -2,6 +2,7 @@ import { Controller, Get, Post, Body, Param, Delete, Query, UseGuards } from '@n
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { WatchlistService } from './watchlist.service';
 import { CreateWatchlistDto, BulkAddWatchlistDto, RenameWatchlistFolderDto } from './dto/create-watchlist.dto';
+import { parseMarket } from '../common/market-scope';
 
 @Controller('watchlist')
 @UseGuards(JwtAuthGuard)
@@ -15,27 +16,32 @@ export class WatchlistController {
 
   @Post('bulk')
   bulkAdd(@Body() dto: BulkAddWatchlistDto) {
-    return this.watchlistService.bulkAdd(dto.tickers, dto.slot);
+    return this.watchlistService.bulkAdd(
+      dto.tickers,
+      dto.slot,
+      dto.market ? parseMarket(dto.market) : undefined,
+    );
   }
 
   @Get()
-  findAll(@Query('slot') slot?: string) {
-    return this.watchlistService.findAll(slot);
+  findAll(@Query('slot') slot?: string, @Query('market') market?: string) {
+    // Unscoped when absent, so a firm-wide read still returns both books.
+    return this.watchlistService.findAll(slot, market ? parseMarket(market) : undefined);
   }
 
   @Get('folders')
-  folders() {
-    return this.watchlistService.folders();
+  folders(@Query('market') market?: string) {
+    return this.watchlistService.folders(parseMarket(market));
   }
 
   @Post('folders/:slot')
   renameFolder(@Param('slot') slot: string, @Body() dto: RenameWatchlistFolderDto) {
-    return this.watchlistService.renameFolder(slot, dto.name);
+    return this.watchlistService.renameFolder(slot, dto.name, parseMarket(dto.market));
   }
 
   @Get('benchmarks')
-  benchmarkReturns() {
-    return this.watchlistService.benchmarkReturns();
+  benchmarkReturns(@Query('market') market?: string) {
+    return this.watchlistService.benchmarkReturns(parseMarket(market));
   }
 
   @Get(':id')

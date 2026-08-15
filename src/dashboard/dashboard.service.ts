@@ -2,9 +2,18 @@ import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { MarketService, DailyClose } from '../market/market.service';
 import { HouseService } from '../analytics/services/house.service';
+import {
+  DEFAULT_MARKET,
+  MARKETS,
+  Market,
+  currencyForMarket,
+  displaySymbol,
+} from '../common/market-scope';
 
 export interface HoldingMover {
   ticker: string;
+  /** Suffix-stripped ticker for display ('RELIANCE.NS' → 'RELIANCE'). */
+  displayTicker: string;
   company: string;
   clientId: string;
   marketValue: number;
@@ -14,6 +23,7 @@ export interface HoldingMover {
 
 export interface TopHolding {
   ticker: string;
+  displayTicker: string;
   company: string;
   marketValue: number;
   weight: number;
@@ -27,6 +37,13 @@ export interface MarketQuote {
   currentPrice: number | null;
   dayChangePercent: number | null;
   ytdChangePercent: number | null;
+  /**
+   * The currency this particular quote is denominated in. Needed because a
+   * market's strip is not uniform: the Indian book shows Nifty/Sensex in INR
+   * alongside WTI and gold, which Yahoo quotes in USD no matter who is looking.
+   * Formatting the whole strip in the book's currency would misprice them.
+   */
+  currency: string;
 }
 
 export interface ClientMover {
@@ -36,18 +53,9 @@ export interface ClientMover {
   changePercent: number;
 }
 
-const TRACKED_INDICES = [
-  { code: 'SP500', label: 'S&P 500', symbol: '^GSPC' },
-  { code: 'NASDAQ', label: 'Nasdaq', symbol: '^IXIC' },
-  { code: 'DOWJONES', label: 'Dow Jones', symbol: '^DJI' },
-  { code: 'RUSSELL2000', label: 'Russell 2000', symbol: '^RUT' },
-] as const;
-
-const TRACKED_COMMODITIES = [
-  { code: 'CRUDE', label: 'Crude Oil (WTI)', symbol: 'CL=F' },
-  { code: 'GOLD', label: 'Gold', symbol: 'GC=F' },
-  { code: 'SILVER', label: 'Silver', symbol: 'SI=F' },
-] as const;
+// Commodities are dollar-denominated globally, so their quotes are labelled USD
+// regardless of which book is selected — see MarketQuote.currency.
+const COMMODITY_CURRENCY = 'USD';
 
 @Injectable()
 export class DashboardService {
@@ -57,15 +65,35 @@ export class DashboardService {
     private house: HouseService,
   ) {}
 
-  async getOverview() {
+  /**
+   * The house-level overview for ONE book of business.
+   *
+   * Every figure here is scoped to `market`: AUM, cash, client and holding
+   * counts, movers, sector allocation and top holdings all describe the selected
+   * book alone. The two books are deliberately never summed — they are
+   * denominated in different currencies, and adding rupees to dollars without an
+   * FX rate would produce a meaningless headline number.
+   *
+   * Holdings are reached through their client rather than filtered directly,
+   * because market lives on Client: a holding's book is a property of whose
+   * mandate it sits in, not of the ticker (the same ADR could in principle be
+   * held either side).
+   */
+  async getOverview(market: Market = DEFAULT_MARKET) {
     const [clients, stored, exposure, cashAgg] = await Promise.all([
-      this.prisma.client.findMany({ select: { id: true, name: true } }),
-      this.prisma.holding.findMany(),
-      this.house.exposure(),
+      this.prisma.client.findMany({
+        where: { market },
+        select: { id: true, name: true },
+      }),
+      this.prisma.holding.findMany({ where: { client: { market } } }),
+      this.house.exposure(market),
       // House-wide idle cash: summed straight off the client records, so a
       // client's balance is counted once regardless of how many positions they
       // hold. This is buying power available for deployment, not deployed capital.
-      this.prisma.client.aggregate({ _sum: { cashBalance: true } }),
+      this.prisma.client.aggregate({
+        where: { market },
+        _sum: { cashBalance: true },
+      }),
     ]);
 
     // Closed lots keep their row for the realized P&L they booked, but they are
@@ -79,6 +107,11 @@ export class DashboardService {
     const movers = this.dailyMovers(holdings, closesByTicker);
 
     return {
+      // Echoed back so the UI formats this payload in the currency it was
+      // actually computed in, rather than trusting its own selector state —
+      // which can be a render ahead of the response it is labelling.
+      market,
+      currency: currencyForMarket(market),
       totalAUM,
       // Cash the house holds across every client — deployable, not yet invested.
       totalCash,
@@ -154,6 +187,7 @@ export class DashboardService {
     return [...byTicker.entries()]
       .map(([ticker, v]) => ({
         ticker,
+        displayTicker: displaySymbol(ticker),
         company: v.company,
         marketValue: v.marketValue,
         weight: totalAUM > 0 ? v.marketValue / totalAUM : 0,
@@ -210,6 +244,7 @@ export class DashboardService {
       if (prior.close === 0) continue;
       byTicker.set(h.ticker, {
         ticker: h.ticker,
+        displayTicker: displaySymbol(h.ticker),
         company: h.company,
         clientId: h.clientId,
         marketValue: h.marketValue,
@@ -258,9 +293,21 @@ export class DashboardService {
       .sort((a, b) => b.changePercent - a.changePercent);
   }
 
-  /** Live daily and YTD % change for the tracked indices and commodities. */
-  async marketOverview(): Promise<MarketQuote[]> {
-    const all = [...TRACKED_INDICES, ...TRACKED_COMMODITIES];
+  /**
+   * Live daily and YTD % change for the selected book's indices, plus the
+   * globally-quoted commodities.
+   *
+   * The Indian book tracks Nifty/Sensex where the US book tracks the S&P/Nasdaq,
+   * so the strip is driven off MARKETS rather than a module constant. Each quote
+   * carries its own currency because the two halves of the list disagree: the
+   * indices follow the book, the commodities are always USD.
+   */
+  async marketOverview(market: Market = DEFAULT_MARKET): Promise<MarketQuote[]> {
+    const def = MARKETS[market];
+    const all = [
+      ...def.indices.map((i) => ({ ...i, currency: def.currency })),
+      ...def.commodities.map((c) => ({ ...c, currency: COMMODITY_CURRENCY })),
+    ];
     const ytdBase = toIsoDate(new Date(Date.UTC(new Date().getUTCFullYear() - 1, 11, 31)));
     // A week of headroom before Dec 31 so a base date landing on a
     // holiday/weekend still has an earlier bar to walk back to.

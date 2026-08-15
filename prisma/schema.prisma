@@ -169,6 +169,29 @@ model Client {
   includeFees      Boolean @default(true)
 
   currency       String       @default("USD")
+
+  /// Which book of business this mandate belongs to — see common/market-scope.ts.
+  ///
+  /// The firm runs a US book and an Indian one out of this single database, and
+  /// this is the dimension nearly every read filters on: the dashboard, holdings,
+  /// performance and reports are all scoped to one market at a time via the
+  /// header's country selector.
+  ///
+  /// Defaults to US so every client that predates the Indian book keeps reading
+  /// exactly as before rather than vanishing from an unscoped query. It is NOT
+  /// derived from `currency`: currency is a reporting unit that a US mandate
+  /// could in principle change, whereas market determines which exchange the
+  /// tickers resolve against and which indices benchmark the book.
+  market         Market       @default(US)
+
+  /// The household this mandate belongs to, if any — see Family.
+  ///
+  /// Nullable because most mandates stand alone; only the accounts a manager
+  /// has explicitly grouped carry it. Set to null (not cascaded) when the
+  /// family is deleted, so dissolving a household never deletes a client.
+  familyId       String?
+  family         Family?      @relation(fields: [familyId], references: [id], onDelete: SetNull)
+
   status         ClientStatus @default(ACTIVE)
   cashBalance    Float        @default(0)
   portfolioValue Float        @default(0)
@@ -214,6 +237,12 @@ model Client {
 
   @@index([status])
   @@index([name])
+  /// Every market-scoped read starts `market = ?`, usually alongside a status
+  /// filter — a compound index keeps that from scanning the whole collection
+  /// once the second book grows.
+  @@index([market, status])
+  /// The family aggregate reads every member in one query.
+  @@index([familyId])
   @@map("clients")
 }
 
@@ -232,6 +261,14 @@ enum ClientStatus {
   ACTIVE
   INACTIVE
   CLOSED
+}
+
+/// The book of business a client or instrument belongs to. Adding a market here
+/// plus an entry in common/market-scope.ts is the whole change needed to run a
+/// third book — no service reads a hardcoded exchange or currency.
+enum Market {
+  US
+  INDIA
 }
 
 model Holding {
@@ -347,21 +384,77 @@ model Watchlist {
   sector   String
   industry String
 
+  /// Which book this tracked name belongs to.
+  ///
+  /// Scoped like every other read: switching the header's country selector to
+  /// India shows the Indian watchlist, not a mixed table. That matters here more
+  /// than elsewhere because the price column is rendered in the selected book's
+  /// currency — a US name sitting in the Indian list would read as rupees.
+  ///
+  /// Defaults to US so every ticker added before the Indian book keeps showing
+  /// on the US watchlist rather than vanishing from both.
+  market   Market @default(US)
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  @@unique([slot, ticker])
+  /// Scoped per book: the same ticker may sit on slot 1 of both books, and
+  /// (more to the point) 'RELIANCE.NS' and a US name never collide.
+  @@unique([market, slot, ticker])
+  @@index([market, slot])
   @@map("watchlists")
 }
 
 /// Display name for each of the five watchlist slots. Rows are created
 /// lazily (upsert) the first time a slot's name is changed from its default.
+///
+/// Named per book, so the Indian book's "Slot 1" can be "Nifty Compounders"
+/// while the US book's stays "Core Longs".
 model WatchlistFolder {
+  id     String @id @default(cuid()) @map("_id")
+  slot   String
+  name   String
+  market Market @default(US)
+
+  @@unique([market, slot])
+  @@map("watchlist_folders")
+}
+
+/// A household — several client mandates managed as one book.
+///
+/// The Indian desk in particular runs four or five accounts that belong to one
+/// family (a couple, their children, an HUF), and the manager reasons about the
+/// household's combined exposure: how much of RELIANCE the family holds in
+/// total, at what blended cost, and how the sector mix looks once the accounts
+/// are merged. Individual mandates stay first-class — this groups them for
+/// reporting, it does not merge them.
+///
+/// Membership is a nullable FK on Client rather than a join table: a client
+/// belongs to at most one family, and that is the rule the desk actually works
+/// to. Deleting a family leaves its clients intact and unaffiliated
+/// (onDelete: SetNull), because a household dissolving must never take the
+/// underlying mandates' holdings with it.
+model Family {
   id   String @id @default(cuid()) @map("_id")
-  slot String @unique
   name String
 
-  @@map("watchlist_folders")
+  /// A family lives in ONE book. Aggregating an INR mandate with a USD one
+  /// would sum two different units into a meaningless total, and the codebase
+  /// carries no FX rate to convert between them — so the API rejects a member
+  /// from another book rather than silently producing a wrong number.
+  market Market @default(US)
+
+  notes String?
+
+  clients Client[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// Families are listed per book, and a household name is unique within one.
+  @@unique([market, name])
+  @@index([market])
+  @@map("families")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -406,8 +499,13 @@ model Benchmark {
   name      String
   /// Join key into PriceBar.symbol.
   symbol    String
+  /// Which book this benchmark belongs to, so the client form offers Nifty/Sensex
+  /// for an Indian mandate and the S&P/Nasdaq for a US one. `isDefault` is scoped
+  /// by market too — each book has its own default (S&P 500 / Nifty 50).
+  market    Market  @default(US)
   isDefault Boolean @default(false)
 
+  @@index([market])
   @@map("benchmarks")
 }
 
@@ -428,6 +526,13 @@ model InstrumentProfile {
   exchange   String     @default("Unknown")
   currency   String     @default("USD")
 
+  /// Which book this instrument trades in, derived from the Yahoo suffix
+  /// ('.NS'/'.BO' → INDIA, otherwise US) by marketForSymbol(). Stored rather
+  /// than re-derived on every read so exposure rollups can group by it without
+  /// parsing strings, and so a future market whose symbols are NOT
+  /// suffix-distinguishable can be corrected by hand.
+  market     Market     @default(US)
+
   /// ETF decomposition: { region: [{ key: "China", weight: 1 }], sector: [...] }.
   /// Null for single stocks. Without this, a book holding MCHI reports 0% China
   /// exposure, because Yahoo classifies the fund itself as US-domiciled.
@@ -443,6 +548,7 @@ model InstrumentProfile {
 
   @@index([sector])
   @@index([region])
+  @@index([market])
   @@map("instrument_profiles")
 }
 

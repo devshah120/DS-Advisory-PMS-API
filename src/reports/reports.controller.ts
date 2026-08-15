@@ -1,6 +1,7 @@
 import { Controller, Get, Param, Query, UseGuards } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { ReportsService } from './reports.service';
+import { parseMarket } from '../common/market-scope';
 
 @Controller('reports')
 @UseGuards(JwtAuthGuard)
@@ -25,8 +26,12 @@ export class ReportsController {
    * A closed quarter is served from its frozen ClientFeeSchedule rows.
    */
   @Get('fees')
-  fees(@Query('quarter') quarter?: string) {
-    return this.reportsService.feesForQuarter(quarter);
+  fees(@Query('quarter') quarter?: string, @Query('market') market?: string) {
+    // Unscoped when absent, so a firm-wide fee run still covers both books.
+    return this.reportsService.feesForQuarter(
+      quarter,
+      market ? parseMarket(market) : undefined,
+    );
   }
 
   /** One client's fee for one quarter — what the per-client export downloads. */

@@ -29,6 +29,17 @@ export enum ClientStatus {
 }
 
 /**
+ * Which book of business the mandate belongs to. Unlike the enums above, this
+ * one does NOT lowercase across the HTTP boundary — 'US'/'INDIA' are codes
+ * rather than words, and the uppercase form matches Prisma, the currency codes
+ * and the ticker suffixes it governs. See common/market-scope.ts.
+ */
+export enum Market {
+  US = 'US',
+  INDIA = 'INDIA',
+}
+
+/**
  * Which ledger rows drive this client's XIRR.
  *
  * transactional — every buy is money in, every sell is money out.
@@ -120,6 +131,16 @@ export class CreateClientDto {
   @IsOptional()
   includeFees?: boolean;
 
+  // Optional on the wire so an existing caller that predates the Indian book
+  // keeps creating US clients; ClientsService defaults it and derives the
+  // currency from it.
+  @IsEnum(Market, { message: 'market must be US or INDIA' })
+  @IsOptional()
+  @Transform(({ value }) =>
+    typeof value === 'string' ? value.trim().toUpperCase() : value
+  )
+  market?: Market;
+
   @IsString()
   @IsOptional()
   @MaxLength(3)
@@ -127,6 +148,20 @@ export class CreateClientDto {
     typeof value === 'string' ? value.trim().toUpperCase() : value
   )
   currency?: string;
+
+  /**
+   * The household this mandate belongs to, if any.
+   *
+   * An empty string from a form's "no family" option is coerced to null, which
+   * is what detaches a client from a household — sending "" would otherwise
+   * fail the FK rather than clearing it.
+   */
+  @IsString()
+  @IsOptional()
+  @Transform(({ value }) =>
+    typeof value === 'string' && value.trim() === '' ? null : value
+  )
+  familyId?: string | null;
 
   @IsEnum(ClientStatus, {
     message: 'status must be active, inactive, or closed',

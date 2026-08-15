@@ -8,6 +8,7 @@ import {
   heatmap,
   overlapMatrix,
 } from '../calculators/overlap';
+import { Market } from '../../common/market-scope';
 
 /**
  * House-level analytics (brief §§5, 6, 12).
@@ -20,9 +21,15 @@ import {
 export class HouseService {
   constructor(private snapshots: SnapshotService) {}
 
-  async exposure() {
-    const house = await this.snapshots.houseSnapshot();
-    const snaps = await this.snapshots.forAllClients();
+  /**
+   * `market` scopes the rollup to one book. Optional so firm-wide callers keep
+   * their existing behaviour; the dashboard always passes it, because a sector
+   * pie mixing a dollar book with a rupee one weights the slices by an
+   * FX-unadjusted sum and is simply wrong.
+   */
+  async exposure(market?: Market) {
+    const house = await this.snapshots.houseSnapshot(market);
+    const snaps = await this.snapshots.forAllClients(market);
 
     const profile = exposureProfile(house);
     // Look-through matters for sector exactly like it does for region: an ETF

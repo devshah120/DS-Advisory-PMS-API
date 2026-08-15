@@ -3,6 +3,13 @@ import { Prisma } from '@prisma/client';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { MarketService, DailyClose } from '../market/market.service';
 import { CreateWatchlistDto, WATCHLIST_SLOTS } from './dto/create-watchlist.dto';
+import {
+  DEFAULT_MARKET,
+  MARKETS,
+  Market,
+  displaySymbol,
+  normalizeSymbol,
+} from '../common/market-scope';
 
 export interface PeriodReturn {
   baseDate: string | null;
@@ -19,11 +26,17 @@ export interface WatchlistReturns {
   ytd: PeriodReturn;
 }
 
-export const TRACKED_BENCHMARKS = [
-  { code: 'SP500', label: 'S&P 500', symbol: '^GSPC' },
-  { code: 'RUSSELL2000', label: 'Russell 2000', symbol: '^RUT' },
-  { code: 'DOWJONES', label: 'Dow Jones', symbol: '^DJI' },
-] as const;
+/**
+ * The indices the watchlist compares against, per book.
+ *
+ * Read off the market definition rather than hardcoded here, so the Indian
+ * watchlist measures itself against the Nifty and the Sensex instead of the
+ * S&P — comparing an Indian book's MTD to the Dow tells the manager nothing.
+ * Capped at three to match the row of benchmark tiles the UI renders.
+ */
+export function trackedBenchmarks(market: Market) {
+  return MARKETS[market].indices.slice(0, 3);
+}
 
 const DEFAULT_FOLDER_NAMES: Record<string, string> = {
   '1': 'Watchlist 1',
@@ -45,15 +58,30 @@ export class WatchlistService {
     private market: MarketService,
   ) {}
 
+  /**
+   * Adds a ticker to a slot on one book's watchlist.
+   *
+   * The symbol is qualified against that book BEFORE the lookup, which is the
+   * whole reason an Indian name can be added at all: a manager types
+   * "RELIANCE", Yahoo returns nothing for the bare form, and the add used to
+   * fail outright. `normalizeSymbol` turns it into "RELIANCE.NS" first, and
+   * MarketService retries '.BO' for a BSE-only listing. A symbol typed with its
+   * own suffix is honoured as-is, so this is a no-op for the US book.
+   */
   async create(dto: CreateWatchlistDto) {
-    const ticker = dto.ticker.trim().toUpperCase();
+    const market = (dto.market as Market) ?? DEFAULT_MARKET;
+    const input = dto.ticker.trim().toUpperCase();
+    const ticker = normalizeSymbol(input, market);
     const slot = dto.slot ?? '1';
-    const profile = await this.market.lookup(ticker);
+
+    const profile = await this.market.lookup(ticker, market);
+
     try {
       return await this.prisma.watchlist.create({
         data: {
           ticker,
           slot,
+          market,
           company: profile.company,
           sector: profile.sector,
           industry: profile.industry,
@@ -61,7 +89,8 @@ export class WatchlistService {
       });
     } catch (err) {
       if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
-        throw new ConflictException(`${ticker} is already on this watchlist`);
+        // Reported under the name the user typed, not the qualified symbol.
+        throw new ConflictException(`${displaySymbol(ticker)} is already on this watchlist`);
       }
       throw err;
     }
@@ -72,14 +101,14 @@ export class WatchlistService {
    * column). Each ticker is resolved independently — one bad/unknown ticker
    * or a duplicate doesn't fail the whole batch.
    */
-  async bulkAdd(rawTickers: string[], slot = '1'): Promise<BulkAddResult> {
+  async bulkAdd(rawTickers: string[], slot = '1', market?: Market): Promise<BulkAddResult> {
     const tickers = [...new Set(rawTickers.map((t) => t.trim().toUpperCase()).filter(Boolean))];
     const added: BulkAddResult['added'] = [];
     const skipped: BulkAddResult['skipped'] = [];
 
     for (const ticker of tickers) {
       try {
-        const item = await this.create({ ticker, slot });
+        const item = await this.create({ ticker, slot, market });
         added.push({ ticker, id: item.id });
       } catch (err: any) {
         skipped.push({ ticker, reason: err?.message || 'Lookup failed' });
@@ -89,9 +118,16 @@ export class WatchlistService {
     return { added, skipped };
   }
 
-  findAll(slot?: string) {
+  /**
+   * One book's tracked names. `market` is optional so an unscoped call still
+   * returns everything (an export, an admin screen); the UI always sends it.
+   */
+  findAll(slot?: string, market?: Market) {
     return this.prisma.watchlist.findMany({
-      where: slot ? { slot } : undefined,
+      where: {
+        ...(slot ? { slot } : {}),
+        ...(market ? { market } : {}),
+      },
       orderBy: { ticker: 'asc' },
     });
   }
@@ -108,22 +144,23 @@ export class WatchlistService {
     });
   }
 
-  async folders() {
-    const rows = await this.prisma.watchlistFolder.findMany();
+  async folders(market: Market = DEFAULT_MARKET) {
+    const rows = await this.prisma.watchlistFolder.findMany({ where: { market } });
     const byslot = new Map(rows.map((r) => [r.slot, r.name]));
     return WATCHLIST_SLOTS.map((slot) => ({
       slot,
       name: byslot.get(slot) ?? DEFAULT_FOLDER_NAMES[slot],
+      market,
     }));
   }
 
-  async renameFolder(slot: string, name: string) {
+  async renameFolder(slot: string, name: string, market: Market = DEFAULT_MARKET) {
     await this.prisma.watchlistFolder.upsert({
-      where: { slot },
-      create: { slot, name },
+      where: { market_slot: { market, slot } },
+      create: { slot, name, market },
       update: { name },
     });
-    return { slot, name };
+    return { slot, name, market };
   }
 
   /** Current price + MTD/QTD/YTD for one symbol, computed from live market data. */
@@ -146,10 +183,15 @@ export class WatchlistService {
     };
   }
 
-  /** Same MTD/QTD/YTD windows, applied to each tracked benchmark index. */
-  async benchmarkReturns(): Promise<Array<{ code: string; label: string; symbol: string } & WatchlistReturns>> {
+  /**
+   * Same MTD/QTD/YTD windows, applied to the selected book's benchmark indices
+   * — the Nifty/Sensex for India, the S&P/Russell/Dow for the US.
+   */
+  async benchmarkReturns(
+    market: Market = DEFAULT_MARKET,
+  ): Promise<Array<{ code: string; label: string; symbol: string } & WatchlistReturns>> {
     return Promise.all(
-      TRACKED_BENCHMARKS.map(async (b) => ({
+      trackedBenchmarks(market).map(async (b) => ({
         ...b,
         ...(await this.returnsFor(b.symbol)),
       })),

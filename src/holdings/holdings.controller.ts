@@ -10,6 +10,7 @@ import {
   UseInterceptors,
   UploadedFile,
   BadRequestException,
+  Query,
   Res,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
@@ -18,6 +19,7 @@ import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { HoldingsService } from './holdings.service';
 import { CreateHoldingDto } from './dto/create-holding.dto';
 import { UpdateHoldingDto } from './dto/update-holding.dto';
+import { parseMarket } from '../common/market-scope';
 
 // A generous ceiling: a bulk position file is small, but this stops an
 // oversized upload from being buffered into memory.
@@ -66,8 +68,9 @@ export class HoldingsController {
   }
 
   @Get()
-  findAll() {
-    return this.holdingsService.findAll();
+  findAll(@Query('market') market?: string) {
+    // Unscoped when absent, so a firm-wide read still returns both books.
+    return this.holdingsService.findAll(market ? parseMarket(market) : undefined);
   }
 
   @Get('client/:clientId')

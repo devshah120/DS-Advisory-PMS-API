@@ -16,6 +16,12 @@ import {
   rebaseLedgerToJun30,
 } from '../analytics/calculators/flows';
 import { xirr } from '../analytics/calculators/xirr';
+import {
+  DEFAULT_MARKET,
+  Market,
+  currencyForMarket,
+  marketForSymbol,
+} from '../common/market-scope';
 
 // Prisma persists SCREAMING_CASE enums; the HTTP contract uses lowercase.
 const toDb = <T extends string>(v: T | undefined) =>
@@ -146,10 +152,21 @@ export class ClientsService {
       });
     }
 
+    // Which book this mandate belongs to. The currency follows from it unless the
+    // caller named one explicitly — an Indian client should report in rupees
+    // without the form having to restate that on every create, and the schema's
+    // "USD" column default would otherwise quietly win.
+    const market: Market = (dto.market as Market) ?? DEFAULT_MARKET;
+
+    // A household holds accounts from one book only — see FamiliesService.
+    await this.assertFamilyInMarket(dto.familyId, market);
+
     try {
       const client = await this.prisma.client.create({
         data: {
           ...clientData,
+          market,
+          currency: dto.currency ?? currencyForMarket(market),
           riskProfile: toDb(dto.riskProfile),
           status: toDb(dto.status),
           // Every client is transactional now — the cash-flow method has been
@@ -182,18 +199,60 @@ export class ClientsService {
     }
   }
 
-  async findAll(skip = 0, take = 10) {
+  /**
+   * Rejects placing a mandate in a household from another book.
+   *
+   * The family view sums its members' positions into one portfolio value, and
+   * an INR mandate cannot be added to a USD household without an FX rate the
+   * codebase does not have. Catching it here (as well as in FamiliesService)
+   * means neither entry point — the client form or the family editor — can
+   * create the mismatch.
+   */
+  private async assertFamilyInMarket(familyId: string | null | undefined, market: Market) {
+    if (!familyId) return;
+
+    const family = await this.prisma.family.findUnique({
+      where: { id: familyId },
+      select: { name: true, market: true },
+    });
+    if (!family) {
+      throw new BadRequestException({
+        message: 'Please correct the highlighted fields.',
+        errors: { familyId: 'That family no longer exists' },
+      });
+    }
+    if (family.market !== market) {
+      throw new BadRequestException({
+        message: 'Please correct the highlighted fields.',
+        errors: {
+          familyId: `"${family.name}" is in the ${family.market} book — a family holds accounts from one book only`,
+        },
+      });
+    }
+  }
+
+  /**
+   * `market` narrows the list to one book. Optional — an omitted value returns
+   * every client, which is what a firm-wide export or an admin screen wants;
+   * the header's country selector always sends it.
+   */
+  async findAll(skip = 0, take = 10, market?: Market) {
+    const where = market ? { market } : {};
     const [clients, total] = await Promise.all([
       this.prisma.client.findMany({
+        where,
         skip,
         take,
         orderBy: { createdAt: 'desc' },
         include: {
           holdings: true,
           transactions: true,
+          // The list shows which household a mandate belongs to, and the
+          // family selector is built from the same read.
+          family: { select: { id: true, name: true } },
         },
       }),
-      this.prisma.client.count(),
+      this.prisma.client.count({ where }),
     ]);
 
     // Distinct tickers held across this page, resolved once and shared by every
@@ -211,11 +270,14 @@ export class ClientsService {
     });
     const jun30Close = new Map(bars.map((b) => [b.symbol, b.adjClose]));
 
+    // Stored tickers are already fully qualified ('RELIANCE.NS'), so the market
+    // is read off the symbol itself rather than the client's — a lookup here
+    // needs no hint and stays correct even for a mixed page of both books.
     const livePrice = new Map<string, number>();
     await Promise.all(
       tickers.map(async (ticker) => {
         try {
-          const { currentPrice } = await this.market.lookup(ticker);
+          const { currentPrice } = await this.market.lookup(ticker, marketForSymbol(ticker));
           if (typeof currentPrice === 'number') livePrice.set(ticker, currentPrice);
         } catch {
           // Absent → deriveMetrics falls back to the holding's stored currentPrice.
@@ -242,6 +304,7 @@ export class ClientsService {
         holdings: true,
         transactions: true,
         research: true,
+        family: { select: { id: true, name: true } },
       },
     });
 
@@ -250,7 +313,14 @@ export class ClientsService {
   }
 
   async update(id: string, dto: UpdateClientDto) {
-    await this.findOne(id);
+    const current = await this.findOne(id);
+
+    // Validated against the mandate's own book (which an edit cannot change),
+    // not the payload's — otherwise an omitted `market` would fall back to the
+    // US default and let an Indian client join a US household.
+    if (dto.familyId !== undefined) {
+      await this.assertFamilyInMarket(dto.familyId, current.market as Market);
+    }
 
     // Password is edit-optional: a blank/absent value leaves the login unchanged.
     // Never persist it on the client row — hash it into the linked User instead.

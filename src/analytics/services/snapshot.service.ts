@@ -8,6 +8,7 @@ import {
   PortfolioSnapshot,
   Position,
 } from '../calculators/types';
+import { Market } from '../../common/market-scope';
 
 /**
  * The single gateway between the database and the math layer.
@@ -107,9 +108,17 @@ export class SnapshotService {
     };
   }
 
-  async forAllClients(): Promise<PortfolioSnapshot[]> {
+  /**
+   * Active clients as snapshots, optionally narrowed to one book of business.
+   *
+   * `market` is optional rather than defaulted: an omitted value means "every
+   * book", which is what firm-wide callers (overlap, heatmap) still want. Only
+   * the callers that report a currency-denominated total need to pass it — see
+   * HouseService.exposure.
+   */
+  async forAllClients(market?: Market): Promise<PortfolioSnapshot[]> {
     const clients = await this.prisma.client.findMany({
-      where: { status: 'ACTIVE' },
+      where: { status: 'ACTIVE', ...(market ? { market } : {}) },
       include: { holdings: true },
     });
 
@@ -138,8 +147,8 @@ export class SnapshotService {
    * client analytics literally cannot disagree, because there is only one
    * implementation.
    */
-  async houseSnapshot(): Promise<PortfolioSnapshot> {
-    const snaps = await this.forAllClients();
+  async houseSnapshot(market?: Market): Promise<PortfolioSnapshot> {
+    const snaps = await this.forAllClients(market);
 
     const merged = new Map<string, Position>();
     let cash = 0;

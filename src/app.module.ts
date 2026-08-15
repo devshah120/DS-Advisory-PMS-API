@@ -5,6 +5,7 @@ import { PrismaModule } from './common/prisma/prisma.module';
 import { AuthModule } from './auth/auth.module';
 import { UsersModule } from './users/users.module';
 import { ClientsModule } from './clients/clients.module';
+import { FamiliesModule } from './families/families.module';
 import { HoldingsModule } from './holdings/holdings.module';
 import { TransactionsModule } from './transactions/transactions.module';
 import { DashboardModule } from './dashboard/dashboard.module';
@@ -28,6 +29,7 @@ import { PortfolioReconstructionModule } from './portfolio-reconstruction/portfo
     AuthModule,
     UsersModule,
     ClientsModule,
+    FamiliesModule,
     HoldingsModule,
     TransactionsModule,
     DashboardModule,

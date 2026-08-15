@@ -17,6 +17,7 @@ import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { ClientsService } from './clients.service';
 import { CreateClientDto } from './dto/create-client.dto';
 import { UpdateClientDto } from './dto/update-client.dto';
+import { parseMarket } from '../common/market-scope';
 
 const MAX_LIMIT = 100;
 
@@ -34,11 +35,19 @@ export class ClientsController {
   @Get()
   findAll(
     @Query('page', new DefaultValuePipe(1), ParseIntPipe) page: number,
-    @Query('limit', new DefaultValuePipe(10), ParseIntPipe) limit: number
+    @Query('limit', new DefaultValuePipe(10), ParseIntPipe) limit: number,
+    @Query('market') market?: string
   ) {
     const safePage = Math.max(1, page);
     const safeLimit = Math.min(Math.max(1, limit), MAX_LIMIT);
-    return this.clientsService.findAll((safePage - 1) * safeLimit, safeLimit);
+    // Absent `market` deliberately stays undefined rather than defaulting to the
+    // US book — an unscoped list must keep returning every client, since the
+    // client management screens page across both books.
+    return this.clientsService.findAll(
+      (safePage - 1) * safeLimit,
+      safeLimit,
+      market ? parseMarket(market) : undefined
+    );
   }
 
   @Get('count')
