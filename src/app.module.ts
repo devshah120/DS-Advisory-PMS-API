@@ -19,6 +19,7 @@ import { NewsModule } from './news/news.module';
 import { FundamentalsModule } from './fundamentals/fundamentals.module';
 import { LegacyBaselineModule } from './legacy-baseline/legacy-baseline.module';
 import { PortfolioReconstructionModule } from './portfolio-reconstruction/portfolio-reconstruction.module';
+import { SubscriptionModule } from './subscription/subscription.module';
 
 @Module({
   imports: [
@@ -44,6 +45,7 @@ import { PortfolioReconstructionModule } from './portfolio-reconstruction/portfo
     FundamentalsModule,
     LegacyBaselineModule,
     PortfolioReconstructionModule,
+    SubscriptionModule,
   ],
 })
 export class AppModule {}

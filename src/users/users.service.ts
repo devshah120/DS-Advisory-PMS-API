@@ -6,9 +6,10 @@ import {
   NotFoundException,
   UnauthorizedException,
 } from '@nestjs/common';
-import { Role } from '@prisma/client';
+import { Role, SubscriptionStatus } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 import { PrismaService } from '../common/prisma/prisma.service';
+import { SubscriptionService } from '../subscription/subscription.service';
 import {
   ApiRole as UserRole,
   ASSIGNABLE_ROLES,
@@ -49,7 +50,10 @@ const BCRYPT_ROUNDS = 10;
 
 @Injectable()
 export class UsersService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private subscriptions: SubscriptionService
+  ) {}
 
   /**
    * With AUTH_BYPASS=true, AuthService issues a token for a synthetic user that
@@ -400,6 +404,15 @@ export class UsersService {
       throw new ConflictException('That email address is already in use');
     }
 
+    // A manager's seat is billable, so it starts its free trial the moment the
+    // login exists. The deadline is stamped here from the CURRENT trialDays and
+    // then never recomputed — see the AppSetting schema note on why editing the
+    // plan later must not move an existing manager's deadline.
+    //
+    // Null means trials are switched off (trialDays = 0), in which case the
+    // seat opens as EXPIRED and must be paid for before it will let anyone in.
+    const trialEndsAt = await this.subscriptions.trialEndsAtForNewManager();
+
     const user = await this.prisma.user.create({
       data: {
         firstName: dto.firstName,
@@ -409,6 +422,10 @@ export class UsersService {
         role,
         organization: dto.organization || null,
         active: dto.active ?? true,
+        subscriptionStatus: trialEndsAt
+          ? SubscriptionStatus.TRIALING
+          : SubscriptionStatus.EXPIRED,
+        trialEndsAt,
       },
     });
 

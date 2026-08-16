@@ -75,9 +75,37 @@ model User {
   clientId String?
   client   Client? @relation(fields: [clientId], references: [id], onDelete: Cascade)
 
+  /// --- Seat subscription (Portfolio Managers only) ---
+  ///
+  /// What this manager pays the FIRM for their login. Nothing to do with
+  /// ClientFeeSchedule, which is what the firm charges its investors.
+  ///
+  /// Every field is nullable and `subscriptionStatus` has no default on
+  /// purpose: SUPER_ADMIN, RESEARCH_ANALYST and VIEWER rows are not billable
+  /// seats, and a default of TRIALING would have wrongly enrolled all of them —
+  /// including the client-portal logins — the moment this migration ran. Null
+  /// therefore reads as "not a billable seat", which is what every pre-existing
+  /// row correctly is. UsersService stamps these only when creating a manager.
+  subscriptionStatus SubscriptionStatus?
+  /// End of the free window, stamped at creation from AppSetting.trialDays.
+  /// Once written it is never recalculated — see the note on that field.
+  trialEndsAt        DateTime?
+  /// Paid access runs to here. Extended by the webhook on each capture.
+  currentPeriodEnd   DateTime?
+  billingCycle       BillingCycle?
+
+  /// Razorpay's customer/subscription handles, when the manager has paid at
+  /// least once. Null for a manager still inside their trial.
+  razorpayCustomerId     String?
+  razorpaySubscriptionId String?
+
+  payments SubscriptionPayment[]
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  /// The expiry sweep asks "which seats lapsed", which is a status+date scan.
+  @@index([subscriptionStatus])
   @@map("users")
 }
 
@@ -1231,4 +1259,139 @@ model ClientFeeSchedule {
   @@unique([clientId, quarter])
   @@index([quarter])
   @@map("client_fee_schedules")
+}
+
+/// Firm-wide configuration owned by the Super Admin: what a Portfolio Manager
+/// seat costs, how long its free trial runs, and the Razorpay credentials the
+/// charges are put through.
+///
+/// SINGLETON. Exactly one row exists, pinned to `id = "app"` rather than a
+/// generated cuid. That is deliberate: a settings table with a floating id
+/// invites a second row that silently shadows the first, and "which settings
+/// are live" then depends on insertion order. AppSettingsService.load() upserts
+/// on the fixed id, so a fresh database self-heals into the documented defaults
+/// instead of 500-ing on a missing row.
+///
+/// Distinct from ClientFeeSchedule, which is the OTHER direction of money: that
+/// is the advisory fee this firm charges its investors, while this is what a
+/// manager pays the firm for a login. The two never interact.
+model AppSetting {
+  /// Always the literal "app". See the singleton note above.
+  id String @id @map("_id")
+
+  /// Free days granted when a Portfolio Manager login is created. Applied at
+  /// creation to stamp User.trialEndsAt — it is NOT read again afterwards, so
+  /// changing it here never retroactively extends or shortens a manager whose
+  /// trial is already running. Zero means "no trial, pay immediately".
+  trialDays Int @default(14)
+
+  /// Seat price per manager, in MAJOR currency units (rupees, not paise).
+  ///
+  /// Stored as major units because that is what the Super Admin types and what
+  /// the table renders; the ×100 conversion to paise happens once, at the
+  /// Razorpay call site, where the API contract demands it. Keeping paise in
+  /// the database instead would mean every read path had to remember to divide.
+  monthlyAmount Float @default(0)
+  yearlyAmount  Float @default(0)
+
+  /// ISO-4217 code the two amounts are denominated in. Razorpay settles Indian
+  /// accounts in INR, which is why that is the default, but the column exists
+  /// so the figures are never ambiguous on screen.
+  currency String @default("INR")
+
+  /// Razorpay API credentials.
+  ///
+  /// `razorpayKeyId` is the PUBLISHABLE half (rzp_test_… / rzp_live_…). It is
+  /// safe to return to the browser — the checkout widget needs it client-side.
+  ///
+  /// `razorpayKeySecret` is the PRIVATE half and is stored AES-256-GCM
+  /// encrypted (see crypto.util.ts), never in the clear. It is never included
+  /// in any API response: the settings endpoint returns `razorpaySecretLast4`
+  /// and a boolean instead, so the UI can prove a key is configured and show
+  /// its tail without the value itself ever reaching a client. A database dump
+  /// therefore does not hand over the ability to charge cards.
+  razorpayKeyId     String?
+  razorpayKeySecret String?
+  /// Last 4 characters of the plaintext secret, kept alongside the ciphertext
+  /// purely so the UI can render "••••4f2a" without a decrypt on every read.
+  razorpaySecretLast4 String?
+
+  /// Guards against a live key being used while the product is still in
+  /// testing. Surfaced as a badge next to the key on the settings screen.
+  razorpayMode String @default("test")
+
+  /// Who last touched these values, for the "Last updated" line. A plain id
+  /// with no relation: the audit line must survive that user being deleted,
+  /// and a FK with a cascade would erase the very record we want to keep.
+  updatedById String?
+  updatedAt   DateTime @updatedAt
+  createdAt   DateTime @default(now())
+
+  @@map("app_settings")
+}
+
+/// Where a Portfolio Manager's seat stands. Read on every login to decide
+/// whether the app opens or the paywall does.
+///
+/// TRIALING  — inside the free window stamped at creation. Full access.
+/// ACTIVE    — a Razorpay payment succeeded; access runs until currentPeriodEnd.
+/// EXPIRED   — the trial ran out with no payment.
+/// PAST_DUE  — was ACTIVE, the period ended, no renewal landed.
+/// CANCELLED — deliberately switched off by the Super Admin.
+///
+/// EXPIRED and PAST_DUE are kept apart on purpose even though both deny access:
+/// one is a manager who never paid and the other is a paying customer whose
+/// renewal failed, and those warrant different dunning treatment.
+enum SubscriptionStatus {
+  TRIALING
+  ACTIVE
+  EXPIRED
+  PAST_DUE
+  CANCELLED
+}
+
+enum BillingCycle {
+  MONTHLY
+  YEARLY
+}
+
+/// One payment attempt against a manager's seat, written by the Razorpay
+/// webhook and never edited afterwards — this is the audit trail that answers
+/// "did this manager actually pay, and when".
+///
+/// Rows are kept for failed attempts too, not just successful ones: a failed
+/// charge is exactly what you need to see when a manager claims they paid.
+model SubscriptionPayment {
+  id     String @id @default(cuid()) @map("_id")
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// Major currency units, matching AppSetting.monthlyAmount — see the note
+  /// there on why this is not paise.
+  amount   Float
+  currency String @default("INR")
+  cycle    BillingCycle
+
+  /// Razorpay's own identifiers, kept so a row here can be reconciled against
+  /// the Razorpay dashboard. `paymentId` is absent until a charge is captured.
+  razorpayOrderId   String?
+  razorpayPaymentId String?
+  /// "created" | "captured" | "failed" — Razorpay's vocabulary, not ours,
+  /// because translating it would only obscure what the dashboard shows.
+  status String @default("created")
+
+  /// The access window this payment bought. Copied onto User on capture.
+  periodStart DateTime?
+  periodEnd   DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// The webhook is retried by Razorpay on any non-2xx, so capture handling has
+  /// to be idempotent — this unique index is what makes a replayed webhook a
+  /// no-op instead of a second extension of the manager's period.
+  @@unique([razorpayOrderId])
+  @@index([userId])
+  @@index([status])
+  @@map("subscription_payments")
 }
