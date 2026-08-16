@@ -862,6 +862,96 @@ model EventSnapshot {
   @@map("event_snapshots")
 }
 
+/// One news item or exchange filing for a tracked ticker — the News Center's
+/// durable store.
+///
+/// Same DB-first contract as EventSnapshot: the page reads only these rows and
+/// never calls upstream, so it renders instantly and survives Yahoo throttling
+/// or a BSE outage. NewsRefreshService is the only writer.
+///
+/// Unlike EventSnapshot this is NOT replace-all. News is an append-only
+/// timeline: a story published last week stays true after it falls out of the
+/// upstream's current window, and wiping the table on every refresh would make
+/// the feed amnesiac — an advisor scrolling back a fortnight would find
+/// nothing. Rows are upserted on `url` and pruned by age instead.
+///
+/// `ticker` is the normalized Yahoo-style symbol (RELIANCE.NS / AAPL) so it
+/// joins directly against Holding.ticker and Watchlist.ticker with no mapping.
+model NewsArticle {
+  id     String @id @default(cuid()) @map("_id")
+  ticker String
+  /// Which book the ticker trades in, so the feed is scoped like every other
+  /// read and an Indian review never surfaces a US headline.
+  market Market
+
+  title     String
+  /// Publisher / news outlet ("Reuters"), or "BSE" for an exchange filing.
+  publisher String
+  /// Canonical link. Also the dedupe key: the same story reaching us from two
+  /// upstreams (a BSE filing and the Reuters write-up of it) is two distinct
+  /// rows, but one story fetched twice is one row.
+  url       String @unique
+  /// Short teaser. Null when the upstream gives only a headline.
+  summary   String?
+
+  /// When the story was published upstream — the timeline is ordered on this,
+  /// never on refreshedAt, so a re-fetch cannot reshuffle the feed.
+  publishedAt DateTime
+
+  /// "NEWS" (press coverage) | "FILING" (regulator-filed disclosure).
+  /// Filings are authoritative and are badged differently in the UI.
+  kind String @default("NEWS")
+
+  /// Filing category straight from the exchange ("Board Meeting",
+  /// "Corp. Action", "AGM/EGM"). Null for press articles.
+  category String?
+
+  /// Materiality tag derived from the headline — "RESULTS", "BUYBACK",
+  /// "M&A", "DIVIDEND", "MANAGEMENT", "RATING", "ORDER". Null when nothing
+  /// matched, which is the common case and means "general coverage".
+  tag String?
+
+  /// "yahoo" | "bse" | "google-news".
+  source      String
+  refreshedAt DateTime @default(now())
+
+  createdAt DateTime @default(now())
+
+  /// The feed query: one book, newest first.
+  @@index([market, publishedAt])
+  /// The per-symbol drill-down.
+  @@index([ticker, publishedAt])
+  @@map("news_articles")
+}
+
+/// NSE-style ticker → BSE scrip code, the mapping the BSE announcements API
+/// needs (it keys on 500325, not "RELIANCE").
+///
+/// Persisted rather than resolved per refresh because BSE's search endpoint is
+/// an undocumented autocomplete: slow, rate-sensitive, and occasionally
+/// ambiguous ("RELIANCE" also matches Reliance Infrastructure). Resolving once
+/// and storing the answer keeps the refresh loop to one request per ticker.
+///
+/// `verified` marks a mapping a human confirmed, which is what makes the
+/// automatic resolution safe: a wrong auto-match can be corrected and will
+/// never be silently overwritten by a later refresh.
+model BseScripCode {
+  id     String @id @default(cuid()) @map("_id")
+  /// Normalized Yahoo-style symbol, e.g. "RELIANCE.NS".
+  ticker String @unique
+  /// BSE scrip code, e.g. "500325".
+  scripCode String
+  /// Company name as BSE spells it — shown when confirming an ambiguous match.
+  bseName   String?
+  /// True once a human has confirmed it; auto-resolved rows start false.
+  verified  Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("bse_scrip_codes")
+}
+
 /// Precomputed rollups. MongoDB has no GROUP BY across relations, so house-level
 /// analytics are computed once by the nightly job rather than aggregated on every
 /// read. This is the concession that makes 1000+ clients viable on Mongo; it costs

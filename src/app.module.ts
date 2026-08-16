@@ -15,6 +15,7 @@ import { MarketModule } from './market/market.module';
 import { AnalyticsModule } from './analytics/analytics.module';
 import { ReportsModule } from './reports/reports.module';
 import { EventsModule } from './events/events.module';
+import { NewsModule } from './news/news.module';
 import { FundamentalsModule } from './fundamentals/fundamentals.module';
 import { LegacyBaselineModule } from './legacy-baseline/legacy-baseline.module';
 import { PortfolioReconstructionModule } from './portfolio-reconstruction/portfolio-reconstruction.module';
@@ -39,6 +40,7 @@ import { PortfolioReconstructionModule } from './portfolio-reconstruction/portfo
     AnalyticsModule,
     ReportsModule,
     EventsModule,
+    NewsModule,
     FundamentalsModule,
     LegacyBaselineModule,
     PortfolioReconstructionModule,
