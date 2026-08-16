@@ -56,6 +56,15 @@ model User {
 
   sessions Session[]
 
+  /// The mandates, households and tracked names this staff user owns — see
+  /// Client.ownerId. Empty for a brand-new manager, which is the point: a new
+  /// login starts with an empty book rather than inheriting the firm's.
+  ///
+  /// Back-relations only; the FK and its delete semantics live on the far side.
+  ownedClients    Client[]    @relation("ClientOwner")
+  ownedFamilies   Family[]    @relation("FamilyOwner")
+  ownedWatchlists Watchlist[] @relation("WatchlistOwner")
+
   /// When set, this User is a client login (role VIEWER) created from the client
   /// add/edit form, scoped to a single mandate. Staff logins leave this null.
   ///
@@ -200,6 +209,40 @@ model Client {
   /// tickers resolve against and which indices benchmark the book.
   market         Market       @default(US)
 
+  /// The staff user whose book this mandate sits in — the firm's privacy
+  /// boundary, and the dimension every client-scoped read filters on alongside
+  /// `market`. See common/ownership-scope.ts, which is the only place the rule
+  /// is written down.
+  ///
+  /// One owner, not a list: a mandate belongs to exactly one manager, which is
+  /// the rule the desk works to and what makes "no other fund manager can see
+  /// other fund managers' data" expressible as a single equality filter.
+  /// Co-management would be an array here plus an `in` filter in the scope
+  /// helper, and nothing else — but it is deliberately not modelled today.
+  ///
+  /// Nullable for two reasons. MongoDB does not backfill a new field onto
+  /// existing documents, so every mandate that predates ownership has no key at
+  /// all (see backfill-ownership.ts). And null carries a real meaning worth
+  /// keeping afterwards: an UNASSIGNED mandate, visible to Super Admins only.
+  /// That is the safe direction to fail — an unowned client is invisible to
+  /// every manager rather than visible to all of them.
+  ///
+  /// `NoAction`, emphatically NOT Cascade: deleting a departing manager's login
+  /// must never take their clients' holdings, transactions and valuations with
+  /// it. Reassign the book first, then delete the user.
+  ///
+  /// Two caveats worth stating plainly, because the annotation reads stronger
+  /// than it is. Prisma demands NoAction on one edge of the
+  /// Client.owner → User.client cycle, so `Restrict` was not available here.
+  /// And on MongoDB neither one is enforced by the database at all — there are
+  /// no foreign keys, so a referential action is at most a hint to Prisma's own
+  /// query layer. The guarantee that a manager with a non-empty book cannot be
+  /// deleted is therefore CODE, in UsersService.deleteUser, and that check is
+  /// the only thing actually standing between a departing manager and their
+  /// clients' data. Do not remove it on the strength of this annotation.
+  ownerId        String?
+  owner          User?        @relation("ClientOwner", fields: [ownerId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
   /// The household this mandate belongs to, if any — see Family.
   ///
   /// Nullable because most mandates stand alone; only the accounts a manager
@@ -257,6 +300,13 @@ model Client {
   /// filter — a compound index keeps that from scanning the whole collection
   /// once the second book grows.
   @@index([market, status])
+  /// A manager's scoped list is `ownerId = ? AND market = ?`. Ownership leads
+  /// because it is the most selective of the two — one manager's book is a
+  /// small slice of a market, never the other way round — and because it is
+  /// present on every scoped read while `market` is optional on some.
+  @@index([ownerId, market])
+  /// "Whose book is this in", and the reassignment sweep when a manager leaves.
+  @@index([ownerId])
   /// The family aggregate reads every member in one query.
   @@index([familyId])
   @@map("clients")
@@ -411,13 +461,37 @@ model Watchlist {
   /// on the US watchlist rather than vanishing from both.
   market   Market @default(US)
 
+  /// The manager whose watchlist this row belongs to. Each manager keeps their
+  /// own five slots; the list is a working research tool, and one manager's
+  /// candidates are a signal about their book.
+  ///
+  /// Null means a pre-ownership row, migrated to the owning manager by
+  /// backfill-ownership.ts. Unlike Client, an unowned watchlist row is harmless
+  /// — it holds a ticker, not client data.
+  /// Cascade is genuinely wanted here — a departed manager's tracked tickers
+  /// carry no client data and are worth nothing to anyone else. Unlike Client
+  /// and Family, MongoDB's lack of FK enforcement means this too is executed by
+  /// Prisma's query layer rather than the database, so UsersService clears
+  /// these rows explicitly when deleting a manager.
+  ownerId String?
+  owner   User?  @relation("WatchlistOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   /// Scoped per book: the same ticker may sit on slot 1 of both books, and
   /// (more to the point) 'RELIANCE.NS' and a US name never collide.
+  ///
+  /// NOT widened to include ownerId, for the MongoDB optional-field reason
+  /// given on Family.name — an index over a nullable key cannot build here.
+  /// The practical consequence is real and accepted: two managers cannot hold
+  /// the same ticker on the same slot of the same book. WatchlistService
+  /// therefore keys its add/remove on (ownerId, market, slot, ticker) and
+  /// enforces per-manager uniqueness in code, exactly as ClientsService already
+  /// enforces one-login-per-client that User.clientId cannot express.
   @@unique([market, slot, ticker])
   @@index([market, slot])
+  @@index([ownerId, market, slot])
   @@map("watchlists")
 }
 
@@ -426,13 +500,30 @@ model Watchlist {
 ///
 /// Named per book, so the Indian book's "Slot 1" can be "Nifty Compounders"
 /// while the US book's stays "Core Longs".
+///
+/// Named per MANAGER too, since the watchlist itself is per-manager: without
+/// an owner here, one manager renaming a slot would silently relabel every
+/// other manager's sidebar.
 model WatchlistFolder {
   id     String @id @default(cuid()) @map("_id")
   slot   String
   name   String
   market Market @default(US)
 
+  /// Null means the pre-ownership firm-wide name, which the service falls back
+  /// to when this manager has not renamed the slot themselves — so existing
+  /// folder names keep showing instead of reverting to "Slot 1" for everyone.
+  ownerId String?
+
+  /// `ownerId` is intentionally a plain column with no relation: this table is
+  /// a label store that no cascade should ever touch, and adding a fourth
+  /// back-relation to User for five strings per manager is not worth it.
+  ///
+  /// The unique key stays (market, slot) for the MongoDB nullable-key reason
+  /// documented on Watchlist. Per-owner naming is therefore enforced in
+  /// WatchlistService, which resolves a rename to the caller's own row.
   @@unique([market, slot])
+  @@index([ownerId, market])
   @@map("watchlist_folders")
 }
 
@@ -460,6 +551,22 @@ model Family {
   /// from another book rather than silently producing a wrong number.
   market Market @default(US)
 
+  /// The manager whose book this household sits in — same boundary and same
+  /// delete semantics as Client.ownerId.
+  ///
+  /// A household groups mandates, so an unscoped family would leak the client
+  /// names inside it across managers even while the underlying clients stayed
+  /// hidden. A family and its members must therefore share an owner; the
+  /// service enforces that on membership changes the same way it already
+  /// enforces a shared market.
+  /// `NoAction` rather than `Restrict` only because Prisma requires one edge of
+  /// the cycle Client.family → Family.owner → User.client → Client.family to
+  /// opt out of referential actions. The two behave identically on MongoDB,
+  /// which has no foreign keys to enforce either way: deleting a manager who
+  /// still owns households is blocked in UsersService, not by the database.
+  ownerId String?
+  owner   User?  @relation("FamilyOwner", fields: [ownerId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
   notes String?
 
   clients Client[]
@@ -468,8 +575,16 @@ model Family {
   updatedAt DateTime @updatedAt
 
   /// Families are listed per book, and a household name is unique within one.
+  ///
+  /// Deliberately NOT widened to include ownerId. Two managers cannot both name
+  /// a household "Salecha Family" — but that collision is vanishingly rare next
+  /// to the cost of the alternative: on MongoDB a unique index whose key
+  /// includes an optional field treats every unstamped row (ownerId absent) as
+  /// a duplicate, so the index would fail to build against the existing data
+  /// this migration is designed to preserve. Same reasoning as User.clientId.
   @@unique([market, name])
   @@index([market])
+  @@index([ownerId, market])
   @@map("families")
 }
 
