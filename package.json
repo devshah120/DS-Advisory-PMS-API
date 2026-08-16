@@ -18,6 +18,7 @@
     "test:watch": "jest --watch",
     "test:cov": "jest --coverage",
     "test:debug": "node --inspect-brk -r tsconfig-paths/register node_modules/.bin/jest --runInBand",
+    "create:super-admin": "ts-node -r tsconfig-paths/register src/scripts/create-super-admin.ts",
     "import:workbook": "ts-node -r tsconfig-paths/register src/analytics/ingestion/import-workbook.cli.ts",
     "seed:scoring-rules": "ts-node -r tsconfig-paths/register src/fundamentals/seed-scoring-rules.ts",
     "normalize:accounting-method": "ts-node -r tsconfig-paths/register src/analytics/scripts/normalize-accounting-method.ts",

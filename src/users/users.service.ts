@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Injectable,
   NotFoundException,
   UnauthorizedException,
@@ -8,10 +9,19 @@ import {
 import { Role } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 import { PrismaService } from '../common/prisma/prisma.service';
-import { UpdateProfileDto, UserRole } from './dto/update-profile.dto';
+import {
+  ApiRole as UserRole,
+  ASSIGNABLE_ROLES,
+  ROLE_LABEL,
+  ROLE_TO_API,
+  ROLE_TO_DB,
+} from '../common/auth/roles';
+import { UpdateProfileDto } from './dto/update-profile.dto';
 import { UpdatePreferencesDto } from './dto/update-preferences.dto';
 import { UpdateNotificationsDto } from './dto/update-notifications.dto';
 import { ChangePasswordDto } from './dto/change-password.dto';
+import { CreateUserDto } from './dto/create-user.dto';
+import { AdminUpdateUserDto } from './dto/admin-update-user.dto';
 
 /**
  * Applied whenever a column is null — i.e. the user has never touched that
@@ -34,20 +44,8 @@ const DEFAULT_NOTIFICATIONS = {
   productUpdates: false,
 };
 
-/** API contract is lowercase; Prisma's Role enum is uppercase. */
-const ROLE_TO_API: Record<Role, UserRole> = {
-  ADMIN: UserRole.ADMIN,
-  PORTFOLIO_MANAGER: UserRole.PORTFOLIO_MANAGER,
-  RESEARCH_ANALYST: UserRole.RESEARCH_ANALYST,
-  VIEWER: UserRole.VIEWER,
-};
-
-const ROLE_TO_DB: Record<UserRole, Role> = {
-  [UserRole.ADMIN]: Role.ADMIN,
-  [UserRole.PORTFOLIO_MANAGER]: Role.PORTFOLIO_MANAGER,
-  [UserRole.RESEARCH_ANALYST]: Role.RESEARCH_ANALYST,
-  [UserRole.VIEWER]: Role.VIEWER,
-};
+/** Cost factor for password hashing, matching the rest of the codebase. */
+const BCRYPT_ROUNDS = 10;
 
 @Injectable()
 export class UsersService {
@@ -152,7 +150,8 @@ export class UsersService {
         ...(dto.organization !== undefined && {
           organization: dto.organization || null,
         }),
-        ...(dto.role !== undefined && { role: ROLE_TO_DB[dto.role] }),
+        // No `role` here by design — see UpdateProfileDto. A user editing their
+        // own profile must not be able to change their own permissions.
       },
     });
 
@@ -255,9 +254,210 @@ export class UsersService {
       );
     }
 
-    const password = await bcrypt.hash(dto.newPassword, 10);
+    const password = await bcrypt.hash(dto.newPassword, BCRYPT_ROUNDS);
     await this.prisma.user.update({ where: { id: userId }, data: { password } });
 
     return { message: 'Your password has been updated.' };
+  }
+
+  // --- Super Admin: staff account management -------------------------------
+  //
+  // Everything below is reachable only through routes guarded by
+  // `@Roles(Role.SUPER_ADMIN)`. The service still re-checks the rules that
+  // protect the account tier itself (below), because those are invariants about
+  // the data — "the firm must always have a working Super Admin" — not just
+  // about who called.
+
+  /** Shape returned by the Users admin screen. Never includes the hash. */
+  private toStaffUser(user: {
+    id: string;
+    email: string;
+    firstName: string;
+    lastName: string;
+    organization: string | null;
+    role: Role;
+    active: boolean;
+    avatar: string | null;
+    clientId: string | null;
+    createdAt: Date;
+    updatedAt: Date;
+  }) {
+    return {
+      id: user.id,
+      email: user.email,
+      firstName: user.firstName,
+      lastName: user.lastName,
+      organization: user.organization,
+      role: ROLE_TO_API[user.role],
+      roleLabel: ROLE_LABEL[user.role],
+      active: user.active,
+      avatar: user.avatar,
+      // True for logins created from the client add/edit form. The UI shows
+      // these as read-only: they belong to a mandate, and editing them here
+      // would desynchronise them from the Client record that owns them.
+      isClientLogin: user.clientId !== null,
+      createdAt: user.createdAt,
+      updatedAt: user.updatedAt,
+    };
+  }
+
+  /**
+   * Rejects any role the Users screen is not allowed to hand out — chiefly
+   * SUPER_ADMIN, which is provisioned by script only so that a stolen Super
+   * Admin session cannot quietly mint a second permanent one.
+   */
+  private assertAssignable(role: Role) {
+    if (!ASSIGNABLE_ROLES.includes(role)) {
+      throw new ForbiddenException(
+        `${ROLE_LABEL[role]} cannot be assigned from the Users screen`
+      );
+    }
+  }
+
+  /**
+   * Guards the two ways a firm could lock itself out: demoting the last Super
+   * Admin, or deactivating them. Counting on every such write is cheap next to
+   * the cost of an unrecoverable account.
+   */
+  private async assertNotLastSuperAdmin(userId: string, action: string) {
+    const remaining = await this.prisma.user.count({
+      where: { role: Role.SUPER_ADMIN, active: true, id: { not: userId } },
+    });
+
+    if (remaining === 0) {
+      throw new BadRequestException(
+        `You cannot ${action} the last Super Admin — promote another one first.`
+      );
+    }
+  }
+
+  /** Every staff login, newest first. Client logins are listed but read-only. */
+  async listUsers() {
+    const users = await this.prisma.user.findMany({
+      orderBy: { createdAt: 'desc' },
+    });
+    return users.map((u) => this.toStaffUser(u));
+  }
+
+  async createUser(dto: CreateUserDto) {
+    const role = ROLE_TO_DB[dto.role];
+    this.assertAssignable(role);
+
+    const taken = await this.prisma.user.findUnique({
+      where: { email: dto.email },
+    });
+    if (taken) {
+      throw new ConflictException('That email address is already in use');
+    }
+
+    const user = await this.prisma.user.create({
+      data: {
+        firstName: dto.firstName,
+        lastName: dto.lastName,
+        email: dto.email,
+        password: await bcrypt.hash(dto.password, BCRYPT_ROUNDS),
+        role,
+        organization: dto.organization || null,
+        active: dto.active ?? true,
+      },
+    });
+
+    return this.toStaffUser(user);
+  }
+
+  async updateUser(actorId: string, targetId: string, dto: AdminUpdateUserDto) {
+    const target = await this.prisma.user.findUnique({ where: { id: targetId } });
+    if (!target) {
+      throw new NotFoundException('User not found');
+    }
+
+    // Client logins are owned by their Client row — ClientsService creates and
+    // deletes them alongside the mandate. Editing one here would leave the two
+    // out of step, so the Users screen only displays them.
+    if (target.clientId) {
+      throw new BadRequestException(
+        'This is a client portal login. Edit it from the client record instead.'
+      );
+    }
+
+    if (dto.role !== undefined) {
+      const nextRole = ROLE_TO_DB[dto.role];
+      this.assertAssignable(nextRole);
+
+      // Reassigning an existing Super Admin means demotion — the new role can
+      // never be SUPER_ADMIN, since assertAssignable just excluded it.
+      if (target.role === Role.SUPER_ADMIN) {
+        await this.assertNotLastSuperAdmin(targetId, 'demote');
+      }
+    }
+
+    if (dto.active === false) {
+      if (targetId === actorId) {
+        throw new BadRequestException('You cannot deactivate your own account');
+      }
+      if (target.role === Role.SUPER_ADMIN) {
+        await this.assertNotLastSuperAdmin(targetId, 'deactivate');
+      }
+    }
+
+    if (dto.email && dto.email !== target.email) {
+      const taken = await this.prisma.user.findUnique({
+        where: { email: dto.email },
+      });
+      if (taken) {
+        throw new ConflictException('That email address is already in use');
+      }
+    }
+
+    const updated = await this.prisma.user.update({
+      where: { id: targetId },
+      data: {
+        ...(dto.firstName !== undefined && { firstName: dto.firstName }),
+        ...(dto.lastName !== undefined && { lastName: dto.lastName }),
+        ...(dto.email !== undefined && { email: dto.email }),
+        ...(dto.organization !== undefined && {
+          organization: dto.organization || null,
+        }),
+        ...(dto.role !== undefined && { role: ROLE_TO_DB[dto.role] }),
+        ...(dto.active !== undefined && { active: dto.active }),
+        ...(dto.password !== undefined && {
+          password: await bcrypt.hash(dto.password, BCRYPT_ROUNDS),
+        }),
+      },
+    });
+
+    // A demoted or deactivated user keeps whatever access token they already
+    // hold until it expires, because the role is a JWT claim. Dropping their
+    // sessions makes the change take effect at the next refresh instead.
+    if (dto.role !== undefined || dto.active === false || dto.password) {
+      await this.prisma.session.deleteMany({ where: { userId: targetId } });
+    }
+
+    return this.toStaffUser(updated);
+  }
+
+  async deleteUser(actorId: string, targetId: string) {
+    const target = await this.prisma.user.findUnique({ where: { id: targetId } });
+    if (!target) {
+      throw new NotFoundException('User not found');
+    }
+
+    if (targetId === actorId) {
+      throw new BadRequestException('You cannot delete your own account');
+    }
+
+    if (target.clientId) {
+      throw new BadRequestException(
+        'This is a client portal login. Remove it from the client record instead.'
+      );
+    }
+
+    if (target.role === Role.SUPER_ADMIN) {
+      await this.assertNotLastSuperAdmin(targetId, 'delete');
+    }
+
+    await this.prisma.user.delete({ where: { id: targetId } });
+
+    return { message: 'User deleted.' };
   }
 }

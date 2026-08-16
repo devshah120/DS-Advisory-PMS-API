@@ -11,7 +11,9 @@ import {
   Req,
   UseGuards,
 } from '@nestjs/common';
+import { Role } from '@prisma/client';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { Roles, RolesGuard } from '../common/auth/roles.guard';
 import { UsersService } from './users.service';
 import { SecurityService } from './security.service';
 import { UpdateProfileDto } from './dto/update-profile.dto';
@@ -19,14 +21,19 @@ import { UpdatePreferencesDto } from './dto/update-preferences.dto';
 import { UpdateNotificationsDto } from './dto/update-notifications.dto';
 import { ChangePasswordDto } from './dto/change-password.dto';
 import { ConfirmTwoFactorDto, PasswordConfirmDto } from './dto/two-factor.dto';
+import { CreateUserDto } from './dto/create-user.dto';
+import { AdminUpdateUserDto } from './dto/admin-update-user.dto';
 
 /**
- * Every route is scoped to the caller's own token (`/me`) — the id comes from
- * the validated JWT, never from the request body or a path param, so one user
- * can't read or edit another's settings.
+ * The `/me` routes are scoped to the caller's own token — the id comes from the
+ * validated JWT, never from the request body or a path param, so one user can't
+ * read or edit another's settings.
+ *
+ * The staff-management routes at the bottom are the exception: they take a
+ * target id, and are restricted to SUPER_ADMIN by `RolesGuard`.
  */
 @Controller('users')
-@UseGuards(JwtAuthGuard)
+@UseGuards(JwtAuthGuard, RolesGuard)
 export class UsersController {
   constructor(
     private usersService: UsersService,
@@ -142,5 +149,38 @@ export class UsersController {
   @Delete('me/sessions/:id')
   revokeSession(@Req() req: any, @Param('id') id: string) {
     return this.securityService.revokeSession(this.userId(req), id);
+  }
+
+  // --- Staff management (Super Admin only) ---
+  //
+  // Declared after every `me/...` route on purpose: Nest matches in
+  // declaration order, so a `:id` pattern listed first would swallow `me`.
+
+  @Get()
+  @Roles(Role.SUPER_ADMIN)
+  listUsers() {
+    return this.usersService.listUsers();
+  }
+
+  @Post()
+  @Roles(Role.SUPER_ADMIN)
+  createUser(@Body() dto: CreateUserDto) {
+    return this.usersService.createUser(dto);
+  }
+
+  @Patch(':id')
+  @Roles(Role.SUPER_ADMIN)
+  updateUser(
+    @Req() req: any,
+    @Param('id') id: string,
+    @Body() dto: AdminUpdateUserDto
+  ) {
+    return this.usersService.updateUser(this.userId(req), id, dto);
+  }
+
+  @Delete(':id')
+  @Roles(Role.SUPER_ADMIN)
+  deleteUser(@Req() req: any, @Param('id') id: string) {
+    return this.usersService.deleteUser(this.userId(req), id);
   }
 }

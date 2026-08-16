@@ -54,6 +54,19 @@ export class AuthService {
     return process.env.AUTH_BYPASS === 'true';
   }
 
+  /**
+   * A deactivated login must not be able to obtain or renew tokens — otherwise
+   * `active: false` from the Users screen would be cosmetic, and a suspended
+   * Portfolio Manager could keep working until their refresh token aged out.
+   */
+  private assertActive(user: { active: boolean }) {
+    if (!user.active) {
+      throw new UnauthorizedException(
+        'This account has been deactivated. Contact your administrator.'
+      );
+    }
+  }
+
   private bypassUser(email: string, firstName = 'Dev', lastName = 'User') {
     return {
       id: 'dev-bypass-user',
@@ -78,6 +91,11 @@ export class AuthService {
     if (!user || !(await bcrypt.compare(password, user.password))) {
       throw new UnauthorizedException('Invalid credentials');
     }
+
+    // Checked only after the password verifies, so the disabled-account message
+    // is never shown to someone who couldn't sign in anyway — it tells a real
+    // owner why they're locked out without confirming the address to a guesser.
+    this.assertActive(user);
 
     // Password was correct but the account has a second factor: hand back a
     // short-lived challenge instead of tokens. No session is recorded yet —
@@ -120,6 +138,10 @@ export class AuthService {
     if (!user || !user.twoFactorEnabled || !user.twoFactorSecret) {
       throw new UnauthorizedException('Invalid sign-in attempt. Please start again.');
     }
+
+    // Re-checked here as well as in `login`: the account could have been
+    // deactivated in the minutes between issuing the challenge and redeeming it.
+    this.assertActive(user);
 
     const valid = dto.isRecoveryCode
       ? await this.securityService.consumeRecoveryCode(user.id, dto.code)
@@ -178,6 +200,11 @@ export class AuthService {
     if (!user) {
       throw new UnauthorizedException('User not found');
     }
+
+    // Deactivation takes effect at the next refresh. The role is also re-read
+    // from the row here (not carried over from the old token's claim), so a
+    // demotion applies without waiting for the user to sign in again.
+    this.assertActive(user);
 
     const session = await this.prisma.session.findUnique({
       where: { refreshTokenHash: this.securityService.hashToken(refreshToken) },

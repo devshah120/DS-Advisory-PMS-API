@@ -1,21 +1,16 @@
 import { Transform } from 'class-transformer';
 import {
   IsEmail,
-  IsEnum,
   IsNotEmpty,
   IsOptional,
   IsString,
   MaxLength,
 } from 'class-validator';
+import { ApiRole } from '../../common/auth/roles';
 
-// The API contract is lowercase (it matches the frontend `UserRole` type);
-// Prisma stores the uppercase variants. UsersService maps between them.
-export enum UserRole {
-  ADMIN = 'admin',
-  PORTFOLIO_MANAGER = 'portfolio_manager',
-  RESEARCH_ANALYST = 'research_analyst',
-  VIEWER = 'viewer',
-}
+// Re-exported under the old name so existing imports keep working; the enum
+// itself now lives in common/auth/roles.ts alongside the mapping tables.
+export { ApiRole as UserRole };
 
 const trim = () =>
   Transform(({ value }) => (typeof value === 'string' ? value.trim() : value));
@@ -29,6 +24,14 @@ const lower = () =>
  * PATCH /users/me — every field optional so the client can send a partial patch,
  * but any field that *is* sent must be non-blank. `@IsNotEmpty` after the trim
  * transform is what rejects "   " for the name fields.
+ *
+ * There is deliberately no `role` field. Editing your own role is privilege
+ * escalation: the Settings > Profile form used to expose a Role select, which
+ * let any signed-in user make themselves an admin with one request. Roles are
+ * now assigned only by a Super Admin through PATCH /users/:id, and the profile
+ * form shows the role as a read-only badge. Because `ValidationPipe` runs with
+ * `forbidNonWhitelisted`, a client that still sends `role` here is rejected
+ * rather than silently ignored.
  */
 export class UpdateProfileDto {
   @IsString()
@@ -58,11 +61,4 @@ export class UpdateProfileDto {
   @trim()
   @IsOptional()
   organization?: string;
-
-  @IsEnum(UserRole, {
-    message: 'role must be admin, portfolio_manager, research_analyst, or viewer',
-  })
-  @lower()
-  @IsOptional()
-  role?: UserRole;
 }

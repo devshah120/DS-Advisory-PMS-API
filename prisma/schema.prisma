@@ -121,7 +121,23 @@ model Session {
   @@map("sessions")
 }
 
+/// Staff roles, most privileged first.
+///
+/// SUPER_ADMIN is the only role that may manage other users — create a
+/// Portfolio Manager, change someone's role, deactivate a login. It is
+/// deliberately not self-assignable: a user cannot promote themselves into it
+/// through the profile form, and the last remaining SUPER_ADMIN cannot be
+/// demoted or deactivated, so the firm can never lock itself out.
+///
+/// PORTFOLIO_MANAGER is the working role. It can do everything else the app
+/// offers — clients, transactions, holdings, research, reports — and differs
+/// from SUPER_ADMIN only in that it cannot administer user accounts.
+///
+/// ADMIN predates SUPER_ADMIN and is kept so existing rows still read. It is
+/// treated as equivalent to PORTFOLIO_MANAGER everywhere except the legacy
+/// baseline guard, which still recognises it.
 enum Role {
+  SUPER_ADMIN
   ADMIN
   PORTFOLIO_MANAGER
   RESEARCH_ANALYST
