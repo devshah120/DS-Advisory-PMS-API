@@ -20,11 +20,16 @@ const lower = () =>
   );
 
 /**
- * POST /users — Super Admin creates a staff login (normally a Portfolio
- * Manager). `role` is validated against the full API enum here; whether the
- * value is actually *assignable* is enforced in UsersService against
- * ASSIGNABLE_ROLES, so the "no minting a second Super Admin" rule lives with
- * the other authorization logic rather than in validation metadata.
+ * POST /users — Super Admin creates a Portfolio Manager login.
+ *
+ * This endpoint creates Portfolio Managers only. UsersService fixes the role
+ * server-side and IGNORES `role` below, so the rule holds for a direct API call
+ * and not just for the UI, which no longer shows a role selector.
+ *
+ * `role` is kept, optional, purely for backward compatibility: an older client
+ * still posting `role: 'portfolio_manager'` should succeed rather than 400. It
+ * is validated so a malformed value is still rejected cleanly, but its value
+ * has no effect on what gets created.
  */
 export class CreateUserDto {
   @IsString()
@@ -51,7 +56,8 @@ export class CreateUserDto {
 
   @IsEnum(ApiRole, { message: 'Choose a valid role' })
   @lower()
-  role!: ApiRole;
+  @IsOptional()
+  role?: ApiRole;
 
   @IsString()
   @MaxLength(120)

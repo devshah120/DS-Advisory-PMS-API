@@ -380,7 +380,17 @@ export class UsersService {
   }
 
   async createUser(dto: CreateUserDto) {
-    const role = ROLE_TO_DB[dto.role];
+    // This endpoint creates PORTFOLIO MANAGERS and nothing else.
+    //
+    // The staff screen no longer offers a role selector, and the role is fixed
+    // here rather than merely defaulted so the rule holds against a direct API
+    // call too — a UI-only restriction is a suggestion, not a constraint.
+    // `dto.role` is ignored on purpose (it stays on the DTO so an older client
+    // still posting it gets a Portfolio Manager rather than a 400).
+    //
+    // Client-portal logins (VIEWER) are NOT created here — ClientsService
+    // creates them alongside the mandate they belong to.
+    const role = Role.PORTFOLIO_MANAGER;
     this.assertAssignable(role);
 
     const taken = await this.prisma.user.findUnique({
