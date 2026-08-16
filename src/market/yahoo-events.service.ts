@@ -85,7 +85,7 @@ export class YahooEventsService {
   ): Promise<WatchlistEvent[]> {
     const data = await this.fetchJson(
       `${YAHOO}/v10/finance/quoteSummary/${encodeURIComponent(ticker)}` +
-        `?modules=calendarEvents,defaultKeyStatistics&crumb=${encodeURIComponent(session.crumb)}`,
+        `?modules=calendarEvents,defaultKeyStatistics,summaryDetail&crumb=${encodeURIComponent(session.crumb)}`,
       { Cookie: session.cookie },
     );
 
@@ -114,6 +114,13 @@ export class YahooEventsService {
       });
     }
 
+    // Per-share annual rate, carried onto both dividend rows so the Event
+    // Center can price a client's entitlement. summaryDetail is the reliable
+    // home for it; defaultKeyStatistics only sometimes repeats it.
+    const detail = result.summaryDetail;
+    const dividendRate = num(detail?.dividendRate) ?? num(calendar?.dividendRate);
+    const payoutsPerYear = inferPayoutsPerYear(dividendRate, num(detail?.dividendYield), num(detail?.previousClose));
+
     const exDate = fmt(calendar?.exDividendDate);
     if (exDate) {
       events.push({
@@ -123,6 +130,8 @@ export class YahooEventsService {
         label: 'Dividend Ex-Date',
         date: exDate,
         status: 'Confirmed',
+        dividendRate,
+        payoutsPerYear,
       });
     }
 
@@ -137,6 +146,8 @@ export class YahooEventsService {
         label: 'Dividend Pay Date',
         date: payDate,
         status: 'Confirmed',
+        dividendRate,
+        payoutsPerYear,
       });
     }
 
@@ -215,6 +226,51 @@ export class YahooEventsService {
 function fmt(node: any): string | null {
   const value = node?.fmt;
   return typeof value === 'string' && value.length === 10 ? value : null;
+}
+
+/**
+ * Numeric fields share the same wrapper as dates (`{ raw, fmt }`), but Yahoo
+ * inconsistently returns a bare number for some of them, so both are accepted.
+ * Anything non-finite becomes null rather than NaN, which would otherwise
+ * propagate silently into a client-facing money figure.
+ */
+function num(node: any): number | null {
+  const value = typeof node === 'object' && node !== null ? node.raw : node;
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+/**
+ * How many times a year the issuer pays, inferred by comparing the annual rate
+ * against the trailing yield.
+ *
+ * There is no frequency field in quoteSummary, and the desk needs one to turn
+ * an annual rate into "what lands on this pay date". The ratio of the annual
+ * rate to (yield x price) is ~1 for a normal payer; Yahoo's `dividendRate` on
+ * many Indian names is the LAST single payment rather than an annualized one,
+ * which shows up as that ratio landing near 1/2, 1/4 or 1/12.
+ *
+ * Only the standard frequencies are accepted, and only within a tight
+ * tolerance — an ambiguous ratio returns null, so the UI shows the annual
+ * figure alone instead of inventing a per-payment number.
+ */
+function inferPayoutsPerYear(
+  rate: number | null,
+  yieldPct: number | null,
+  price: number | null,
+): number | null {
+  if (!rate || !yieldPct || !price || rate <= 0 || yieldPct <= 0 || price <= 0) return null;
+
+  // Yahoo quotes summaryDetail.dividendYield as a fraction (0.0234 = 2.34%),
+  // but has been observed returning whole percents on some Indian rows.
+  const asFraction = yieldPct > 1 ? yieldPct / 100 : yieldPct;
+  const annualFromYield = asFraction * price;
+  if (annualFromYield <= 0) return null;
+
+  const ratio = annualFromYield / rate;
+  for (const frequency of [1, 2, 4, 12]) {
+    if (Math.abs(ratio - frequency) / frequency < 0.15) return frequency;
+  }
+  return null;
 }
 
 function toIsoDate(d: Date): string {

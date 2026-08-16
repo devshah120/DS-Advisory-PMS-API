@@ -842,6 +842,15 @@ model EventSnapshot {
   /// "Upcoming" | "Confirmed".
   status String
 
+  /// Per-share ANNUAL dividend rate in the ticker's own currency, null for
+  /// earnings/splits and for payers the upstream has no rate for. Annual
+  /// rather than per-payment because that is what the upstream reports; see
+  /// WatchlistEvent.dividendRate.
+  dividendRate Float?
+  /// Payments per year (1/2/4/12), inferred from the trailing yield. Null when
+  /// it could not be determined, which suppresses the per-payment estimate.
+  payoutsPerYear Int?
+
   source      String   @default("fmp")
   refreshedAt DateTime @default(now())
 

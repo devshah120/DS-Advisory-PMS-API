@@ -10,6 +10,23 @@ export interface WatchlistEvent {
   label: string;
   date: string; // ISO date
   status: 'Upcoming' | 'Confirmed';
+  /**
+   * Per-share ANNUAL dividend rate, in the ticker's own currency. Null for
+   * earnings and splits, and for dividend payers the upstream has no rate for.
+   *
+   * Deliberately the annual rate rather than "this payment": Yahoo's
+   * calendarEvents exposes a trailing/forward annual figure, not the declared
+   * amount for the specific ex-date on this row. Storing what the source
+   * actually means — and labelling it annual in the UI — keeps the column
+   * honest; `payoutsPerYear` is what lets the UI derive a per-payment estimate.
+   */
+  dividendRate?: number | null;
+  /**
+   * How many times a year the issuer pays. Null when it cannot be determined,
+   * which is what keeps the per-payment estimate optional rather than a
+   * fabricated divide-by-four.
+   */
+  payoutsPerYear?: number | null;
 }
 
 const FMP_BASE = 'https://financialmodelingprep.com/stable';

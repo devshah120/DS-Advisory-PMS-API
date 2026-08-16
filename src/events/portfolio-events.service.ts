@@ -5,6 +5,26 @@ import { WatchlistEvent } from '../market/events.service';
 import { YahooEventsService } from '../market/yahoo-events.service';
 import { EventSnapshotRepository } from './event-snapshot.repository';
 
+/** One client's exposure to a single event — the rows behind the Held By hover. */
+export interface EventHolder {
+  clientId: string;
+  clientName: string;
+  /** Shares held right now, which is what the entitlement is priced on. */
+  quantity: number;
+  /**
+   * `quantity x dividendRate` — this client's ANNUAL dividend income from the
+   * name, in the book's currency. Null for non-dividend events and whenever
+   * the upstream had no rate.
+   */
+  annualAmount: number | null;
+  /**
+   * The single payment this event represents, `annualAmount / payoutsPerYear`.
+   * Null when the frequency could not be inferred — an estimate is offered
+   * only where there is a real basis for one.
+   */
+  estimatedAmount: number | null;
+}
+
 export interface PortfolioEvent extends WatchlistEvent {
   company: string;
   /** How many clients currently hold this ticker — a rough measure of exposure. */
@@ -13,11 +33,25 @@ export interface PortfolioEvent extends WatchlistEvent {
   market: Market;
   /** True when the ticker is only watchlisted, i.e. no client holds it yet. */
   watchlistOnly: boolean;
+  /** Per-client breakdown behind the count, largest holder first. */
+  holders: EventHolder[];
+  /** Shares held across every client — the hover's footer total. */
+  totalQuantity: number;
+  /** Annual dividend across every client. Null when there is no rate. */
+  totalAnnualAmount: number | null;
+  /** Estimated single payment across every client. Null without a frequency. */
+  totalEstimatedAmount: number | null;
 }
 
 export interface EventRefreshResult {
   refreshed: number;
   tickers: number;
+}
+
+/** One ticker's event universe entry, keyed by clientId so lots merge per client. */
+interface TrackedTicker {
+  company: string;
+  holders: Map<string, { clientName: string; quantity: number }>;
 }
 
 /**
@@ -57,6 +91,31 @@ export class PortfolioEventsService {
       .filter((e) => byTicker.has(e.ticker))
       .map((e) => {
         const entry = byTicker.get(e.ticker)!;
+
+        // Only a dividend carries cash. A split changes the share count, not
+        // the client's money, so its holders are listed with quantities and no
+        // amount rather than a misleading zero.
+        const rate = e.type === 'DIVIDEND' ? e.dividendRate : null;
+        const frequency = e.type === 'DIVIDEND' ? e.payoutsPerYear : null;
+
+        const holders: EventHolder[] = [...entry.holders.entries()]
+          .map(([clientId, h]) => {
+            const annualAmount = rate != null ? h.quantity * rate : null;
+            return {
+              clientId,
+              clientName: h.clientName,
+              quantity: h.quantity,
+              annualAmount,
+              estimatedAmount:
+                annualAmount != null && frequency ? annualAmount / frequency : null,
+            };
+          })
+          // Largest position first: the advisor wants the most exposed client
+          // at the top of the hover, not whichever row Mongo returned first.
+          .sort((a, b) => b.quantity - a.quantity);
+
+        const totalQuantity = holders.reduce((sum, h) => sum + h.quantity, 0);
+
         return {
           ticker: e.ticker,
           type: e.type as WatchlistEvent['type'],
@@ -64,10 +123,17 @@ export class PortfolioEventsService {
           label: e.label,
           date: e.date,
           status: e.status as WatchlistEvent['status'],
+          dividendRate: rate,
+          payoutsPerYear: frequency,
           company: entry.company,
-          clientCount: entry.clientIds.size,
+          clientCount: entry.holders.size,
           market,
-          watchlistOnly: entry.clientIds.size === 0,
+          watchlistOnly: entry.holders.size === 0,
+          holders,
+          totalQuantity,
+          totalAnnualAmount: rate != null ? totalQuantity * rate : null,
+          totalEstimatedAmount:
+            rate != null && frequency ? (totalQuantity * rate) / frequency : null,
         };
       })
       .sort((a, b) => a.date.localeCompare(b.date));
@@ -113,13 +179,19 @@ export class PortfolioEventsService {
    * itself: the position belongs to whichever book its mandate does, and that is
    * how /holdings scopes too.
    */
-  private async trackedTickers(
-    market: Market,
-  ): Promise<Map<string, { company: string; clientIds: Set<string> }>> {
+  private async trackedTickers(market: Market): Promise<Map<string, TrackedTicker>> {
     const [stored, watched] = await Promise.all([
       this.prisma.holding.findMany({
         where: { client: { market } },
-        select: { ticker: true, company: true, clientId: true, quantity: true },
+        // The client relation is what turns a bare count into a named
+        // breakdown; quantity is what prices each holder's entitlement.
+        select: {
+          ticker: true,
+          company: true,
+          clientId: true,
+          quantity: true,
+          client: { select: { name: true } },
+        },
       }),
       this.prisma.watchlist.findMany({
         where: { market },
@@ -127,11 +199,22 @@ export class PortfolioEventsService {
       }),
     ]);
 
-    const byTicker = new Map<string, { company: string; clientIds: Set<string> }>();
+    const byTicker = new Map<string, TrackedTicker>();
 
     for (const h of stored.filter((h) => Math.abs(h.quantity) > 1e-9)) {
-      const entry = byTicker.get(h.ticker) ?? { company: h.company, clientIds: new Set<string>() };
-      entry.clientIds.add(h.clientId);
+      const entry = byTicker.get(h.ticker) ?? { company: h.company, holders: new Map() };
+      // A client can hold the same ticker across several lots; the entitlement
+      // is on the combined position, so quantities accumulate per client rather
+      // than the last lot overwriting the earlier ones.
+      const held = entry.holders.get(h.clientId);
+      if (held) {
+        held.quantity += h.quantity;
+      } else {
+        entry.holders.set(h.clientId, {
+          clientName: h.client?.name ?? 'Unknown client',
+          quantity: h.quantity,
+        });
+      }
       byTicker.set(h.ticker, entry);
     }
 
@@ -139,7 +222,7 @@ export class PortfolioEventsService {
     // its real clientCount instead of being reset to a watchlist-only zero.
     for (const w of watched) {
       if (byTicker.has(w.ticker)) continue;
-      byTicker.set(w.ticker, { company: w.company, clientIds: new Set<string>() });
+      byTicker.set(w.ticker, { company: w.company, holders: new Map() });
     }
 
     return byTicker;

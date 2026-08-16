@@ -43,6 +43,8 @@ export class EventSnapshotRepository {
       label: e.label,
       date: e.date,
       status: e.status,
+      dividendRate: e.dividendRate ?? null,
+      payoutsPerYear: e.payoutsPerYear ?? null,
       source,
       refreshedAt,
     }));
