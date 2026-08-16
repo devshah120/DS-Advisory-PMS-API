@@ -1,6 +1,7 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { FundamentalSnapshot } from '@prisma/client';
 import { ApiRepository } from './api.repository';
+import { Actor } from '../common/ownership-scope';
 import { ScoringEngine, MetricInput } from './scoring/scoring-engine';
 import { IndustryComparisonEngine, IndustryComparisonResult } from './scoring/industry-comparison.engine';
 import { ExplanationEngine } from './scoring/explanation.engine';
@@ -78,8 +79,14 @@ export class FundamentalService {
    * (Single-symbol lookups still go through `getBySymbol`, which is
    * deliberately unscoped so an advisor can research a prospect.)
    */
-  async list(strategy = DEFAULT_STRATEGY, symbols?: string[]): Promise<FundamentalView[]> {
-    const universe = await this.repository.listUniverseSymbols();
+  async list(
+    strategy = DEFAULT_STRATEGY,
+    symbols?: string[],
+    actor?: Actor,
+  ): Promise<FundamentalView[]> {
+    // Scoped to the CALLER's universe, so the table lists the names they hold
+    // or watch rather than every name in the firm.
+    const universe = await this.repository.listUniverseSymbols(actor);
     const requested = symbols?.map((s) => s.trim().toUpperCase()).filter(Boolean);
     const scope = requested ? universe.filter((s) => requested.includes(s)) : universe;
 

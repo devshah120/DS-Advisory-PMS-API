@@ -1,10 +1,21 @@
-import { BadRequestException, Controller, Get, Param, Query, UseGuards } from '@nestjs/common';
+import {
+  BadRequestException,
+  Controller,
+  Get,
+  Param,
+  Query,
+  Req,
+  UseGuards,
+} from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { PortfolioHistoryService } from './portfolio-history.service';
 import { PerformanceBaselineService, PerformancePeriod } from './performance-baseline.service';
 import { availablePeriods, resolvePeriod } from './periods';
 import { Market, parseMarket } from '../common/market-scope';
 import { PrismaService } from '../common/prisma/prisma.service';
+import { Actor, assertCanAccessClient } from '../common/ownership-scope';
+
+type AuthedRequest = { user: Actor };
 
 /**
  * PART 7 / PART 9's read side: "portfolio as it existed on any date after
@@ -40,8 +51,30 @@ export class PortfolioHistoryController {
     return parseMarket(client?.market);
   }
 
+  /**
+   * Every route here is mounted under `clients/:clientId` and serves that
+   * mandate's history, so each one gates on ownership first.
+   *
+   * Checked in the controller rather than in the two services below because
+   * both are also driven by the snapshot scheduler, which has no logged-in user
+   * — putting the guard here keeps the request path locked without forcing an
+   * optional-actor parameter through the reconstruction layer.
+   */
+  private async assertAccess(clientId: string, actor: Actor) {
+    const client = await this.prisma.client.findUnique({
+      where: { id: clientId },
+      select: { id: true, ownerId: true },
+    });
+    assertCanAccessClient(actor, client);
+  }
+
   @Get('as-of/:date')
-  asOf(@Param('clientId') clientId: string, @Param('date') date: string) {
+  async asOf(
+    @Param('clientId') clientId: string,
+    @Param('date') date: string,
+    @Req() req: AuthedRequest,
+  ) {
+    await this.assertAccess(clientId, req.user);
     const parsed = this.parseDate(date);
     return this.history.getPortfolioAsOf(clientId, parsed);
   }
@@ -55,8 +88,10 @@ export class PortfolioHistoryController {
   @Get('periods')
   async periods(
     @Param('clientId') clientId: string,
+    @Req() req: AuthedRequest,
     @Query('market') market?: string,
   ) {
+    await this.assertAccess(clientId, req.user);
     return availablePeriods(new Date(), await this.marketFor(clientId, market));
   }
 
@@ -71,11 +106,14 @@ export class PortfolioHistoryController {
   @Get('return')
   async periodReturn(
     @Param('clientId') clientId: string,
+    @Req() req: AuthedRequest,
     @Query('period') period?: string,
     @Query('from') from?: string,
     @Query('to') to?: string,
     @Query('market') market?: string,
   ) {
+    await this.assertAccess(clientId, req.user);
+
     const to_ = to ? this.parseDate(to) : undefined;
     const from_ = from ? this.parseDate(from) : undefined;
 

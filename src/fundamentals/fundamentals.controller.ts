@@ -1,8 +1,11 @@
-import { Controller, Get, Post, Param, Query, UseGuards } from '@nestjs/common';
+import { Controller, Get, Post, Param, Query, Req, UseGuards } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { FundamentalService } from './fundamental.service';
 import { ApiRepository } from './api.repository';
 import { RefreshScheduler } from './refresh.scheduler';
+import { Actor } from '../common/ownership-scope';
+
+type AuthedRequest = { user: Actor };
 
 @Controller('fundamentals')
 @UseGuards(JwtAuthGuard)
@@ -15,8 +18,16 @@ export class FundamentalsController {
 
   /** Every symbol the engine has fundamentals for, scored under `strategy` (default GARP). Powers the Fundamentals watchlist. */
   @Get()
-  list(@Query('strategy') strategy?: string, @Query('symbols') symbols?: string) {
-    return this.fundamentalService.list(strategy, symbols ? symbols.split(',') : undefined);
+  list(
+    @Req() req: AuthedRequest,
+    @Query('strategy') strategy?: string,
+    @Query('symbols') symbols?: string,
+  ) {
+    return this.fundamentalService.list(
+      strategy,
+      symbols ? symbols.split(',') : undefined,
+      req.user,
+    );
   }
 
   /** Every strategy currently authored in ScoringRule — lets the UI populate a strategy switcher without hardcoding the list. */
@@ -30,7 +41,14 @@ export class FundamentalsController {
     return this.fundamentalService.getBySymbol(symbol, strategy);
   }
 
-  /** Manual trigger for the same pipeline the daily cron runs — useful right after adding a new holding/watchlist ticker rather than waiting for 1am. */
+  /**
+   * Manual trigger for the same pipeline the daily cron runs — useful right
+   * after adding a new holding/watchlist ticker rather than waiting for 1am.
+   *
+   * Unscoped by design: it refreshes the shared snapshot table for every
+   * manager's universe, like the news and events refreshes. It writes ticker
+   * fundamentals, not client data.
+   */
   @Post('refresh')
   refresh() {
     return this.refreshScheduler.refreshAll();

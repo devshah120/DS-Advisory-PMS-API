@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { Market, DEFAULT_MARKET, ALL_MARKETS } from '../common/market-scope';
+import { Actor, clientWhere, ownedWhere } from '../common/ownership-scope';
 import { WatchlistEvent } from '../market/events.service';
 import { YahooEventsService } from '../market/yahoo-events.service';
 import { EventSnapshotRepository } from './event-snapshot.repository';
@@ -83,8 +84,11 @@ export class PortfolioEventsService {
    * corporate actions has no use for an Apple ex-date, and a mixed calendar is
    * actively confusing when the two books' dates sit side by side.
    */
-  async forAllHoldings(market: Market = DEFAULT_MARKET): Promise<PortfolioEvent[]> {
-    const byTicker = await this.trackedTickers(market);
+  async forAllHoldings(
+    market: Market = DEFAULT_MARKET,
+    actor?: Actor,
+  ): Promise<PortfolioEvent[]> {
+    const byTicker = await this.trackedTickers(market, actor);
     const stored = await this.snapshots.listAll();
 
     return stored
@@ -150,6 +154,11 @@ export class PortfolioEventsService {
     // active market would delete the other book's events on every replaceAll —
     // switching the selector would then show an empty calendar until someone
     // refreshed again from that side.
+    // Deliberately UNSCOPED (no actor): the snapshot is one shared store keyed
+    // by ticker, so it must be built from every manager's tracked universe.
+    // Scoping this would make whichever manager refreshed last delete everyone
+    // else's events. Privacy is enforced on the READ path instead — a manager
+    // only ever sees the rows whose tickers they actually hold or watch.
     const universes = await Promise.all(ALL_MARKETS.map((m) => this.trackedTickers(m)));
     const tickers = [...new Set(universes.flatMap((u) => [...u.keys()]))];
 
@@ -179,10 +188,15 @@ export class PortfolioEventsService {
    * itself: the position belongs to whichever book its mandate does, and that is
    * how /holdings scopes too.
    */
-  private async trackedTickers(market: Market): Promise<Map<string, TrackedTicker>> {
+  private async trackedTickers(
+    market: Market,
+    actor?: Actor,
+  ): Promise<Map<string, TrackedTicker>> {
     const [stored, watched] = await Promise.all([
       this.prisma.holding.findMany({
-        where: { client: { market } },
+        where: {
+          client: { market, ...(actor ? clientWhere(actor) : {}) },
+        },
         // The client relation is what turns a bare count into a named
         // breakdown; quantity is what prices each holder's entitlement.
         select: {
@@ -194,7 +208,7 @@ export class PortfolioEventsService {
         },
       }),
       this.prisma.watchlist.findMany({
-        where: { market },
+        where: { market, ...(actor ? ownedWhere(actor) : {}) },
         select: { ticker: true, company: true },
       }),
     ]);

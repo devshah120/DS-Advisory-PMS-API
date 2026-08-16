@@ -6,6 +6,7 @@ import {
   ALL_MARKETS,
   displaySymbol,
 } from '../common/market-scope';
+import { Actor, clientWhere, ownedWhere } from '../common/ownership-scope';
 import { NewsRepository } from './news.repository';
 import { NewsItem, NewsKind, NewsTag } from './news.types';
 import { YahooNewsProvider } from './providers/yahoo-news.provider';
@@ -86,8 +87,12 @@ export class NewsService {
   async feed(
     market: Market = DEFAULT_MARKET,
     opts: { limit?: number; ticker?: string } = {},
+    actor?: Actor,
   ): Promise<NewsFeedItem[]> {
-    const tracked = await this.trackedNames(market);
+    // The tracked universe is what gates the feed, so scoping it here scopes
+    // the whole page — a manager sees stories for their own held/watched names
+    // and nothing else, including via the ?ticker= drill-down below.
+    const tracked = await this.trackedNames(market, actor);
 
     // A single-ticker drill-down still goes through the tracked universe, so a
     // ticker outside this book returns nothing instead of another book's news.
@@ -130,6 +135,10 @@ export class NewsService {
   async refresh(): Promise<NewsRefreshResult> {
     const universes = new Map<Market, Map<string, TrackedName>>();
     for (const market of ALL_MARKETS) {
+      // UNSCOPED on purpose — the article store is shared and keyed by ticker,
+      // so it must cover every manager's universe or a refresh by one manager
+      // would starve the others' feeds. Privacy lives on the read path in
+      // feed(), which only surfaces tickers the caller actually tracks.
       universes.set(market, await this.trackedNames(market));
     }
 
@@ -179,14 +188,17 @@ export class NewsService {
    * noise. Held names are added first so a name that is both held and
    * watchlisted keeps its real client count.
    */
-  private async trackedNames(market: Market): Promise<Map<string, TrackedName>> {
+  private async trackedNames(
+    market: Market,
+    actor?: Actor,
+  ): Promise<Map<string, TrackedName>> {
     const [holdings, watched] = await Promise.all([
       this.prisma.holding.findMany({
-        where: { client: { market } },
+        where: { client: { market, ...(actor ? clientWhere(actor) : {}) } },
         select: { ticker: true, company: true, clientId: true, quantity: true },
       }),
       this.prisma.watchlist.findMany({
-        where: { market },
+        where: { market, ...(actor ? ownedWhere(actor) : {}) },
         select: { ticker: true, company: true },
       }),
     ]);

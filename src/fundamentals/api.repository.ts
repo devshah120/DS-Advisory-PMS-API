@@ -5,6 +5,7 @@ import { RawFundamentals } from './providers/fundamentals-provider.interface';
 import { FundamentalScoreResult } from './scoring/scoring-engine';
 import { IndustryComparisonResult } from './scoring/industry-comparison.engine';
 import { Explanation } from './scoring/explanation.engine';
+import { Actor, ownedWhere, relatedClientWhere } from '../common/ownership-scope';
 
 /**
  * The only class in the Fundamentals Engine that touches Prisma. Every other
@@ -53,10 +54,21 @@ export class ApiRepository {
    * prunes the snapshot. Filtering funds here too would only hide them while
    * leaving the row in the database.
    */
-  async listUniverseSymbols(): Promise<string[]> {
+  async listUniverseSymbols(actor?: Actor): Promise<string[]> {
+    // `actor` narrows the universe to one manager's held + watched names. It is
+    // optional because the nightly RefreshScheduler legitimately needs every
+    // manager's symbols — it populates one shared snapshot table keyed by
+    // symbol, exactly like the news and events refreshes. The READ path
+    // (FundamentalService.list) always passes it.
     const [holdings, watchlist] = await Promise.all([
-      this.prisma.holding.findMany({ select: { ticker: true } }),
-      this.prisma.watchlist.findMany({ select: { ticker: true } }),
+      this.prisma.holding.findMany({
+        where: actor ? relatedClientWhere(actor) : {},
+        select: { ticker: true },
+      }),
+      this.prisma.watchlist.findMany({
+        where: actor ? ownedWhere(actor) : {},
+        select: { ticker: true },
+      }),
     ]);
     const symbols = new Set<string>(
       [...holdings, ...watchlist]
