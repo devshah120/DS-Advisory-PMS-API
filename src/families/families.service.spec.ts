@@ -3,6 +3,15 @@ import { BadRequestException } from '@nestjs/common';
 import { FamiliesService } from './families.service';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { MarketService } from '../market/market.service';
+import { Actor } from '../common/ownership-scope';
+
+/**
+ * These tests exercise the blended-cost roll-up, not the ownership boundary
+ * (see ownership-scope.spec.ts for that). A Super Admin actor keeps the
+ * ownership guard satisfied without the mocked family needing an owner, so
+ * these stay focused on the arithmetic they were written to pin down.
+ */
+const SUPER_ADMIN: Actor = { id: 'u_super', role: 'SUPER_ADMIN' };
 
 /**
  * The household roll-up is the whole point of the family feature, and its one
@@ -63,7 +72,7 @@ describe('FamiliesService.aggregate', () => {
       { [RELIANCE]: 2500 },
     );
 
-    const result = await service.aggregate('fam1');
+    const result = await service.aggregate('fam1', SUPER_ADMIN);
 
     expect(result.positions).toHaveLength(1);
     const position = result.positions[0];
@@ -110,7 +119,7 @@ describe('FamiliesService.aggregate', () => {
       { [RELIANCE]: 1000, [TCS]: 3000 },
     );
 
-    const result = await service.aggregate('fam1');
+    const result = await service.aggregate('fam1', SUPER_ADMIN);
 
     expect(result.positions.map((p) => p.ticker)).toEqual([TCS, RELIANCE]);
     expect(result.totals.lotCount).toBe(2); // the closed WIPRO lot never counted
@@ -140,7 +149,7 @@ describe('FamiliesService.aggregate', () => {
       {}, // every lookup throws
     );
 
-    const result = await service.aggregate('fam1');
+    const result = await service.aggregate('fam1', SUPER_ADMIN);
 
     // One unreachable ticker must degrade to the stored price, not fail the view.
     expect(result.positions[0].currentPrice).toBe(1200);
@@ -162,8 +171,10 @@ describe('FamiliesService.aggregate', () => {
     const service = new FamiliesService(prisma, {} as MarketService);
 
     // setMembers is private; reached through the update path it guards.
+    // The Super Admin actor makes the ownership filter a no-op so this keeps
+    // testing the cross-book rule rather than the ownership one.
     await expect(
-      (service as any).setMembers('fam1', ['c1', 'c2'], 'INDIA'),
+      (service as any).setMembers('fam1', ['c1', 'c2'], 'INDIA', SUPER_ADMIN),
     ).rejects.toBeInstanceOf(BadRequestException);
   });
 });

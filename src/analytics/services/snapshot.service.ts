@@ -9,6 +9,11 @@ import {
   Position,
 } from '../calculators/types';
 import { Market } from '../../common/market-scope';
+import {
+  Actor,
+  assertCanAccessClient,
+  clientWhere,
+} from '../../common/ownership-scope';
 
 /**
  * The single gateway between the database and the math layer.
@@ -87,11 +92,14 @@ export class SnapshotService {
     return quotes;
   }
 
-  async forClient(clientId: string): Promise<PortfolioSnapshot> {
+  async forClient(clientId: string, actor?: Actor): Promise<PortfolioSnapshot> {
     const client = await this.prisma.client.findUnique({
       where: { id: clientId },
       include: { holdings: true },
     });
+    // Absent and not-yours are the same 404 — see ownership-scope.ts. Optional
+    // actor for the same scheduler/CLI reason as forAllClients.
+    if (actor) assertCanAccessClient(actor, client);
     if (!client) throw new NotFoundException(`Client ${clientId} not found`);
 
     const profiles = await this.profiles();
@@ -115,10 +123,25 @@ export class SnapshotService {
    * book", which is what firm-wide callers (overlap, heatmap) still want. Only
    * the callers that report a currency-denominated total need to pass it — see
    * HouseService.exposure.
+   *
+   * `actor` narrows to one manager's book. This is THE chokepoint for analytics
+   * privacy: houseSnapshot, HouseService.exposure, the dashboard rollups and the
+   * overlap/heatmap views all funnel through here, so scoping this one query
+   * scopes every derived aggregate rather than each of them separately.
+   *
+   * It is optional ONLY so the schedulers and CLI scripts that legitimately run
+   * firm-wide (the nightly snapshot job, valuation replay, workbook import) can
+   * omit it — they have no logged-in user. Every request-path caller must pass
+   * it; omitting it there silently restores the firm-wide leak this exists to
+   * close.
    */
-  async forAllClients(market?: Market): Promise<PortfolioSnapshot[]> {
+  async forAllClients(market?: Market, actor?: Actor): Promise<PortfolioSnapshot[]> {
     const clients = await this.prisma.client.findMany({
-      where: { status: 'ACTIVE', ...(market ? { market } : {}) },
+      where: {
+        status: 'ACTIVE',
+        ...(market ? { market } : {}),
+        ...(actor ? clientWhere(actor) : {}),
+      },
       include: { holdings: true },
     });
 
@@ -147,8 +170,10 @@ export class SnapshotService {
    * client analytics literally cannot disagree, because there is only one
    * implementation.
    */
-  async houseSnapshot(market?: Market): Promise<PortfolioSnapshot> {
-    const snaps = await this.forAllClients(market);
+  async houseSnapshot(market?: Market, actor?: Actor): Promise<PortfolioSnapshot> {
+    // "House" means the caller's house: a manager's merged book, or the firm's
+    // for a Super Admin. Same optional-actor contract as forAllClients.
+    const snaps = await this.forAllClients(market, actor);
 
     const merged = new Map<string, Position>();
     let cash = 0;

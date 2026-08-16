@@ -4,6 +4,7 @@ import { SnapshotService } from './snapshot.service';
 import { allocationBy } from '../calculators/weights';
 import { benchmarkXirr, xirr, CashFlow } from '../calculators/xirr';
 import { DEFAULT_MARKET, MARKETS, Market } from '../../common/market-scope';
+import { Actor, assertCanAccessClient } from '../../common/ownership-scope';
 import {
   AccountingMethod,
   buildFlows,
@@ -79,11 +80,18 @@ export class PerformanceService {
     private snapshots: SnapshotService,
   ) {}
 
-  async forClient(clientId: string, benchmarkCode?: string, asOfOverride?: Date) {
+  async forClient(
+    clientId: string,
+    benchmarkCode?: string,
+    asOfOverride?: Date,
+    actor?: Actor,
+  ) {
     const client = await this.prisma.client.findUnique({ where: { id: clientId } });
+    // Not-yours and absent both surface as the same NotFound below.
+    if (actor) assertCanAccessClient(actor, client);
     if (!client) throw new NotFoundException(`Client ${clientId} not found`);
 
-    const snap = await this.snapshots.forClient(clientId);
+    const snap = await this.snapshots.forClient(clientId, actor);
     const asOf = asOfOverride ?? new Date();
 
     /**

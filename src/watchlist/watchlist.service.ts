@@ -1,4 +1,4 @@
-import { ConflictException, Injectable } from '@nestjs/common';
+import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { MarketService, DailyClose } from '../market/market.service';
@@ -10,6 +10,12 @@ import {
   displaySymbol,
   normalizeSymbol,
 } from '../common/market-scope';
+import {
+  Actor,
+  isFirmWide,
+  ownedWhere,
+  ownerForCreate,
+} from '../common/ownership-scope';
 
 export interface PeriodReturn {
   baseDate: string | null;
@@ -68,13 +74,26 @@ export class WatchlistService {
    * MarketService retries '.BO' for a BSE-only listing. A symbol typed with its
    * own suffix is honoured as-is, so this is a no-op for the US book.
    */
-  async create(dto: CreateWatchlistDto) {
+  async create(dto: CreateWatchlistDto, actor: Actor) {
     const market = (dto.market as Market) ?? DEFAULT_MARKET;
     const input = dto.ticker.trim().toUpperCase();
     const ticker = normalizeSymbol(input, market);
     const slot = dto.slot ?? '1';
 
     const profile = await this.market.lookup(ticker, market);
+    const ownerId = ownerForCreate(actor);
+
+    // Per-manager duplicate check, done in code because the database cannot do
+    // it: MongoDB will not build a unique index over a nullable key, so
+    // @@unique stays (market, slot, ticker) and knows nothing about owners.
+    // Same pattern as ClientsService enforcing one-login-per-client.
+    const mine = await this.prisma.watchlist.findFirst({
+      where: { ticker, slot, market, ...ownedWhere(actor) },
+      select: { id: true },
+    });
+    if (mine) {
+      throw new ConflictException(`${displaySymbol(ticker)} is already on this watchlist`);
+    }
 
     try {
       return await this.prisma.watchlist.create({
@@ -82,6 +101,7 @@ export class WatchlistService {
           ticker,
           slot,
           market,
+          ownerId,
           company: profile.company,
           sector: profile.sector,
           industry: profile.industry,
@@ -89,8 +109,16 @@ export class WatchlistService {
       });
     } catch (err) {
       if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
-        // Reported under the name the user typed, not the qualified symbol.
-        throw new ConflictException(`${displaySymbol(ticker)} is already on this watchlist`);
+        // The row exists but is NOT this manager's — the duplicate check above
+        // already cleared their own list. This is the known cost of the
+        // database-level key not carrying the owner (see schema.prisma on
+        // Watchlist): two managers cannot hold the same ticker on the same slot
+        // of the same book. Say so plainly rather than claiming it is already on
+        // "this" watchlist, which would be untrue and unactionable.
+        throw new ConflictException(
+          `${displaySymbol(ticker)} is already tracked on slot ${slot} by another manager. ` +
+            `Use a different slot for now.`,
+        );
       }
       throw err;
     }
@@ -101,14 +129,19 @@ export class WatchlistService {
    * column). Each ticker is resolved independently — one bad/unknown ticker
    * or a duplicate doesn't fail the whole batch.
    */
-  async bulkAdd(rawTickers: string[], slot = '1', market?: Market): Promise<BulkAddResult> {
+  async bulkAdd(
+    rawTickers: string[],
+    actor: Actor,
+    slot = '1',
+    market?: Market,
+  ): Promise<BulkAddResult> {
     const tickers = [...new Set(rawTickers.map((t) => t.trim().toUpperCase()).filter(Boolean))];
     const added: BulkAddResult['added'] = [];
     const skipped: BulkAddResult['skipped'] = [];
 
     for (const ticker of tickers) {
       try {
-        const item = await this.create({ ticker, slot, market });
+        const item = await this.create({ ticker, slot, market }, actor);
         added.push({ ticker, id: item.id });
       } catch (err: any) {
         skipped.push({ ticker, reason: err?.message || 'Lookup failed' });
@@ -122,44 +155,90 @@ export class WatchlistService {
    * One book's tracked names. `market` is optional so an unscoped call still
    * returns everything (an export, an admin screen); the UI always sends it.
    */
-  findAll(slot?: string, market?: Market) {
+  findAll(actor: Actor, slot?: string, market?: Market) {
     return this.prisma.watchlist.findMany({
       where: {
         ...(slot ? { slot } : {}),
         ...(market ? { market } : {}),
+        ...ownedWhere(actor),
       },
       orderBy: { ticker: 'asc' },
     });
   }
 
-  findOne(id: string) {
-    return this.prisma.watchlist.findUnique({
-      where: { id },
+  findOne(id: string, actor: Actor) {
+    return this.prisma.watchlist.findFirst({
+      where: { id, ...ownedWhere(actor) },
     });
   }
 
-  remove(id: string) {
-    return this.prisma.watchlist.delete({
-      where: { id },
+  async remove(id: string, actor: Actor) {
+    // deleteMany takes a filter; delete takes only a unique key. A zero count
+    // means absent OR another manager's — the same indistinguishable 404.
+    const { count } = await this.prisma.watchlist.deleteMany({
+      where: { id, ...ownedWhere(actor) },
     });
+    if (count === 0) throw new NotFoundException('Watchlist entry not found');
+    return { success: true, id };
   }
 
-  async folders(market: Market = DEFAULT_MARKET) {
+  /**
+   * Slot names for this manager, falling back to the shared pre-ownership row
+   * and then to the built-in default. The fallback chain is what keeps existing
+   * folder names ("Sample", "Potential") showing after the ownership migration
+   * instead of every slot reverting to "Slot 1".
+   */
+  async folders(market: Market = DEFAULT_MARKET, actor?: Actor) {
     const rows = await this.prisma.watchlistFolder.findMany({ where: { market } });
-    const byslot = new Map(rows.map((r) => [r.slot, r.name]));
+
+    const ownerId = actor && !isFirmWide(actor) ? actor.id : null;
+    const mine = new Map(
+      rows.filter((r) => !ownerId || r.ownerId === ownerId).map((r) => [r.slot, r.name]),
+    );
+    // Legacy rows with no owner act as the firm-wide default name.
+    const shared = new Map(
+      rows.filter((r) => !r.ownerId).map((r) => [r.slot, r.name]),
+    );
+
     return WATCHLIST_SLOTS.map((slot) => ({
       slot,
-      name: byslot.get(slot) ?? DEFAULT_FOLDER_NAMES[slot],
+      name: mine.get(slot) ?? shared.get(slot) ?? DEFAULT_FOLDER_NAMES[slot],
       market,
     }));
   }
 
-  async renameFolder(slot: string, name: string, market: Market = DEFAULT_MARKET) {
-    await this.prisma.watchlistFolder.upsert({
-      where: { market_slot: { market, slot } },
-      create: { slot, name, market },
-      update: { name },
+  /**
+   * Renames a slot for the calling manager only.
+   *
+   * The unique key is (market, slot) and cannot include the owner (see
+   * schema.prisma), so this cannot upsert per manager. It updates the caller's
+   * own row when one exists and otherwise creates one, leaving any other
+   * manager's row untouched — which is the behaviour the key alone would not
+   * give us.
+   */
+  async renameFolder(
+    slot: string,
+    name: string,
+    market: Market = DEFAULT_MARKET,
+    actor?: Actor,
+  ) {
+    const ownerId = actor && !isFirmWide(actor) ? actor.id : null;
+
+    const existing = await this.prisma.watchlistFolder.findFirst({
+      where: { market, slot, ownerId },
+      select: { id: true },
     });
+
+    if (existing) {
+      await this.prisma.watchlistFolder.update({
+        where: { id: existing.id },
+        data: { name },
+      });
+    } else {
+      await this.prisma.watchlistFolder.create({
+        data: { slot, name, market, ownerId },
+      });
+    }
     return { slot, name, market };
   }
 

@@ -163,6 +163,23 @@ export class CreateClientDto {
   )
   familyId?: string | null;
 
+  /**
+   * The staff user this mandate is assigned to — the "Assigned Manager" field.
+   *
+   * Honoured ONLY for a Super Admin; a Portfolio Manager always owns what they
+   * create regardless of what they send, so this field cannot be used to push a
+   * mandate into another manager's book. ClientsService resolves the effective
+   * owner through ownerForCreate() and discards this value.
+   *
+   * Empty string (a form's "Unassigned" option) is coerced to null.
+   */
+  @IsString()
+  @IsOptional()
+  @Transform(({ value }) =>
+    typeof value === 'string' && value.trim() === '' ? null : value
+  )
+  ownerId?: string | null;
+
   @IsEnum(ClientStatus, {
     message: 'status must be active, inactive, or closed',
   })

@@ -9,6 +9,7 @@ import {
   currencyForMarket,
   displaySymbol,
 } from '../common/market-scope';
+import { Actor, clientWhere } from '../common/ownership-scope';
 
 export interface HoldingMover {
   ticker: string;
@@ -79,19 +80,25 @@ export class DashboardService {
    * mandate it sits in, not of the ticker (the same ADR could in principle be
    * held either side).
    */
-  async getOverview(market: Market = DEFAULT_MARKET) {
+  async getOverview(market: Market = DEFAULT_MARKET, actor?: Actor) {
+    // Ownership narrows all four reads to the caller's own book. Holdings and
+    // cash reach it through the client relation, exactly as `market` does —
+    // there is no owner column on Holding to keep in step.
+    const ownScope = actor ? clientWhere(actor) : {};
     const [clients, stored, exposure, cashAgg] = await Promise.all([
       this.prisma.client.findMany({
-        where: { market },
+        where: { ...ownScope, market },
         select: { id: true, name: true },
       }),
-      this.prisma.holding.findMany({ where: { client: { market } } }),
-      this.house.exposure(market),
+      this.prisma.holding.findMany({
+        where: { client: { ...ownScope, market } },
+      }),
+      this.house.exposure(market, actor),
       // House-wide idle cash: summed straight off the client records, so a
       // client's balance is counted once regardless of how many positions they
       // hold. This is buying power available for deployment, not deployed capital.
       this.prisma.client.aggregate({
-        where: { market },
+        where: { ...ownScope, market },
         _sum: { cashBalance: true },
       }),
     ]);

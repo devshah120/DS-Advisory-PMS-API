@@ -22,6 +22,14 @@ import {
   currencyForMarket,
   marketForSymbol,
 } from '../common/market-scope';
+import {
+  Actor,
+  assertCanAccessClient,
+  assertFirmWide,
+  clientWhere,
+  isFirmWide,
+  ownerForCreate,
+} from '../common/ownership-scope';
 
 // Prisma persists SCREAMING_CASE enums; the HTTP contract uses lowercase.
 const toDb = <T extends string>(v: T | undefined) =>
@@ -115,9 +123,19 @@ export class ClientsService {
     private market: MarketService,
   ) {}
 
-  async create(dto: CreateClientDto) {
+  async create(dto: CreateClientDto, actor: Actor) {
+    // Who this mandate will belong to. A manager always owns what they create;
+    // only a Super Admin may name someone else (the form's "Assigned Manager").
+    const ownerId = ownerForCreate(actor, dto.ownerId);
+    await this.assertOwnerIsManager(ownerId);
+
+    // Scoped: the broker+account uniqueness check must not report a conflict
+    // against a mandate the caller cannot see. Doing so would leak that another
+    // manager holds that account number — a slow enumeration of the firm's book
+    // through the create form.
     const existing = await this.prisma.client.findFirst({
       where: {
+        ...clientWhere(actor),
         broker: dto.broker,
         accountNumber: dto.accountNumber,
       },
@@ -133,7 +151,12 @@ export class ClientsService {
     // The login account is a User row keyed by a unique email, so a client login
     // needs an email. Password is required on create (DTO), so require the email
     // alongside it rather than silently creating a client with no way to sign in.
-    const { password, ...clientData } = dto;
+    //
+    // `ownerId` is pulled out and discarded here: the authoritative value was
+    // already resolved through ownerForCreate above, and letting the raw payload
+    // field survive into the spread would let a manager POST someone else's
+    // ownerId and file a mandate into their book.
+    const { password, ownerId: _ignoredOwnerId, ...clientData } = dto;
     if (!dto.email) {
       throw new BadRequestException({
         message: 'Please correct the highlighted fields.',
@@ -165,6 +188,7 @@ export class ClientsService {
       const client = await this.prisma.client.create({
         data: {
           ...clientData,
+          ownerId,
           market,
           currency: dto.currency ?? currencyForMarket(market),
           riskProfile: toDb(dto.riskProfile),
@@ -196,6 +220,39 @@ export class ClientsService {
         throw new ConflictException('A client with these details already exists');
       }
       throw err;
+    }
+  }
+
+  /**
+   * Rejects an "Assigned Manager" that cannot actually hold a book.
+   *
+   * A mandate assigned to a client-portal login (VIEWER) would be invisible to
+   * every manager and to the portal user alike; one assigned to a deactivated
+   * account would be invisible to everyone but a Super Admin. Both are silent
+   * data-loss shapes, so they are rejected at the point of assignment rather
+   * than discovered later as a client that "disappeared".
+   *
+   * Null is valid and means UNASSIGNED — Super-Admin-visible only.
+   */
+  private async assertOwnerIsManager(ownerId: string | null) {
+    if (!ownerId) return;
+
+    const owner = await this.prisma.user.findUnique({
+      where: { id: ownerId },
+      select: { id: true, role: true, active: true, clientId: true },
+    });
+
+    if (!owner || owner.clientId || owner.role === 'VIEWER') {
+      throw new BadRequestException({
+        message: 'Please correct the highlighted fields.',
+        errors: { ownerId: 'Select a staff member who can hold a book of business' },
+      });
+    }
+    if (!owner.active) {
+      throw new BadRequestException({
+        message: 'Please correct the highlighted fields.',
+        errors: { ownerId: 'That account is deactivated' },
+      });
     }
   }
 
@@ -233,11 +290,20 @@ export class ClientsService {
 
   /**
    * `market` narrows the list to one book. Optional — an omitted value returns
-   * every client, which is what a firm-wide export or an admin screen wants;
-   * the header's country selector always sends it.
+   * every book, which is what a firm-wide export or an admin screen wants; the
+   * header's country selector always sends it.
+   *
+   * `actor` narrows it to one MANAGER, and unlike market it is REQUIRED — note
+   * it sits before the optional `market` in the signature for that reason.
+   * Omitting the book is a display choice; omitting the owner would be a data
+   * leak, so the compiler is made to enforce it rather than a reviewer. A Super
+   * Admin's filter resolves to `{}` and sees the firm.
    */
-  async findAll(skip = 0, take = 10, market?: Market) {
-    const where = market ? { market } : {};
+  async findAll(actor: Actor, skip = 0, take = 10, market?: Market) {
+    const where = {
+      ...clientWhere(actor),
+      ...(market ? { market } : {}),
+    };
     const [clients, total] = await Promise.all([
       this.prisma.client.findMany({
         where,
@@ -297,7 +363,15 @@ export class ClientsService {
     };
   }
 
-  async findOne(id: string) {
+  /**
+   * One mandate, if this actor is allowed to see it.
+   *
+   * The ownership check runs AFTER the fetch rather than as a `where` clause so
+   * that "absent" and "not yours" both land in assertCanAccessClient and come
+   * back as the same NotFoundException — a 403 here would confirm the id exists
+   * and turn id-guessing into a census of the firm's clients.
+   */
+  async findOne(id: string, actor: Actor) {
     const client = await this.prisma.client.findUnique({
       where: { id },
       include: {
@@ -308,12 +382,23 @@ export class ClientsService {
       },
     });
 
-    if (!client) throw new NotFoundException(`Client ${id} not found`);
-    return serialize(client);
+    assertCanAccessClient(actor, client);
+    return serialize(client!);
   }
 
-  async update(id: string, dto: UpdateClientDto) {
-    const current = await this.findOne(id);
+  async update(id: string, dto: UpdateClientDto, actor: Actor) {
+    // Doubles as the ownership gate: findOne throws NotFound unless this actor
+    // owns the mandate, so everything below is already authorised.
+    const current = await this.findOne(id, actor);
+
+    // Reassigning a mandate to another manager is a Super-Admin-only act. A
+    // manager who could set this could push a client out of their own book (or,
+    // worse, pull one in) and quietly move the data this whole boundary exists
+    // to separate.
+    if (dto.ownerId !== undefined && dto.ownerId !== current.ownerId) {
+      assertFirmWide(actor, 'reassign a client to another manager');
+      await this.assertOwnerIsManager(dto.ownerId ?? null);
+    }
 
     // Validated against the mandate's own book (which an edit cannot change),
     // not the payload's — otherwise an omitted `market` would fall back to the
@@ -324,7 +409,11 @@ export class ClientsService {
 
     // Password is edit-optional: a blank/absent value leaves the login unchanged.
     // Never persist it on the client row — hash it into the linked User instead.
-    const { password, ...clientData } = dto;
+    //
+    // `ownerId` is split out and re-applied below only when the actor passed the
+    // Super-Admin check above; letting the spread carry it would reintroduce the
+    // reassignment path that check exists to close.
+    const { password, ownerId: requestedOwnerId, ...clientData } = dto;
     if (password) {
       const login = await this.prisma.user.findFirst({
         where: { clientId: id },
@@ -339,7 +428,7 @@ export class ClientsService {
       } else {
         // The client predates client logins (or never had one). Create it now —
         // this needs an email, which comes from the payload or the stored record.
-        const email = dto.email ?? (await this.findOne(id)).email;
+        const email = dto.email ?? current.email;
         if (!email) {
           throw new BadRequestException({
             message: 'Please correct the highlighted fields.',
@@ -356,7 +445,7 @@ export class ClientsService {
             errors: { email: 'An account with this email already exists' },
           });
         }
-        const name = dto.name ?? (await this.findOne(id)).name;
+        const name = dto.name ?? current.name;
         await this.prisma.user.create({
           data: {
             email,
@@ -382,6 +471,11 @@ export class ClientsService {
       where: { id },
       data: {
         ...clientData,
+        // Only a Super Admin reaches here with a changed value — the guard at
+        // the top of this method already threw for anyone else.
+        ...(isFirmWide(actor) && requestedOwnerId !== undefined
+          ? { ownerId: requestedOwnerId }
+          : {}),
         riskProfile: toDb(dto.riskProfile),
         status: toDb(dto.status),
         // Retired: always transactional. Saving any client normalizes a
@@ -393,18 +487,21 @@ export class ClientsService {
     return serialize(client);
   }
 
-  async remove(id: string) {
-    await this.findOne(id);
+  async remove(id: string, actor: Actor) {
+    // Ownership gate — NotFound for a mandate that is not this actor's, so a
+    // manager cannot delete (or probe for) another manager's client.
+    await this.findOne(id, actor);
     await this.prisma.client.delete({ where: { id } });
     return { success: true, id };
   }
 
-  async count() {
-    return this.prisma.client.count();
+  /** Headline count for the caller's own book; the firm's, for a Super Admin. */
+  async count(actor: Actor) {
+    return this.prisma.client.count({ where: clientWhere(actor) });
   }
 
-  async getClientMetrics(id: string) {
-    const client = await this.findOne(id);
+  async getClientMetrics(id: string, actor: Actor) {
+    const client = await this.findOne(id, actor);
 
     const totalValue = client.holdings.reduce(
       (sum: number, h: any) => sum + h.marketValue,

@@ -7,6 +7,13 @@ import {
 } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../common/prisma/prisma.service';
+import {
+  Actor,
+  assertOwns,
+  clientWhere,
+  ownedWhere,
+  ownerForCreate,
+} from '../common/ownership-scope';
 import { MarketService } from '../market/market.service';
 import { CreateFamilyDto } from './dto/create-family.dto';
 import { UpdateFamilyDto } from './dto/update-family.dto';
@@ -120,19 +127,25 @@ export class FamiliesService {
     private market: MarketService,
   ) {}
 
-  async create(dto: CreateFamilyDto) {
+  async create(dto: CreateFamilyDto, actor: Actor) {
     const market = (dto.market as Market) ?? DEFAULT_MARKET;
 
     try {
       const family = await this.prisma.family.create({
-        data: { name: dto.name, market, notes: dto.notes },
+        data: {
+          name: dto.name,
+          market,
+          notes: dto.notes,
+          // A household belongs to the manager who runs its mandates.
+          ownerId: ownerForCreate(actor),
+        },
       });
 
       if (dto.clientIds?.length) {
-        await this.setMembers(family.id, dto.clientIds, market);
+        await this.setMembers(family.id, dto.clientIds, market, actor);
       }
 
-      return this.findOne(family.id);
+      return this.findOne(family.id, actor);
     } catch (err) {
       if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
         throw new ConflictException(`A family named "${dto.name}" already exists in this book`);
@@ -145,9 +158,12 @@ export class FamiliesService {
    * Families in one book, each with a light member summary — enough for the
    * selector to read "Shah Family · 4 accounts" without loading every holding.
    */
-  async findAll(market?: Market) {
+  async findAll(market?: Market, actor?: Actor) {
     const families = await this.prisma.family.findMany({
-      where: market ? { market } : {},
+      where: {
+        ...(market ? { market } : {}),
+        ...(actor ? ownedWhere(actor) : {}),
+      },
       include: {
         clients: { select: { id: true, name: true }, orderBy: { name: 'asc' } },
       },
@@ -167,7 +183,7 @@ export class FamiliesService {
     }));
   }
 
-  async findOne(id: string) {
+  async findOne(id: string, actor: Actor) {
     const family = await this.prisma.family.findUnique({
       where: { id },
       include: {
@@ -177,30 +193,32 @@ export class FamiliesService {
         },
       },
     });
-    if (!family) throw new NotFoundException(`Family ${id} not found`);
 
+    // 404 for absent and for someone else's alike — a household lists its
+    // member client names, so confirming one exists leaks the roster.
+    assertOwns(actor, family, 'Family');
     return {
-      id: family.id,
-      name: family.name,
-      market: family.market as Market,
-      currency: currencyForMarket(family.market as Market),
-      notes: family.notes,
-      memberCount: family.clients.length,
-      members: family.clients,
-      createdAt: family.createdAt,
-      updatedAt: family.updatedAt,
+      id: family!.id,
+      name: family!.name,
+      market: family!.market as Market,
+      currency: currencyForMarket(family!.market as Market),
+      notes: family!.notes,
+      memberCount: family!.clients.length,
+      members: family!.clients,
+      createdAt: family!.createdAt,
+      updatedAt: family!.updatedAt,
     };
   }
 
-  async update(id: string, dto: UpdateFamilyDto) {
+  async update(id: string, dto: UpdateFamilyDto, actor: Actor) {
     const existing = await this.prisma.family.findUnique({ where: { id } });
-    if (!existing) throw new NotFoundException(`Family ${id} not found`);
+    assertOwns(actor, existing, 'Family');
 
     // The book is fixed at creation: moving a household across books would
     // leave its existing members — all from the old book — invalid members of
     // the new one, and there is no currency in which the combined figure would
     // then make sense.
-    if (dto.market && dto.market !== existing.market) {
+    if (dto.market && dto.market !== existing!.market) {
       throw new BadRequestException(
         "A family's market cannot be changed. Create a family in the other book instead.",
       );
@@ -219,10 +237,10 @@ export class FamiliesService {
     }
 
     if (dto.clientIds) {
-      await this.setMembers(id, dto.clientIds, existing.market as Market);
+      await this.setMembers(id, dto.clientIds, existing!.market as Market, actor);
     }
 
-    return this.findOne(id);
+    return this.findOne(id, actor);
   }
 
   /**
@@ -233,12 +251,21 @@ export class FamiliesService {
    * carries no FX rate that would make such a total meaningful. Rejecting here
    * is deliberate: the alternative is a number that looks right and isn't.
    */
-  private async setMembers(familyId: string, clientIds: string[], market: Market) {
+  private async setMembers(
+    familyId: string,
+    clientIds: string[],
+    market: Market,
+    actor: Actor,
+  ) {
     const ids = [...new Set(clientIds.filter(Boolean))];
 
     if (ids.length > 0) {
+      // Scoped: without this a manager could pull another manager's mandate
+      // into their own household and read its positions through the family
+      // aggregate, bypassing every per-client check. An unowned id simply does
+      // not come back, and falls into the "no client found" branch below.
       const candidates = await this.prisma.client.findMany({
-        where: { id: { in: ids } },
+        where: { id: { in: ids }, ...clientWhere(actor) },
         select: { id: true, name: true, market: true },
       });
 
@@ -279,9 +306,9 @@ export class FamiliesService {
    * the FK is SetNull — because dissolving a family must never take the
    * underlying mandates (or their holdings) with it.
    */
-  async remove(id: string) {
+  async remove(id: string, actor: Actor) {
     const existing = await this.prisma.family.findUnique({ where: { id } });
-    if (!existing) throw new NotFoundException(`Family ${id} not found`);
+    assertOwns(actor, existing, 'Family');
 
     await this.prisma.client.updateMany({ where: { familyId: id }, data: { familyId: null } });
     await this.prisma.family.delete({ where: { id } });
@@ -300,7 +327,7 @@ export class FamiliesService {
    * valued at LIVE quotes, not the stored marketValue cache, so the family
    * total agrees with what each member's own page reports.
    */
-  async aggregate(id: string): Promise<FamilyAggregate> {
+  async aggregate(id: string, actor: Actor): Promise<FamilyAggregate> {
     const family = await this.prisma.family.findUnique({
       where: { id },
       include: {
@@ -315,6 +342,8 @@ export class FamiliesService {
         },
       },
     });
+    // The most disclosive family route — it returns every member's positions.
+    assertOwns(actor, family, 'Family');
     if (!family) throw new NotFoundException(`Family ${id} not found`);
 
     const market = family.market as Market;

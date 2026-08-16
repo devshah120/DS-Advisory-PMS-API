@@ -3,6 +3,7 @@ import { PrismaService } from '../common/prisma/prisma.service';
 import { PortfolioHistoryService } from '../portfolio-reconstruction/portfolio-history.service';
 import { INCEPTION_DATE } from '../analytics/calculators/flows';
 import { Market } from '../common/market-scope';
+import { Actor, clientWhere } from '../common/ownership-scope';
 
 export interface ClientFeeRow {
   clientId: string;
@@ -99,7 +100,11 @@ export class ReportsService {
    *      snapshot and freeze it now, so the first read locks it in.
    *   3. The quarter is still open → compute live and store nothing.
    */
-  async feesForQuarter(quarter?: string, market?: Market): Promise<ClientFeeRow[]> {
+  async feesForQuarter(
+    quarter?: string,
+    market?: Market,
+    actor?: Actor,
+  ): Promise<ClientFeeRow[]> {
     const today = new Date();
     const code = quarter ?? currentQuarterCode(today);
     const { start, end, label } = parseQuarterCode(code);
@@ -111,7 +116,14 @@ export class ReportsService {
     // total — a figure in no currency at all. Optional so an unscoped
     // firm-wide read still works.
     const clients = await this.prisma.client.findMany({
-      where: { status: 'ACTIVE', ...(market ? { market } : {}) },
+      where: {
+        status: 'ACTIVE',
+        ...(market ? { market } : {}),
+        // Ownership scoping happens HERE and nowhere else in this service: the
+        // fee rows, the totals and clientFee() below are all derived from this
+        // one list, so narrowing it narrows every fee surface at once.
+        ...(actor ? clientWhere(actor) : {}),
+      },
       include: { holdings: true },
       orderBy: { name: 'asc' },
     });
@@ -296,8 +308,15 @@ export class ReportsService {
   }
 
   /** One client, one quarter — what the per-client export downloads. */
-  async clientFee(clientId: string, quarter?: string): Promise<ClientFeeRow> {
-    const rows = await this.feesForQuarter(quarter);
+  async clientFee(
+    clientId: string,
+    quarter?: string,
+    actor?: Actor,
+  ): Promise<ClientFeeRow> {
+    // Derived from the scoped list above, so a mandate the caller does not own
+    // simply is not among the rows and falls into the NotFound below — the same
+    // answer an unbilled client gets.
+    const rows = await this.feesForQuarter(quarter, undefined, actor);
     const row = rows.find((r) => r.clientId === clientId);
     if (!row) {
       throw new NotFoundException(

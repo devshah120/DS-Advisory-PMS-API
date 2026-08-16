@@ -9,6 +9,7 @@ import {
   Patch,
   Post,
   Query,
+  Req,
   UseGuards,
 } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
@@ -16,6 +17,9 @@ import { FamiliesService } from './families.service';
 import { CreateFamilyDto } from './dto/create-family.dto';
 import { UpdateFamilyDto } from './dto/update-family.dto';
 import { parseMarket } from '../common/market-scope';
+import { Actor } from '../common/ownership-scope';
+
+type AuthedRequest = { user: Actor };
 
 @Controller('families')
 @UseGuards(JwtAuthGuard)
@@ -24,19 +28,22 @@ export class FamiliesController {
 
   @Post()
   @HttpCode(HttpStatus.CREATED)
-  create(@Body() dto: CreateFamilyDto) {
-    return this.familiesService.create(dto);
+  create(@Body() dto: CreateFamilyDto, @Req() req: AuthedRequest) {
+    return this.familiesService.create(dto, req.user);
   }
 
   @Get()
-  findAll(@Query('market') market?: string) {
-    // Unscoped when absent, so an admin screen still sees both books.
-    return this.familiesService.findAll(market ? parseMarket(market) : undefined);
+  findAll(@Req() req: AuthedRequest, @Query('market') market?: string) {
+    // Market unscoped when absent (both books); ownership always applied.
+    return this.familiesService.findAll(
+      market ? parseMarket(market) : undefined,
+      req.user
+    );
   }
 
   @Get(':id')
-  findOne(@Param('id') id: string) {
-    return this.familiesService.findOne(id);
+  findOne(@Param('id') id: string, @Req() req: AuthedRequest) {
+    return this.familiesService.findOne(id, req.user);
   }
 
   /**
@@ -44,17 +51,21 @@ export class FamiliesController {
    * the combined sector allocation.
    */
   @Get(':id/aggregate')
-  aggregate(@Param('id') id: string) {
-    return this.familiesService.aggregate(id);
+  aggregate(@Param('id') id: string, @Req() req: AuthedRequest) {
+    return this.familiesService.aggregate(id, req.user);
   }
 
   @Patch(':id')
-  update(@Param('id') id: string, @Body() dto: UpdateFamilyDto) {
-    return this.familiesService.update(id, dto);
+  update(
+    @Param('id') id: string,
+    @Body() dto: UpdateFamilyDto,
+    @Req() req: AuthedRequest
+  ) {
+    return this.familiesService.update(id, dto, req.user);
   }
 
   @Delete(':id')
-  remove(@Param('id') id: string) {
-    return this.familiesService.remove(id);
+  remove(@Param('id') id: string, @Req() req: AuthedRequest) {
+    return this.familiesService.remove(id, req.user);
   }
 }

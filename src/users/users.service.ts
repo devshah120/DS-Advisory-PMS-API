@@ -331,6 +331,46 @@ export class UsersService {
     }
   }
 
+  /**
+   * Staff who can own a book of business, for the "Assigned Manager" selector.
+   *
+   * Excludes client-portal logins (they exist to read one mandate, not manage
+   * others') and deactivated accounts (assigning to one would make the mandate
+   * invisible to everyone but a Super Admin). ClientsService.assertOwnerIsManager
+   * rejects exactly the same two cases server-side, so the dropdown and the
+   * validation cannot disagree.
+   *
+   * Returns the minimum the UI needs — no emails-as-identity, no password
+   * metadata — because this is the one user-listing a non-admin screen consumes.
+   */
+  async listAssignableManagers() {
+    const users = await this.prisma.user.findMany({
+      where: {
+        active: true,
+        clientId: null,
+        role: { in: [Role.SUPER_ADMIN, Role.ADMIN, Role.PORTFOLIO_MANAGER, Role.RESEARCH_ANALYST] },
+      },
+      select: {
+        id: true,
+        firstName: true,
+        lastName: true,
+        email: true,
+        role: true,
+        organization: true,
+      },
+      orderBy: [{ firstName: 'asc' }, { lastName: 'asc' }],
+    });
+
+    return users.map((u) => ({
+      id: u.id,
+      name: `${u.firstName} ${u.lastName}`.trim(),
+      email: u.email,
+      role: ROLE_TO_API[u.role],
+      roleLabel: ROLE_LABEL[u.role],
+      organization: u.organization,
+    }));
+  }
+
   /** Every staff login, newest first. Client logins are listed but read-only. */
   async listUsers() {
     const users = await this.prisma.user.findMany({
@@ -455,6 +495,39 @@ export class UsersService {
     if (target.role === Role.SUPER_ADMIN) {
       await this.assertNotLastSuperAdmin(targetId, 'delete');
     }
+
+    // A manager who still owns mandates cannot be deleted.
+    //
+    // This check IS the guarantee — it is not a convenience on top of a
+    // database constraint. MongoDB has no foreign keys, so `onDelete` on
+    // Client.owner (see schema.prisma) is enforced by nothing at the storage
+    // layer: deleting this row would leave every one of their clients pointing
+    // at a user id that no longer exists, invisible to every manager and
+    // reachable only by a Super Admin. Reassign the book first.
+    const ownedClients = await this.prisma.client.count({
+      where: { ownerId: targetId },
+    });
+    if (ownedClients > 0) {
+      throw new BadRequestException(
+        `${target.firstName} ${target.lastName} still manages ${ownedClients} ` +
+          `client${ownedClients === 1 ? '' : 's'}. Reassign them to another manager first.`
+      );
+    }
+
+    const ownedFamilies = await this.prisma.family.count({
+      where: { ownerId: targetId },
+    });
+    if (ownedFamilies > 0) {
+      throw new BadRequestException(
+        `${target.firstName} ${target.lastName} still owns ${ownedFamilies} ` +
+          `famil${ownedFamilies === 1 ? 'y' : 'ies'}. Reassign or delete them first.`
+      );
+    }
+
+    // Watchlist rows and folder names carry no client data and are worthless to
+    // anyone else, so they go with the account rather than blocking the delete.
+    await this.prisma.watchlist.deleteMany({ where: { ownerId: targetId } });
+    await this.prisma.watchlistFolder.deleteMany({ where: { ownerId: targetId } });
 
     await this.prisma.user.delete({ where: { id: targetId } });
 

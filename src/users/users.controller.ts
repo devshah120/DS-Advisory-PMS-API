@@ -162,6 +162,20 @@ export class UsersController {
     return this.usersService.listUsers();
   }
 
+  /**
+   * Staff who can hold a book — the "Assigned Manager" dropdown's options.
+   *
+   * Declared before `@Patch(':id')` for the same declaration-order reason as
+   * the block comment above. Super-Admin-only, because assignment is: a manager
+   * has no reason to enumerate their colleagues, and this would otherwise be a
+   * staff directory available to every login.
+   */
+  @Get('assignable')
+  @Roles(Role.SUPER_ADMIN)
+  assignableManagers() {
+    return this.usersService.listAssignableManagers();
+  }
+
   @Post()
   @Roles(Role.SUPER_ADMIN)
   createUser(@Body() dto: CreateUserDto) {

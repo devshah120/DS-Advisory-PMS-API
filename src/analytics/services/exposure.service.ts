@@ -4,6 +4,7 @@ import { Denominator, Dimension } from '../calculators/types';
 import { allocationBy, exposureProfile } from '../calculators/weights';
 import { DEFAULT_LIMITS, concentrationReport } from '../calculators/concentration';
 import { diversificationScore } from '../calculators/diversification';
+import { Actor } from '../../common/ownership-scope';
 
 /**
  * Client-level cross-sectional analytics (brief §§1,2,3,4,7,8).
@@ -19,8 +20,11 @@ export class ExposureService {
     clientId: string,
     dim: Dimension,
     opts: { lookThrough?: boolean; denominator?: Denominator } = {},
+    actor?: Actor,
   ) {
-    const snap = await this.snapshots.forClient(clientId);
+    // Ownership is enforced inside forClient, which 404s a mandate this actor
+    // does not own — so every method here inherits the check from one place.
+    const snap = await this.snapshots.forClient(clientId, actor);
 
     // Geography without look-through reports 0% China while MCHI is held, so it
     // defaults ON for region/country and OFF elsewhere (a stock's sector is its
@@ -48,8 +52,12 @@ export class ExposureService {
     };
   }
 
-  async exposure(clientId: string, denominator: Denominator = 'TOTAL_ASSETS') {
-    const snap = await this.snapshots.forClient(clientId);
+  async exposure(
+    clientId: string,
+    denominator: Denominator = 'TOTAL_ASSETS',
+    actor?: Actor,
+  ) {
+    const snap = await this.snapshots.forClient(clientId, actor);
     const profile = exposureProfile(snap, denominator);
 
     return {
@@ -58,8 +66,8 @@ export class ExposureService {
     };
   }
 
-  async concentration(clientId: string) {
-    const snap = await this.snapshots.forClient(clientId);
+  async concentration(clientId: string, actor?: Actor) {
+    const snap = await this.snapshots.forClient(clientId, actor);
     const report = concentrationReport(snap, DEFAULT_LIMITS);
 
     return {
@@ -68,8 +76,8 @@ export class ExposureService {
     };
   }
 
-  async diversification(clientId: string) {
-    const snap = await this.snapshots.forClient(clientId);
+  async diversification(clientId: string, actor?: Actor) {
+    const snap = await this.snapshots.forClient(clientId, actor);
     const score = diversificationScore(snap);
 
     return {

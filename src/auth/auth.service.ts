@@ -67,6 +67,16 @@ export class AuthService {
     }
   }
 
+  /**
+   * The AUTH_BYPASS identity (local development only).
+   *
+   * Note what ownership scoping does to this: `dev-bypass-user` is not a real
+   * User row and therefore owns no clients, so under AUTH_BYPASS the app now
+   * shows an EMPTY book rather than the whole firm's. That is correct — it is
+   * the same rule every manager gets — but it looks like data loss if you hit it
+   * unaware. Sign in as a real manager to see a book, or promote this to
+   * SUPER_ADMIN below if a bypass session needs the holistic view.
+   */
   private bypassUser(email: string, firstName = 'Dev', lastName = 'User') {
     return {
       id: 'dev-bypass-user',
@@ -74,6 +84,7 @@ export class AuthService {
       firstName,
       lastName,
       role: 'PORTFOLIO_MANAGER',
+      clientId: null as string | null,
     };
   }
 
@@ -324,6 +335,15 @@ export class AuthService {
       sub: user.id,
       email: user.email,
       role: user.role,
+      // The mandate a client-portal login (role VIEWER) is pinned to. Carried in
+      // the token so ownership scoping can resolve a VIEWER's single client
+      // without a database round-trip on every request — see
+      // common/ownership-scope.ts, whose VIEWER branch reads exactly this.
+      //
+      // Null for staff, who are scoped by `ownerId` instead. It is safe in a
+      // JWT: a client id is not a secret to the client it belongs to, and the
+      // claim is signed, so it cannot be swapped for another mandate's id.
+      clientId: user.clientId ?? null,
     };
 
     const accessToken = this.jwtService.sign(payload);

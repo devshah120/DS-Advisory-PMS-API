@@ -9,6 +9,7 @@ import {
   overlapMatrix,
 } from '../calculators/overlap';
 import { Market } from '../../common/market-scope';
+import { Actor } from '../../common/ownership-scope';
 
 /**
  * House-level analytics (brief §§5, 6, 12).
@@ -27,9 +28,9 @@ export class HouseService {
    * pie mixing a dollar book with a rupee one weights the slices by an
    * FX-unadjusted sum and is simply wrong.
    */
-  async exposure(market?: Market) {
-    const house = await this.snapshots.houseSnapshot(market);
-    const snaps = await this.snapshots.forAllClients(market);
+  async exposure(market?: Market, actor?: Actor) {
+    const house = await this.snapshots.houseSnapshot(market, actor);
+    const snaps = await this.snapshots.forAllClients(market, actor);
 
     const profile = exposureProfile(house);
     // Look-through matters for sector exactly like it does for region: an ETF
@@ -83,24 +84,35 @@ export class HouseService {
     };
   }
 
-  async overlap() {
-    const snaps = await this.snapshots.forAllClients();
+  /**
+   * The overlap matrix is the most disclosive view in the app — it lists client
+   * names down both axes and shows who holds what in common. Unscoped, it would
+   * hand any manager a roster of every other manager's clients even if every
+   * other endpoint were locked down, so `actor` matters more here than anywhere.
+   */
+  async overlap(actor?: Actor) {
+    const snaps = await this.snapshots.forAllClients(undefined, actor);
     return {
       data: overlapMatrix(snaps),
       meta: { asOf: new Date(), clientCount: snaps.length },
     };
   }
 
-  async heatmap(rows: HeatmapDimension, cols: HeatmapDimension, metric: HeatmapMetric) {
-    const snaps = await this.snapshots.forAllClients();
+  async heatmap(
+    rows: HeatmapDimension,
+    cols: HeatmapDimension,
+    metric: HeatmapMetric,
+    actor?: Actor,
+  ) {
+    const snaps = await this.snapshots.forAllClients(undefined, actor);
     return {
       data: heatmap(snaps, rows, cols, metric),
       meta: { asOf: new Date(), rows, cols, metric, sparse: true },
     };
   }
 
-  async concentration() {
-    const house = await this.snapshots.houseSnapshot();
+  async concentration(actor?: Actor) {
+    const house = await this.snapshots.houseSnapshot(undefined, actor);
     const report = concentrationReport(house);
     return { data: report, meta: { asOf: house.asOf } };
   }

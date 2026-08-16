@@ -1,4 +1,9 @@
-import { BadRequestException, Injectable, Logger } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
 import * as XLSX from 'xlsx';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { MarketService } from '../market/market.service';
@@ -7,6 +12,12 @@ import { CreateHoldingDto } from './dto/create-holding.dto';
 import { UpdateHoldingDto } from './dto/update-holding.dto';
 import { BulkImportRowResult, BulkImportSummary } from './dto/bulk-import-result.dto';
 import { Market, marketForSymbol, normalizeSymbol } from '../common/market-scope';
+import {
+  Actor,
+  assertCanAccessClient,
+  clientWhere,
+  relatedClientWhere,
+} from '../common/ownership-scope';
 
 /**
  * The bulk-import sheet, in the order the columns appear in the sample workbook.
@@ -205,6 +216,19 @@ export class HoldingsService {
   ) {}
 
   /**
+   * Proves the caller owns the mandate a write names, before anything is
+   * persisted into it. NotFound (not Forbidden) for the usual reason — see
+   * common/ownership-scope.ts.
+   */
+  private async assertOwnsClient(clientId: string, actor: Actor) {
+    const client = await this.prisma.client.findUnique({
+      where: { id: clientId },
+      select: { id: true, ownerId: true },
+    });
+    assertCanAccessClient(actor, client);
+  }
+
+  /**
    * Overlays each holding's stored `currentPrice`/`marketValue`/`unrealizedPnL`
    * with a live quote. The DB row stays untouched (it's the cost-basis ledger,
    * not a price cache) — this only affects what a read returns. One ticker
@@ -258,7 +282,7 @@ export class HoldingsService {
    * every caller gets both; no caller should be writing a Transaction for a
    * trade itself.
    */
-  async create(createHoldingDto: CreateHoldingDto) {
+  async create(createHoldingDto: CreateHoldingDto, actor: Actor) {
     const {
       clientId,
       marketValue: _ignored,
@@ -267,6 +291,10 @@ export class HoldingsService {
       ...data
     } = createHoldingDto;
     const { ticker, quantity, averageCost, currentPrice } = data;
+
+    // The mandate is named in the payload, so prove the caller owns it before
+    // writing a position (and its paired transaction) into that book.
+    await this.assertOwnsClient(clientId, actor);
 
     if (quantity === 0) {
       throw new BadRequestException('Quantity must be non-zero');
@@ -441,9 +469,15 @@ export class HoldingsService {
    * Scoped through the client relation rather than the ticker, because market is
    * a property of the mandate — see the note on Client.market in schema.prisma.
    */
-  async findAll(market?: Market) {
+  async findAll(market?: Market, actor?: Actor) {
+    // Ownership and market are both properties of the MANDATE, so both are
+    // expressed on the same `client` relation rather than on the holding.
+    const clientFilter = {
+      ...(market ? { market } : {}),
+      ...(actor ? clientWhere(actor) : {}),
+    };
     const holdings = await this.prisma.holding.findMany({
-      where: market ? { client: { market } } : {},
+      where: Object.keys(clientFilter).length ? { client: clientFilter } : {},
       include: {
         client: true,
       },
@@ -451,23 +485,28 @@ export class HoldingsService {
     return this.withLivePrices(openOnly(holdings));
   }
 
-  async findByClient(clientId: string) {
+  async findByClient(clientId: string, actor: Actor) {
     const holdings = await this.prisma.holding.findMany({
-      where: { clientId },
+      where: { clientId, ...relatedClientWhere(actor) },
     });
     return this.withLivePrices(openOnly(holdings));
   }
 
-  findOne(id: string) {
-    return this.prisma.holding.findUnique({
-      where: { id },
+  findOne(id: string, actor: Actor) {
+    // findFirst, not findUnique: only findFirst accepts the relation filter that
+    // carries the ownership check.
+    return this.prisma.holding.findFirst({
+      where: { id, ...relatedClientWhere(actor) },
     });
   }
 
   /** Recomputes marketValue and unrealizedPnL whenever an input to them changes. */
-  async update(id: string, updateHoldingDto: UpdateHoldingDto) {
-    const existing = await this.prisma.holding.findUnique({ where: { id } });
-    if (!existing) throw new BadRequestException(`No holding with id ${id}`);
+  async update(id: string, updateHoldingDto: UpdateHoldingDto, actor: Actor) {
+    const existing = await this.prisma.holding.findFirst({
+      where: { id, ...relatedClientWhere(actor) },
+    });
+    // Absent or someone else's — indistinguishable to the caller by design.
+    if (!existing) throw new NotFoundException(`No holding with id ${id}`);
 
     const { marketValue: _ignored, ...data } = updateHoldingDto as UpdateHoldingDto & {
       marketValue?: number;
@@ -488,19 +527,27 @@ export class HoldingsService {
    * alone — they are the record of what actually happened, and the schema
    * hangs both off the client rather than off each other.
    */
-  async remove(id: string) {
-    const existing = await this.prisma.holding.findUnique({ where: { id } });
-    // Two people deleting the same row shouldn't surface a raw Prisma error.
-    if (!existing) throw new BadRequestException(`No holding with id ${id}`);
+  async remove(id: string, actor: Actor) {
+    const existing = await this.prisma.holding.findFirst({
+      where: { id, ...relatedClientWhere(actor) },
+    });
+    // Two people deleting the same row shouldn't surface a raw Prisma error;
+    // nor should a manager learn that another manager's holding id exists.
+    if (!existing) throw new NotFoundException(`No holding with id ${id}`);
 
     return this.prisma.holding.delete({
       where: { id },
     });
   }
 
-  async getByTicker(ticker: string) {
+  /**
+   * Who holds this ticker. Scoped, because unscoped it answers "which of the
+   * firm's clients hold RELIANCE" — a cross-manager position disclosure even
+   * though the caller never names another manager's client.
+   */
+  async getByTicker(ticker: string, actor: Actor) {
     const holdings = await this.prisma.holding.findMany({
-      where: { ticker },
+      where: { ticker, ...relatedClientWhere(actor) },
       include: {
         client: true,
       },
@@ -508,9 +555,9 @@ export class HoldingsService {
     return this.withLivePrices(openOnly(holdings));
   }
 
-  async getSectorExposure(clientId: string) {
+  async getSectorExposure(clientId: string, actor: Actor) {
     const stored = await this.prisma.holding.findMany({
-      where: { clientId },
+      where: { clientId, ...relatedClientWhere(actor) },
     });
     const holdings = await this.withLivePrices(openOnly(stored));
 
@@ -538,14 +585,14 @@ export class HoldingsService {
    * Only BUY/SELL transactions are replayed. Other transaction types (dividends,
    * fees, splits) are tracked separately and don't affect quantity reconstruction.
    */
-  async getPortfolioAsOfDate(clientId: string, asOfDate: Date) {
-    // Validate client exists
+  async getPortfolioAsOfDate(clientId: string, asOfDate: Date, actor: Actor) {
+    // Validate the client exists AND belongs to the caller — a historical
+    // reconstruction is as disclosive as a live one.
     const client = await this.prisma.client.findUnique({
       where: { id: clientId },
+      select: { id: true, ownerId: true },
     });
-    if (!client) {
-      throw new BadRequestException(`No client with id ${clientId}`);
-    }
+    assertCanAccessClient(actor, client);
 
     // Get all BUY and SELL transactions up to and including the specified date
     const transactions = await this.prisma.transaction.findMany({
@@ -755,7 +802,7 @@ export class HoldingsService {
    * spreadsheet line number and either an 'imported' or 'failed' status, so the
    * UI can show the user precisely what did and didn't land.
    */
-  async bulkImport(fileBuffer: Buffer): Promise<BulkImportSummary> {
+  async bulkImport(fileBuffer: Buffer, actor: Actor): Promise<BulkImportSummary> {
     let rows: Record<string, unknown>[];
     try {
       const wb = XLSX.read(fileBuffer, { type: 'buffer' });
@@ -777,7 +824,7 @@ export class HoldingsService {
     // Resolved once for the whole file rather than per row: a blotter is mostly
     // the same few names repeated, and this is the only DB read the row loop
     // would otherwise make before doing any work.
-    const clientsByName = await this.clientNameIndex();
+    const clientsByName = await this.clientNameIndex(actor);
 
     const results: BulkImportRowResult[] = [];
 
@@ -788,7 +835,7 @@ export class HoldingsService {
       const ticker = toText(raw.symbol)?.toUpperCase() ?? null;
 
       try {
-        await this.importRow(raw, clientsByName);
+        await this.importRow(raw, clientsByName, actor);
         results.push({ row: rowNumber, ticker, status: 'imported' });
       } catch (error) {
         results.push({
@@ -818,8 +865,17 @@ export class HoldingsService {
    * mandate says "RELIANCE", not "RELIANCE.NS" — the row needs the client's book
    * to qualify that symbol before it can be priced.
    */
-  private async clientNameIndex(): Promise<Map<string, { id: string; market: Market } | null>> {
+  private async clientNameIndex(
+    actor: Actor,
+  ): Promise<Map<string, { id: string; market: Market } | null>> {
+    // Scoped, and this one matters more than it looks: bulk import resolves the
+    // destination mandate by NAME from the spreadsheet, so an unscoped index
+    // would let a manager write trades into another manager's client just by
+    // typing their client's name into a cell. Narrowing the index means an
+    // unowned name never resolves, and the row fails with the same "no client
+    // found" message an unknown name gets.
     const clients = await this.prisma.client.findMany({
+      where: clientWhere(actor),
       select: { id: true, name: true, market: true },
     });
 
@@ -839,6 +895,7 @@ export class HoldingsService {
   private async importRow(
     raw: Record<string, unknown>,
     clientsByName: Map<string, { id: string; market: Market } | null>,
+    actor: Actor,
   ): Promise<void> {
     const side = toSide(raw.action);
     const date = toDate(raw.date);
@@ -917,6 +974,10 @@ export class HoldingsService {
       amountInvested,
     };
 
-    await this.create(dto);
+    // The name index this row resolved through was already scoped to the actor,
+    // so ownership is settled by construction; passing it on keeps create()'s
+    // own check meaningful rather than relying on that invariant holding
+    // forever.
+    await this.create(dto, actor);
   }
 }
