@@ -4,6 +4,7 @@ import { PortfolioHistoryService } from './portfolio-history.service';
 import { BenchmarkHistoryService, BenchmarkWindowResult } from './benchmark-history.service';
 import { CashFlow, xirr } from '../analytics/calculators/xirr';
 import { ResolvedPeriod } from './periods';
+import { Market } from '../common/market-scope';
 
 /**
  * Widened from the original four-value union to any code `resolvePeriod`
@@ -131,8 +132,17 @@ export class PerformanceBaselineService {
       openingValue > 0 ? (closingValue - openingValue) / openingValue : null;
 
     const flows = await this.windowFlows(clientId, from, to, openingValue, closingValue);
+    // The client's own book decides the benchmark: an Indian mandate is measured
+    // against the Nifty 50, not the S&P 500. Passing market here is what makes
+    // the unset-benchmarkId case (every client seeded so far) resolve correctly.
     const benchmark = client
-      ? await this.benchmarkHistory.windowReturn(undefined, client.benchmarkId, flows, to)
+      ? await this.benchmarkHistory.windowReturn(
+          undefined,
+          client.benchmarkId,
+          flows,
+          to,
+          client.market as Market,
+        )
       : null;
 
     /**

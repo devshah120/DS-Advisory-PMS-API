@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { HistoricalPriceService } from '../historical-price/historical-price.service';
 import { benchmarkXirr, CashFlow } from '../analytics/calculators/xirr';
+import { DEFAULT_MARKET, MARKETS, Market } from '../common/market-scope';
 
 export interface BenchmarkWindowResult {
   code: string;
@@ -40,8 +41,9 @@ export class BenchmarkHistoryService {
     benchmarkId: string | null,
     flows: CashFlow[],
     asOf: Date,
+    market: Market = DEFAULT_MARKET,
   ): Promise<BenchmarkWindowResult | null> {
-    const bm = await this.resolveBenchmark(code, benchmarkId);
+    const bm = await this.resolveBenchmark(code, benchmarkId, market);
     if (!bm) return null;
 
     const closes = await Promise.all(flows.map((f) => this.prices.closeOn(bm.symbol, f.date)));
@@ -85,8 +87,9 @@ export class BenchmarkHistoryService {
     openingValue: number,
     from: Date,
     to: Date,
+    market: Market = DEFAULT_MARKET,
   ): Promise<number | null> {
-    const bm = await this.resolveBenchmark(code, benchmarkId);
+    const bm = await this.resolveBenchmark(code, benchmarkId, market);
     if (!bm) return null;
 
     const openClose = await this.prices.closeOn(bm.symbol, from);
@@ -97,10 +100,41 @@ export class BenchmarkHistoryService {
     return units * closeAtTo;
   }
 
-  /** Same code -> benchmarkId -> isDefault chain as PerformanceService.resolveBenchmark. */
-  private async resolveBenchmark(code: string | undefined, benchmarkId: string | null) {
+  /**
+   * Same code -> benchmarkId -> default chain as PerformanceService, but the
+   * default is resolved WITHIN THE CLIENT'S MARKET.
+   *
+   * `isDefault` is documented in schema.prisma as scoped per market — each book
+   * has its own default (S&P 500 / Nifty 50). The unscoped
+   * `findFirst({ isDefault: true })` this replaces ignored that scoping and
+   * returned whichever row Mongo happened to hit first, which is the S&P 500 —
+   * so every Indian mandate was measured against a US index quoted in dollars,
+   * and the alpha beside it was the spread between a rupee portfolio and the
+   * S&P. That number is not merely mislabelled, it is meaningless.
+   *
+   * The market falls back to the seeded default row only if the book has no
+   * benchmark seeded at all, which means `npm run seed:market-benchmarks` has
+   * not been run — a missing benchmark is reported as such rather than being
+   * quietly substituted with the other book's index.
+   */
+  private async resolveBenchmark(
+    code: string | undefined,
+    benchmarkId: string | null,
+    market: Market = DEFAULT_MARKET,
+  ) {
     if (code) return this.prisma.benchmark.findUnique({ where: { code } });
     if (benchmarkId) return this.prisma.benchmark.findUnique({ where: { id: benchmarkId } });
-    return this.prisma.benchmark.findFirst({ where: { isDefault: true } });
+
+    const scoped = await this.prisma.benchmark.findFirst({
+      where: { market, isDefault: true },
+    });
+    if (scoped) return scoped;
+
+    // Nothing seeded as this book's default — fall back to the market
+    // definition's declared benchmark code before giving up, so a partially
+    // seeded database still measures against the right index.
+    return this.prisma.benchmark.findUnique({
+      where: { code: MARKETS[market].defaultBenchmark.code },
+    });
   }
 }

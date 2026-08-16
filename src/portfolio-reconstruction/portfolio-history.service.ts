@@ -3,6 +3,7 @@ import { PrismaService } from '../common/prisma/prisma.service';
 import { PortfolioReconstructionService } from './portfolio-reconstruction.service';
 import { BenchmarkHistoryService } from './benchmark-history.service';
 import { ReconstructedPortfolio } from './types';
+import { Market } from '../common/market-scope';
 
 function utcDay(d: Date): Date {
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
@@ -149,6 +150,7 @@ export class PortfolioHistoryService {
       openingValue,
       baselineDate,
       snapshotDate,
+      client.market as Market,
     );
     return value ?? undefined;
   }

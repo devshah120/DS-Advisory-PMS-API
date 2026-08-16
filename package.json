@@ -25,6 +25,7 @@
     "backfill:market": "ts-node -r tsconfig-paths/register src/analytics/scripts/backfill-market.ts",
     "backfill:watchlist-market": "ts-node -r tsconfig-paths/register src/analytics/scripts/backfill-watchlist-market.ts",
     "seed:market-benchmarks": "ts-node -r tsconfig-paths/register src/analytics/scripts/seed-market-benchmarks.ts",
+    "repair:client-benchmarks": "ts-node -r tsconfig-paths/register src/analytics/scripts/repair-client-benchmarks.ts",
     "reconcile:ledger": "ts-node -T --project scripts/tsconfig.json scripts/reconcile-ledger.ts"
   },
   "dependencies": {

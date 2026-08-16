@@ -15,6 +15,7 @@ interface WorkingPosition {
   currency: string;
   sector: string;
   industry: string;
+  country: string;
 }
 
 /**
@@ -68,6 +69,7 @@ export class PortfolioReconstructionService {
         currency: h.currency,
         sector: h.sector,
         industry: h.industry,
+        country: (h as { country?: string }).country ?? 'Unknown',
       });
     }
 
@@ -105,7 +107,7 @@ export class PortfolioReconstructionService {
       open.map((p) => p.ticker),
       asOfDate,
     );
-    const profiles = await this.profiles();
+    const profiles = await this.profiles(clientId);
 
     const reconstructedPositions: ReconstructedPosition[] = [];
     let holdingsValue = 0;
@@ -130,9 +132,14 @@ export class PortfolioReconstructionService {
         marketValue,
         costBasisTotal: p.costBasisTotal,
         unrealizedGain: gain,
-        sector: p.sector,
-        industry: p.industry,
-        country: profiles.get(p.ticker)?.country ?? 'Unknown',
+        // Classification comes from the profile/holding map, falling back to
+        // whatever the replay carried. The replay seeds a position created by a
+        // BUY with 'Unclassified' (it has only a ledger row, which has no
+        // sector column), so preferring the map here is what stops an entire
+        // Indian book reporting as 100% Unclassified.
+        sector: profiles.get(p.ticker)?.sector ?? p.sector,
+        industry: profiles.get(p.ticker)?.industry ?? p.industry,
+        country: profiles.get(p.ticker)?.country ?? p.country ?? 'Unknown',
         assetClass: profiles.get(p.ticker)?.assetClass ?? 'EQUITY',
         weight: 0, // filled in below once portfolioValue is known
       });
@@ -213,8 +220,13 @@ export class PortfolioReconstructionService {
             quantity: t.quantity,
             costBasisTotal: cost,
             currency: 'USD',
+            // A ledger row carries no classification. These are placeholders
+            // only — the real sector/industry/country is attached from the
+            // profile/holding map when the position is materialised (see
+            // `profiles`), never left as written here.
             sector: 'Unclassified',
             industry: 'Unclassified',
+            country: 'Unknown',
           });
         }
         addCash(-Math.abs(t.amount));
@@ -278,9 +290,48 @@ export class PortfolioReconstructionService {
     }
   }
 
-  private async profiles(): Promise<Map<string, Classification>> {
-    const rows = await this.prisma.instrumentProfile.findMany();
+  /**
+   * Ticker -> classification, from InstrumentProfile FIRST and the client's own
+   * Holding rows second.
+   *
+   * InstrumentProfile is the canonical table, but it is populated only by the
+   * workbook importer and so covers the US book alone — every Indian symbol is
+   * absent from it. The Holding rows, by contrast, are written by
+   * HoldingsService.create with the sector/industry/country Yahoo returned at
+   * trade time, and those ARE correct for Indian tickers (AJANTPHARM.NS is
+   * stored as Healthcare / India).
+   *
+   * Reconstruction previously read profiles only, so an Indian book resolved to
+   * nothing and every position fell back to the hardcoded 'Unclassified' /
+   * 'Unknown' that the replay seeds a new BUY with — which is why the whole
+   * portfolio rendered as one 100% Unclassified bar. Falling back to the
+   * holding row recovers the real classification without inventing one.
+   *
+   * Profiles still win where both exist: the profile carries assetClass and the
+   * ETF lookThrough map, which a holding row has no column for.
+   */
+  private async profiles(clientId?: string): Promise<Map<string, Classification>> {
+    const [rows, holdings] = await Promise.all([
+      this.prisma.instrumentProfile.findMany(),
+      clientId
+        ? this.prisma.holding.findMany({ where: { clientId } })
+        : Promise.resolve([] as Array<Record<string, any>>),
+    ]);
+
     const map = new Map<string, Classification>();
+
+    // Seed from holdings first so a real InstrumentProfile can overwrite it.
+    for (const h of holdings) {
+      map.set(h.ticker, {
+        sector: h.sector || 'Unclassified',
+        industry: h.industry || 'Unclassified',
+        region: 'Unknown',
+        country: h.country || 'Unknown',
+        assetClass: 'EQUITY',
+        lookThrough: null,
+      });
+    }
+
     for (const r of rows) {
       map.set(r.symbol, {
         sector: r.sector,
