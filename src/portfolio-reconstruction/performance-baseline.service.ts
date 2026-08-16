@@ -2,7 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { PortfolioHistoryService } from './portfolio-history.service';
 import { BenchmarkHistoryService, BenchmarkWindowResult } from './benchmark-history.service';
-import { CashFlow } from '../analytics/calculators/xirr';
+import { CashFlow, xirr } from '../analytics/calculators/xirr';
 import { ResolvedPeriod } from './periods';
 
 /**
@@ -15,23 +15,60 @@ export type PerformancePeriod = string;
 
 export interface PeriodReturn {
   period: PerformancePeriod;
-  /** Human label for the selected window, e.g. "Q3 CY26". */
+  /** Human label for the selected window, e.g. "Q2 FY27". */
   label: string;
   from: Date;
   to: Date;
   /** True when `from` was pulled forward to the 30-June-2026 inception. */
   clampedToInception: boolean;
+  /** Where the window would have opened without the inception clamp. */
+  nominalFrom?: Date;
+  /** Days lost to the clamp. Zero when the window is whole. */
+  daysClamped: number;
   /** True when the period has not closed yet and `to` is today. */
   openPeriod: boolean;
+  /** Calendar length of the measured window, in days. */
+  periodDays: number;
+
   openingValue: number;
   closingValue: number;
-  /** Simple (openingValue -> closingValue) return. Not flow-adjusted TWRR —
-   *  callers wanting a flow-adjusted figure feed `openingValue` into their
-   *  own TWRR chain instead of using this field directly. */
+
+  /**
+   * Net external money added during the window (deposits − withdrawals).
+   *
+   * Reported because it is what separates the two return figures below, and a
+   * reader who cannot see it cannot tell why they differ.
+   */
+  netFlows: number;
+
+  /**
+   * THE headline: money-weighted return over the window, de-annualized to the
+   * window's own length.
+   *
+   * This is the number the sheet leads with, and it is flow-adjusted — a
+   * mid-quarter deposit is treated as capital arriving, not as performance. See
+   * the note on `simpleReturnPct` for why that distinction is not academic.
+   */
   returnPct: number | null;
-  /** The index over the SAME window, same unit-purchase method as the
-   *  Current tab's Alpha card. Null when the client has no benchmark set. */
+  /** The same money-weighted rate, annualized. Null on windows under 30 days. */
+  annualizedReturnPct: number | null;
+  /** Set when the solver could not find a rate, so the sheet can say why. */
+  returnReason?: string;
+
+  /**
+   * The naive (closing − opening) / opening figure.
+   *
+   * Kept, clearly labelled, because it ties to a custody statement and operators
+   * ask for it — but it is NOT the headline, because it counts deposits as
+   * return. On a book that took a large mid-quarter contribution the two can
+   * differ by tens of percent, and the simple figure is the flattering one.
+   */
+  simpleReturnPct: number | null;
+
+  /** The index over the SAME window, same unit-purchase method. */
   benchmark: BenchmarkWindowResult | null;
+  /** Portfolio − benchmark over this window. Both money-weighted, same flows. */
+  alpha: number | null;
 }
 
 /**
@@ -90,12 +127,53 @@ export class PerformanceBaselineService {
     ]);
 
     const closingValue = closingPortfolio.portfolioValue;
-    const returnPct = openingValue > 0 ? (closingValue - openingValue) / openingValue : null;
+    const simpleReturnPct =
+      openingValue > 0 ? (closingValue - openingValue) / openingValue : null;
 
     const flows = await this.windowFlows(clientId, from, to, openingValue, closingValue);
     const benchmark = client
       ? await this.benchmarkHistory.windowReturn(undefined, client.benchmarkId, flows, to)
       : null;
+
+    /**
+     * The money-weighted return over this window — the headline figure.
+     *
+     * Solved on EXACTLY the flow series the benchmark is priced on (opening
+     * value in, real mid-window deposits/withdrawals on their own dates, closing
+     * value out). That identity is the point: alpha is only meaningful if both
+     * sides saw the same money on the same days, and the previous
+     * implementation compared a flow-contaminated portfolio number against a
+     * flow-adjusted benchmark — so a client who deposited mid-quarter showed
+     * fake alpha proportional to the size of their deposit.
+     *
+     * XIRR is annualized by construction, so it is de-annualized back onto the
+     * window to give the figure that is comparable to the benchmark's interim.
+     */
+    const periodDays = Math.max(
+      1,
+      Math.round((to.getTime() - from.getTime()) / 86_400_000),
+    );
+
+    const solved = xirr(flows);
+    const annualized = solved.status === 'ok' ? solved.rate : null;
+
+    /**
+     * De-annualization mirrors PerformanceService exactly — same formula, same
+     * 365-day basis — so the two engines cannot report different numbers for the
+     * same window.
+     */
+    const returnPct =
+      annualized !== null ? (1 + annualized) ** (periodDays / 365) - 1 : null;
+
+    /**
+     * Annualizing a short window extrapolates noise: a 2% move over 11 days is
+     * "+95% a year". The same 30-day floor PerformanceService applies.
+     */
+    const annualizedReturnPct = periodDays >= 30 ? annualized : null;
+
+    const netFlows = flows
+      .slice(1, -1)
+      .reduce((sum, f) => sum - f.amount, 0);
 
     return {
       period: resolved.period,
@@ -103,11 +181,22 @@ export class PerformanceBaselineService {
       from,
       to,
       clampedToInception: resolved.clampedToInception,
+      nominalFrom: resolved.nominalFrom,
+      daysClamped: resolved.daysClamped,
       openPeriod: resolved.openPeriod,
+      periodDays,
       openingValue,
       closingValue,
+      netFlows,
       returnPct,
+      annualizedReturnPct,
+      returnReason: solved.status === 'no-solution' ? solved.reason : undefined,
+      simpleReturnPct,
       benchmark,
+      alpha:
+        returnPct !== null && benchmark?.interim != null
+          ? returnPct - benchmark.interim
+          : null,
     };
   }
 
