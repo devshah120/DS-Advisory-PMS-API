@@ -4,6 +4,7 @@ import { SnapshotService } from './snapshot.service';
 import { allocationBy } from '../calculators/weights';
 import { benchmarkXirr, xirr, CashFlow } from '../calculators/xirr';
 import { DEFAULT_MARKET, MARKETS, Market } from '../../common/market-scope';
+import { replayLots, totalRealizedGain } from '../calculators/tax-lots';
 import { Actor, assertCanAccessClient } from '../../common/ownership-scope';
 import {
   AccountingMethod,
@@ -25,7 +26,6 @@ import {
   LedgerRow,
   performers,
   portfolioTurnover,
-  realizedGain,
   realizedProceeds,
 } from '../calculators/kpis';
 
@@ -250,6 +250,7 @@ export class PerformanceService {
       holdingsValue,
       cash,
       portfolioValue,
+      client.market as Market,
     );
 
     /**
@@ -452,9 +453,24 @@ export class PerformanceService {
     holdingsValue: number,
     cash: number,
     portfolioValue: number,
+    market: Market,
   ) {
     const totals = flowTotals(ledger);
-    const realized = realizedGain(ledger);
+
+    /**
+     * Realized gain is FIFO, from the same lot engine the capital-gains
+     * statement uses — not the average-cost figure this line used to carry.
+     *
+     * Average cost is not an available election for listed equity in either
+     * book (see the header of tax-lots.ts), so a headline that used it could
+     * never tie to the statement the client files. Sharing one replay is what
+     * keeps the Performance sheet and the tax report from disagreeing, which is
+     * the drift this codebase repeatedly warns about.
+     *
+     * This is the whole ledger, not one fiscal year: the KPI is since-inception
+     * realized gain, matching the since-inception XIRR beside it.
+     */
+    const realized = totalRealizedGain(replayLots(ledger, { market }).gains);
 
     // Unrealized is derived from the snapshot (quantity × price − cost), never
     // from the stored Holding.unrealizedPnL.

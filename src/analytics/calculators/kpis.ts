@@ -101,14 +101,29 @@ function sumWhere(ledger: LedgerRow[], type: string): number {
 /**
  * Realized gain, from the ledger, using average cost.
  *
- * A SELL's realized gain is `proceeds − (avg cost at the time of sale × qty)`.
- * The average cost has to be tracked as the ledger is walked, because it moves
+ * @deprecated Superseded by the FIFO lot engine — use `replayLots` and
+ * `totalRealizedGain` from `./tax-lots` instead. Kept because its spec pins the
+ * old behaviour, and because a reader comparing a historical report against a
+ * current one needs to be able to reproduce the figure it used to print.
+ *
+ * WHY IT WAS REPLACED
+ *
+ * The original rationale was internal consistency: average cost is what
+ * `Holding.averageCost` represents, so the two could not disagree. That is a
+ * fine property for a display KPI and the wrong basis for anything a client
+ * files a return on. Listed equity is FIFO in both books this product serves —
+ * India under s.45 with the depository delivery rules, the US as the broker
+ * default under Treas. Reg. §1.1012-1(c) — so an average-cost figure cannot tie
+ * to a contract note, a broker statement, or an ITR.
+ *
+ * It also cannot answer the question the statement actually asks: average cost
+ * has no lot identity, so it cannot say which parcel was sold, and therefore
+ * cannot classify short versus long term at all.
+ *
+ * A SELL's realized gain here is `proceeds − (avg cost at the time of sale ×
+ * qty)`. The average cost is tracked as the ledger is walked, because it moves
  * with every subsequent BUY — computing it from today's `Holding.averageCost`
  * would price a 2024 sale at a 2026 cost basis.
- *
- * FIFO would be the other defensible choice and would give a different number
- * on a book with multiple lots. Average cost is used because it is what
- * `Holding.averageCost` already represents, so the two cannot disagree.
  */
 export function realizedGain(ledger: LedgerRow[]): number {
   const lots = new Map<string, { qty: number; cost: number }>();

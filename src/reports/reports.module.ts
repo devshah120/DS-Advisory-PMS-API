@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { ReportsService } from './reports.service';
+import { CapitalGainsService } from './capital-gains.service';
 import { ReportsController } from './reports.controller';
 import { PrismaModule } from '../common/prisma/prisma.module';
 import { PortfolioReconstructionModule } from '../portfolio-reconstruction/portfolio-reconstruction.module';
@@ -11,7 +12,7 @@ import { FeeCloseScheduler } from './fee-close.scheduler';
   // valued from. It already exports it for this exact use.
   imports: [PrismaModule, PortfolioReconstructionModule],
   controllers: [ReportsController],
-  providers: [ReportsService, FeeCloseScheduler],
-  exports: [ReportsService],
+  providers: [ReportsService, CapitalGainsService, FeeCloseScheduler],
+  exports: [ReportsService, CapitalGainsService],
 })
 export class ReportsModule {}
