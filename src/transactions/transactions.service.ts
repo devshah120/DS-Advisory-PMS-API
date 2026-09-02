@@ -155,6 +155,31 @@ export class TransactionsService {
     return { success: true, id };
   }
 
+  /**
+   * Deletes many rows in one statement, keeping only those the caller owns.
+   *
+   * Deliberately NOT all-or-nothing: the relation filter silently drops ids that
+   * are absent or in another manager's book, and the caller is told how many
+   * actually went. Rejecting the whole batch on one stale id would mean a row
+   * deleted in another tab makes the rest of the selection undeletable.
+   *
+   * `deleted` is therefore the count the UI must trust when reconciling its
+   * state — not `ids.length`.
+   */
+  async removeMany(ids: string[], actor: Actor) {
+    // Duplicate ids in the payload would inflate nothing (deleteMany counts
+    // rows, not ids), but they do bloat the IN list for no gain.
+    const unique = [...new Set(ids)];
+
+    const { count } = await this.prisma.transaction.deleteMany({
+      where: { id: { in: unique }, ...relatedClientWhere(actor) },
+    });
+
+    if (count === 0) throw new NotFoundException('No matching transactions found');
+
+    return { success: true, requested: unique.length, deleted: count };
+  }
+
   async getClientCashFlow(clientId: string, actor: Actor) {
     return this.prisma.transaction.findMany({
       where: {
