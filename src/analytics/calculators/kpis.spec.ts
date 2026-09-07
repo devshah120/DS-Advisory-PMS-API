@@ -66,7 +66,7 @@ describe('derivedCash', () => {
 /**
  * The regression test for the worst bug this engine has produced so far.
  *
- * The live "Atlas Global Fund" was imported from the workbook with its four
+ * The live "GGC Global Fund" was imported from the workbook with its four
  * deposits ($188,780) and its eighteen holdings ($191,837) — and NO buy rows,
  * because the workbook's XIRR sheet only ever recorded cash flows.
  *

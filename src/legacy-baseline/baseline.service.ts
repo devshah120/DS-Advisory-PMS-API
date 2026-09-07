@@ -12,7 +12,7 @@ export interface AutoSeedSummary {
 
 /**
  * The Legacy Portfolio Baseline: the immutable opening position imported for
- * a client before Atlas started recording transactions.
+ * a client before the system started recording transactions.
  *
  * Deliberately has no `update()`. A baseline is a one-time import — every
  * downstream calculation (PortfolioReconstructionService, the performance
@@ -84,7 +84,7 @@ export class BaselineService {
   }
 
   /**
-   * Builds a baseline for `clientId` from data already in Atlas, instead of
+   * Builds a baseline for `clientId` from data already in the system, instead of
    * requiring hand-typed holdings: current `Holding` rows, valued at their
    * `baselineDate` close (falls back to the holding's own `averageCost` when
    * no price bar exists for that date — the identical fallback order

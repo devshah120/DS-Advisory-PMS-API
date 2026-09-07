@@ -38,7 +38,7 @@ export class WorkbookImportService {
 
   constructor(private prisma: PrismaService) {}
 
-  async import(filePath: string, clientName = 'Atlas Global Fund'): Promise<ImportSummary> {
+  async import(filePath: string, clientName = 'GGC Global Fund'): Promise<ImportSummary> {
     const wb = XLSX.readFile(filePath);
     const warnings: string[] = [];
 
@@ -185,6 +185,9 @@ export class WorkbookImportService {
           data: {
             name: clientName,
             broker: 'Interactive Brokers',
+            // Retains the interim product name: this is the identifier the
+            // seeded import row already carries in the database, and changing it
+            // would orphan that account rather than rename it.
             accountNumber: 'U-ATLAS-001',
             benchmark: 'S&P 500',
             benchmarkId: sp500?.id,

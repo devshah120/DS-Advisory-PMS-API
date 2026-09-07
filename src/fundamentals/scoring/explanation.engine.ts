@@ -21,7 +21,7 @@ const NOTABLE_PREMIUM_PERCENT = 15;
 
 /**
  * Turns a scored breakdown into the plain-English strengths/weaknesses list
- * the UI renders under a company's Atlas Fundamental Score. Entirely
+ * the UI renders under a company's GGC Fundamental Score. Entirely
  * derived from the SAME MetricScore/IndustryComparisonResult objects the
  * score itself was built from — there is no separate narrative logic that
  * could disagree with the number next to it, and no strategy-specific

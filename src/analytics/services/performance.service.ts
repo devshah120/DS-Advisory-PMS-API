@@ -259,7 +259,7 @@ export class PerformanceService {
      * This is stronger than the `meta.warnings` note, and deliberately so. When
      * the ledger records deposits but not the purchases they funded, the
      * cash-flow method's terminal value (holdings + cash) double-counts: the
-     * money appears once as stock and again as cash. On the live "Atlas Global
+     * money appears once as stock and again as cash. On the live "GGC Global
      * Fund" that yields +497% annualized against a true +12%.
      *
      * A warning printed beside a 497% return does not work. The number is the

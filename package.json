@@ -1,8 +1,8 @@
 {
-  "name": "atlas-pms-backend",
+  "name": "ggc-pms-backend",
   "version": "1.0.0",
-  "description": "Atlas PMS - Portfolio Management System Backend",
-  "author": "Atlas Team",
+  "description": "Giriraj Global Consultants - Portfolio Management System Backend",
+  "author": "Giriraj Global Consultants",
   "private": true,
   "license": "UNLICENSED",
   "scripts": {

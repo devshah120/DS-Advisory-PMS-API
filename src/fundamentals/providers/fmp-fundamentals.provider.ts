@@ -62,7 +62,7 @@ export class FmpFundamentalsProvider implements FundamentalsProvider {
 
     // FMP — unlike Finnhub — serves a profile for ETFs and commodity funds, so
     // without this guard a country/thematic ETF persists a row whose every
-    // metric is null and whose Atlas score therefore renders as 0. Nothing
+    // metric is null and whose GGC Fundamental Score therefore renders as 0. Nothing
     // downstream can tell that 0 apart from a genuinely bad company.
     if (isFundVehicle({ symbol, company: profile.companyName, industry: profile.industry, isEtf: profile.isEtf, isFund: profile.isFund })) {
       this.logger.debug(`Skipping ${symbol} — pooled vehicle (ETF/fund), no company fundamentals to score`);

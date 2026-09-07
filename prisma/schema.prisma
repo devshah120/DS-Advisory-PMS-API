@@ -291,7 +291,7 @@ model Client {
   feeRatePercent Float    @default(0)
   /// The mandate's actual start date, used to prorate the first (partial)
   /// billing quarter. NOT the same as createdAt, which is only when the
-  /// record was entered into Atlas PMS and may postdate real inception for
+  /// record was entered into Giriraj Global Consultants and may postdate real inception for
   /// backfilled clients. Defaults to createdAt's value at write time for
   /// clients created before this field existed.
   inceptionDate  DateTime @default(now())
@@ -940,7 +940,7 @@ model ScoringRule {
   @@map("scoring_rules")
 }
 
-/// One symbol's computed Atlas Fundamental Score under one strategy, cached so
+/// One symbol's computed GGC Fundamental Score under one strategy, cached so
 /// the watchlist doesn't re-run five pillars' worth of rule lookups on every
 /// render. Recomputed by the same daily refresh that pulls fresh snapshots,
 /// and on demand if a caller asks for a symbol/strategy pair with no cache row.
@@ -1148,7 +1148,7 @@ model AnalyticsCache {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// The immutable opening position for one client — what was imported before
-/// Atlas started recording transactions. Exactly one per client, and normally
+/// the system started recording transactions. Exactly one per client, and normally
 /// never touched again after creation: `@unique` on `clientId` is the database
 /// half of that guarantee, and BaselineService exposes no update method at all.
 /// The only path that can change a locked baseline is BaselineAdminService,

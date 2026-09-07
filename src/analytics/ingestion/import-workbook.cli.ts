@@ -15,7 +15,7 @@ async function main() {
 
   const filePath =
     process.argv[2] ?? 'c:/Users/dev shah/Downloads/New folder/Portfolio June 2026.xlsx';
-  const clientName = process.argv[3] ?? 'Atlas Global Fund';
+  const clientName = process.argv[3] ?? 'GGC Global Fund';
 
   const app = await NestFactory.createApplicationContext(AppModule, {
     logger: ['error', 'warn', 'log'],
