@@ -47,6 +47,38 @@ export class ReportsController {
     );
   }
 
+  /**
+   * The households this caller can invoice, for the fee page's selector.
+   *
+   * Declared BEFORE `fees/:clientId` for the same reason `fees/quarters` is —
+   * Nest matches in declaration order, so the parameterised route would
+   * otherwise swallow "families" as a client id.
+   */
+  @Get('fees/families')
+  invoiceableFamilies(@Req() req: AuthedRequest, @Query('market') market?: string) {
+    return this.reportsService.invoiceableFamilies(
+      req.user,
+      market ? parseMarket(market) : undefined,
+    );
+  }
+
+  /**
+   * One household's invoice for one quarter — the member fee lines plus the
+   * household total, ready to send to the family.
+   *
+   * The rows are the SAME ones each member's individual statement carries, so
+   * the two documents can never disagree. Also declared before
+   * `fees/:clientId`.
+   */
+  @Get('fees/family/:familyId')
+  familyInvoice(
+    @Param('familyId') familyId: string,
+    @Req() req: AuthedRequest,
+    @Query('quarter') quarter?: string,
+  ) {
+    return this.reportsService.familyInvoice(familyId, quarter, req.user);
+  }
+
   /** One client's fee for one quarter — what the per-client export downloads. */
   @Get('fees/:clientId')
   clientFee(

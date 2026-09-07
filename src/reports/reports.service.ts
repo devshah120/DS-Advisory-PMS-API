@@ -2,8 +2,8 @@ import { BadRequestException, Injectable, Logger, NotFoundException } from '@nes
 import { PrismaService } from '../common/prisma/prisma.service';
 import { PortfolioHistoryService } from '../portfolio-reconstruction/portfolio-history.service';
 import { INCEPTION_DATE } from '../analytics/calculators/flows';
-import { Market } from '../common/market-scope';
-import { Actor, clientWhere } from '../common/ownership-scope';
+import { Market, currencyForMarket } from '../common/market-scope';
+import { Actor, assertOwns, clientWhere, ownedWhere } from '../common/ownership-scope';
 
 export interface ClientFeeRow {
   clientId: string;
@@ -32,6 +32,66 @@ export interface ClientFeeRow {
    * was billed in rather than in whatever the viewer's selector happens to say.
    */
   currency: string;
+}
+
+/** One member account, unbillable for this quarter, and why. */
+export interface UnbilledMember {
+  clientId: string;
+  clientName: string;
+  reason: string;
+}
+
+/**
+ * A household's fee invoice for one quarter: the member fee rows verbatim,
+ * plus the totals a bill needs.
+ */
+export interface FamilyFeeInvoice {
+  familyId: string;
+  familyName: string;
+  market: string;
+  /** The single unit every figure below is in — a family lives in one book. */
+  currency: string;
+
+  quarter: string;
+  quarterLabel: string;
+  quarterStart: string;
+  quarterEnd: string;
+  /** True while the quarter is open: every line is an estimate, not a bill. */
+  isEstimate: boolean;
+
+  /**
+   * The billable member accounts, each row IDENTICAL to the one that client's
+   * own fee statement carries — see the service doc on why these are reused
+   * rather than recomputed.
+   */
+  lines: ClientFeeRow[];
+
+  /**
+   * Members that could not be billed this quarter, with the reason.
+   *
+   * Listed rather than silently dropped: a household invoice that quietly
+   * omits an account looks like a complete bill for the family and is not one,
+   * and the client is the party least able to detect the omission.
+   */
+  unbilled: UnbilledMember[];
+
+  totals: {
+    memberCount: number;
+    billedCount: number;
+    /** Σ of the member portfolio values the fee was charged on. */
+    portfolioValue: number;
+    /** THE invoice total — Σ of the member fee amounts, nothing re-derived. */
+    feeAmount: number;
+    /**
+     * The household's effective annual rate: feeAmount back-solved against the
+     * value and the days actually billed.
+     *
+     * Reported rather than assumed because members can sit on different rates
+     * and different proration, so no single member's rate describes the
+     * household. Null when nothing was billable to divide by.
+     */
+    effectiveAnnualRatePercent: number | null;
+  };
 }
 
 /** One entry in the quarter dropdown. */
@@ -325,6 +385,162 @@ export class ReportsService {
       );
     }
     return row;
+  }
+
+  /**
+   * One household's invoice for one quarter.
+   *
+   * The governing decision: this REUSES the per-client rows `feesForQuarter`
+   * already produced, and sums them. It does not recompute a fee from a
+   * combined portfolio value, and it does not apply a blended household rate.
+   *
+   * That matters because both documents go to the same people. A family
+   * invoice and the member's own fee statement are read side by side, and if
+   * the household bill were derived independently the two could differ by
+   * rounding — or, once members sit on different rates or different proration,
+   * by real money. Summing the exact rows the individual statements are built
+   * from makes disagreement structurally impossible rather than merely
+   * unlikely.
+   *
+   * It also means every guarantee `feesForQuarter` already provides carries
+   * over unchanged: a closed quarter is served from its frozen
+   * ClientFeeSchedule rows, so re-invoicing a household months later reports
+   * what was actually billed rather than what today's rates would produce.
+   */
+  async familyInvoice(
+    familyId: string,
+    quarter: string | undefined,
+    actor: Actor,
+  ): Promise<FamilyFeeInvoice> {
+    const family = await this.prisma.family.findUnique({
+      where: { id: familyId },
+      include: {
+        clients: {
+          select: { id: true, name: true, status: true, inceptionDate: true },
+          orderBy: { name: 'asc' },
+        },
+      },
+    });
+    // Same 404-for-absent-and-for-someone-else's rule the other family routes
+    // use: an invoice discloses the household's member roster and their values.
+    assertOwns(actor, family, 'Family');
+    if (!family) throw new NotFoundException(`Family ${familyId} not found`);
+
+    const code = quarter ?? currentQuarterCode(new Date());
+    const { start, end, label } = parseQuarterCode(code);
+    const isEstimate = utcDay(new Date()) <= end;
+
+    /**
+     * Scoped to the family's OWN book rather than to the caller's current
+     * market selector.
+     *
+     * A family lives in exactly one book (schema.prisma: Family.market), and
+     * its invoice must be denominated in that book's currency no matter which
+     * market the viewer happens to be looking at. Passing the viewer's
+     * selection here would let an INR household be invoiced while the UI sat
+     * on the US book, and the total would be a number in no currency at all.
+     */
+    const allRows = await this.feesForQuarter(code, family.market as Market, actor);
+    const byClient = new Map(allRows.map((r) => [r.clientId, r]));
+
+    const lines: ClientFeeRow[] = [];
+    const unbilled: UnbilledMember[] = [];
+
+    for (const member of family.clients) {
+      const row = byClient.get(member.id);
+      if (row) {
+        lines.push(row);
+        continue;
+      }
+
+      /**
+       * Absent from the fee run means one of two things, and the invoice says
+       * which. Both are legitimate; neither may be silently dropped, because a
+       * household bill missing an account still looks like a complete bill.
+       */
+      const reason =
+        member.status !== 'ACTIVE'
+          ? `Mandate is ${member.status.toLowerCase()} — not billed this quarter`
+          : utcDay(member.inceptionDate) > end
+            ? `Mandate began ${toIsoDate(utcDay(member.inceptionDate))}, after this quarter ended`
+            : 'Not billable for this quarter';
+
+      unbilled.push({ clientId: member.id, clientName: member.name, reason });
+    }
+
+    // Invoice lines read alphabetically, matching the fee table they are
+    // reconciled against. `feesForQuarter` already orders by name, but the
+    // family's member list drives the loop above, so sorting here keeps the
+    // order stable regardless of how the roster comes back.
+    lines.sort((a, b) => a.clientName.localeCompare(b.clientName));
+    unbilled.sort((a, b) => a.clientName.localeCompare(b.clientName));
+
+    const portfolioValue = lines.reduce((s, r) => s + r.portfolioValue, 0);
+    const feeAmount = lines.reduce((s, r) => s + r.feeAmount, 0);
+
+    /**
+     * The household's effective annual rate, back-solved from what was actually
+     * billed rather than averaged from the members' headline rates.
+     *
+     * fee = Σ(value × rate/4 × daysBilled/daysInQuarter), so recovering an
+     * annual rate means dividing by the value-weighted proration, not by the
+     * raw value — otherwise a household whose accounts were billed for half
+     * the quarter would report half its true rate. Null when there is no
+     * billed base to divide by.
+     */
+    const proratedBase = lines.reduce(
+      (s, r) => s + r.portfolioValue * (r.daysBilled / r.daysInQuarter),
+      0,
+    );
+    const effectiveAnnualRatePercent =
+      proratedBase > 0 ? (feeAmount / proratedBase) * 4 * 100 : null;
+
+    return {
+      familyId: family.id,
+      familyName: family.name,
+      market: family.market,
+      currency: currencyForMarket(family.market as Market),
+      quarter: code,
+      quarterLabel: label,
+      quarterStart: toIsoDate(start),
+      quarterEnd: toIsoDate(end),
+      isEstimate,
+      lines,
+      unbilled,
+      totals: {
+        memberCount: family.clients.length,
+        billedCount: lines.length,
+        portfolioValue,
+        feeAmount,
+        effectiveAnnualRatePercent,
+      },
+    };
+  }
+
+  /**
+   * The households the fee page can invoice, for its selector.
+   *
+   * Scoped by ownership and by book, and each carries the member count so the
+   * dropdown can read "Salecha Family · 4 accounts" without a second call.
+   */
+  async invoiceableFamilies(
+    actor: Actor,
+    market?: Market,
+  ): Promise<Array<{ id: string; name: string; memberCount: number }>> {
+    const families = await this.prisma.family.findMany({
+      where: {
+        ...(market ? { market } : {}),
+        ...ownedWhere(actor),
+      },
+      include: { clients: { select: { id: true } } },
+      orderBy: { name: 'asc' },
+    });
+
+    return families.map((f) => ({
+      id: f.id,
+      name: f.name,
+      memberCount: f.clients.length,
+    }));
   }
 }
 
