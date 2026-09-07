@@ -20,6 +20,8 @@ import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { HoldingsService } from './holdings.service';
 import { CreateHoldingDto } from './dto/create-holding.dto';
 import { UpdateHoldingDto } from './dto/update-holding.dto';
+import { SetSectorDto } from './dto/set-sector.dto';
+import { ClassificationService } from './classification.service';
 import { parseMarket } from '../common/market-scope';
 import { Actor } from '../common/ownership-scope';
 
@@ -40,7 +42,10 @@ interface UploadedExcel {
 @Controller('holdings')
 @UseGuards(JwtAuthGuard)
 export class HoldingsController {
-  constructor(private holdingsService: HoldingsService) {}
+  constructor(
+    private holdingsService: HoldingsService,
+    private classification: ClassificationService,
+  ) {}
 
   @Post()
   create(@Body() createHoldingDto: CreateHoldingDto, @Req() req: AuthedRequest) {
@@ -112,6 +117,37 @@ export class HoldingsController {
       throw new BadRequestException('Invalid date format. Use ISO format (YYYY-MM-DD)');
     }
     return this.holdingsService.getPortfolioAsOfDate(clientId, asOfDate, req.user);
+  }
+
+  /**
+   * Every symbol in the caller's book that still has no sector, largest
+   * exposure first, plus the sector vocabulary to choose from.
+   *
+   * Mounted above `@Get(':id')` so the literal segment is matched as a route
+   * rather than swallowed as a holding id.
+   */
+  @Get('classification/unclassified')
+  unclassified(@Req() req: AuthedRequest, @Query('market') market?: string) {
+    return this.classification.queue(
+      req.user,
+      market ? parseMarket(market) : undefined,
+    );
+  }
+
+  /**
+   * Classify one SYMBOL — not one holding row.
+   *
+   * The decision lands on InstrumentProfile, which every allocation reader
+   * already prefers over the Holding row, so it covers every account that holds
+   * the symbol today and every account that buys it later.
+   */
+  @Patch('classification/:symbol/sector')
+  setSector(
+    @Param('symbol') symbol: string,
+    @Body() dto: SetSectorDto,
+    @Req() req: AuthedRequest,
+  ) {
+    return this.classification.setSector(symbol, dto.sector, req.user);
   }
 
   @Get(':id')

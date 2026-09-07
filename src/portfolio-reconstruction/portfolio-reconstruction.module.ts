@@ -7,21 +7,29 @@ import { PortfolioReconstructionService } from './portfolio-reconstruction.servi
 import { PortfolioHistoryService } from './portfolio-history.service';
 import { PerformanceBaselineService } from './performance-baseline.service';
 import { BenchmarkHistoryService } from './benchmark-history.service';
+import { FamilyPerformanceService } from './family-performance.service';
 import { SnapshotScheduler } from './snapshot.scheduler';
 import { PortfolioHistoryController } from './portfolio-history.controller';
+import { FamilyPerformanceController } from './family-performance.controller';
 
 @Module({
   imports: [PrismaModule, MarketModule, LegacyBaselineModule, HistoricalPriceModule],
-  controllers: [PortfolioHistoryController],
+  controllers: [PortfolioHistoryController, FamilyPerformanceController],
   providers: [
     PortfolioReconstructionService,
     PortfolioHistoryService,
     PerformanceBaselineService,
     BenchmarkHistoryService,
+    FamilyPerformanceService,
     SnapshotScheduler,
   ],
   // Exported so a future Reports/export feature can consume the read paths
   // without re-declaring these as its own providers.
-  exports: [PortfolioReconstructionService, PortfolioHistoryService, PerformanceBaselineService],
+  exports: [
+    PortfolioReconstructionService,
+    PortfolioHistoryService,
+    PerformanceBaselineService,
+    FamilyPerformanceService,
+  ],
 })
 export class PortfolioReconstructionModule {}
