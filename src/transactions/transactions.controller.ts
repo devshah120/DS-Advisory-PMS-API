@@ -90,6 +90,20 @@ export class TransactionsController {
     return this.transactionsService.getRecentTransactions(clientId, req.user, days);
   }
 
+  /**
+   * The lot history behind one position. Declared above `@Get(':id')` for the
+   * same reason 'bulk-delete' is — a literal segment must be matched before the
+   * catch-all id param claims it.
+   */
+  @Get('client/:clientId/lots/:ticker')
+  findLots(
+    @Param('clientId') clientId: string,
+    @Param('ticker') ticker: string,
+    @Req() req: AuthedRequest
+  ) {
+    return this.transactionsService.findLots(clientId, ticker, req.user);
+  }
+
   @Get('client/:clientId/cashflow')
   getCashFlow(@Param('clientId') clientId: string, @Req() req: AuthedRequest) {
     return this.transactionsService.getClientCashFlow(clientId, req.user);

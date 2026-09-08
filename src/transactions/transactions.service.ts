@@ -132,6 +132,45 @@ export class TransactionsService {
     return rows.map(serialize);
   }
 
+  /**
+   * The dated lot history behind ONE position — every buy and sell of a single
+   * ticker in a single mandate, oldest first.
+   *
+   * Read off the ledger rather than the Holding row because the holding stores
+   * only running aggregates (quantity, averageCost): it knows the position is
+   * 39.89 shares at $162.95 average, but not that it was assembled from two
+   * fills. That breakdown only exists here.
+   *
+   * Ordered ASCENDING, unlike the blotter views above — this is read as the
+   * story of how a position was built, and a cost basis reads forwards.
+   * Unpaginated: a single name in a single account is a handful of rows, and
+   * partial lot history would misstate the cost basis it is used to explain.
+   *
+   * `relatedClientWhere` means an unowned clientId returns an empty list, so
+   * this leaks nothing about another manager's book.
+   */
+  async findLots(clientId: string, ticker: string, actor: Actor) {
+    const rows = await this.prisma.transaction.findMany({
+      where: {
+        clientId,
+        // Ownership merged into the same query, exactly as findByClient does:
+        // an unowned clientId then returns an empty list rather than another
+        // manager's fills, with no separate existence check to keep in step.
+        ...relatedClientWhere(actor),
+        // Tickers are upper-cased on every write path (the importer and the
+        // Add Position form both normalise), so match on the same casing
+        // rather than trusting whatever the querystring carried.
+        ticker: ticker.toUpperCase(),
+        // Only the trades that MOVE the position. A dividend or a fee against
+        // the same ticker is real, but it buys no shares — including it would
+        // put rows in a cost-basis table that contribute no cost and no basis.
+        type: { in: ['BUY', 'SELL'] },
+      },
+      orderBy: { date: 'asc' },
+    });
+    return rows.map(serialize);
+  }
+
   async findOne(id: string, actor: Actor) {
     const tx = await this.prisma.transaction.findFirst({
       where: { id, ...relatedClientWhere(actor) },
