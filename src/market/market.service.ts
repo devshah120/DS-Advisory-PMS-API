@@ -24,6 +24,13 @@ export interface DailyClose {
   close: number;
 }
 
+/** A security's move over the current session, against the prior session's close. */
+export interface DayChange {
+  currentPrice: number;
+  priorClose: number;
+  changePercent: number;
+}
+
 const YAHOO = 'https://query2.finance.yahoo.com';
 const REQUEST_TIMEOUT_MS = 6000;
 
@@ -44,6 +51,12 @@ export class MarketService {
   // ticker+fromDate can live a lot longer than the quote/classification cache.
   private readonly historyCache = new Map<string, { value: DailyClose[]; expiresAt: number }>();
   private static readonly HISTORY_CACHE_TTL_MS = 4 * 60 * 60 * 1000;
+
+  // Day changes move with the live price, so this expires far sooner than the
+  // daily-close cache — long enough to collapse the burst of identical lookups
+  // one dashboard load fires, short enough that the board stays current.
+  private readonly dayChangeCache = new Map<string, { value: DayChange; expiresAt: number }>();
+  private static readonly DAY_CHANGE_CACHE_TTL_MS = 60 * 1000;
 
   // `quoteSummary` requires a cookie+crumb pair; both are reusable for a while.
   private session: { cookie: string; crumb: string; expiresAt: number } | null = null;
@@ -118,7 +131,11 @@ export class MarketService {
     const bars: DailyClose[] = [];
     for (let i = 0; i < timestamps.length; i++) {
       const close = closes[i];
-      if (close == null) continue; // Yahoo emits a null bar for the still-open current session.
+      // A null close is usually the still-open current session, but Yahoo also
+      // drops whole settled sessions for thinly-traded symbols (common on .NS).
+      // Either way there is no close to record, so the bar is skipped here and
+      // any resulting gap is repaired below.
+      if (close == null) continue;
       bars.push({
         date: new Date(timestamps[i] * 1000).toISOString().slice(0, 10),
         close,
@@ -130,6 +147,64 @@ export class MarketService {
       expiresAt: Date.now() + MarketService.HISTORY_CACHE_TTL_MS,
     });
     return bars;
+  }
+
+  /**
+   * Today's price and the prior session's close, straight from Yahoo's quote
+   * metadata.
+   *
+   * Deriving a one-day move from the last two daily bars looks equivalent but
+   * is not: Yahoo silently omits whole settled sessions for thinly-traded
+   * symbols (routine on the NSE smallcaps this book holds), and the bars either
+   * side of that hole span several days. A multi-day move then gets reported as
+   * a one-day change, which is enough to seat a stock that fell today at the
+   * top of a gainers board. Asking for a 1-day range makes Yahoo resolve the
+   * previous close against its own calendar, so a missing bar can't shift it.
+   */
+  async dayChange(rawTicker: string): Promise<DayChange | null> {
+    const ticker = rawTicker.trim().toUpperCase();
+    if (!ticker) return null;
+
+    const cached = this.dayChangeCache.get(ticker);
+    if (cached && cached.expiresAt > Date.now()) return cached.value;
+
+    let data = await this.fetchJson(
+      `${YAHOO}/v8/finance/chart/${encodeURIComponent(ticker)}?range=1d&interval=1d`
+    );
+
+    // A BSE-only smallcap is often stored with the '.NS' suffix the rest of the
+    // Indian book uses, and Yahoo reports that symbol as delisted. Retrying on
+    // '.BO' is the same fallback `lookup` applies, and without it these holdings
+    // would silently vanish from the movers board rather than be ranked.
+    if (!data?.chart?.result?.[0]?.meta && ticker.endsWith('.NS')) {
+      data = await this.fetchJson(
+        `${YAHOO}/v8/finance/chart/${encodeURIComponent(`${ticker.slice(0, -3)}.BO`)}?range=1d&interval=1d`
+      );
+    }
+
+    const meta = data?.chart?.result?.[0]?.meta;
+    const price: unknown = meta?.regularMarketPrice;
+    const prior: unknown = meta?.chartPreviousClose;
+
+    // A zero/negative prior close would make the percentage meaningless, so
+    // treat it as missing and let the caller drop the row.
+    if (
+      typeof price !== 'number' || !Number.isFinite(price) ||
+      typeof prior !== 'number' || !Number.isFinite(prior) || prior <= 0
+    ) {
+      return null;
+    }
+
+    const value: DayChange = {
+      currentPrice: price,
+      priorClose: prior,
+      changePercent: ((price - prior) / prior) * 100,
+    };
+    this.dayChangeCache.set(ticker, {
+      value,
+      expiresAt: Date.now() + MarketService.DAY_CHANGE_CACHE_TTL_MS,
+    });
+    return value;
   }
 
   private fromFallback(ticker: string): LookupResult | null {

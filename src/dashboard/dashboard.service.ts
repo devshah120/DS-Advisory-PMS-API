@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../common/prisma/prisma.service';
-import { MarketService, DailyClose } from '../market/market.service';
+import { MarketService, DailyClose, DayChange } from '../market/market.service';
 import { HouseService } from '../analytics/services/house.service';
 import {
   DEFAULT_MARKET,
@@ -110,8 +110,8 @@ export class DashboardService {
     const holdings = await this.withLiveMarketValue(open);
     const totalAUM = holdings.reduce((sum, h) => sum + h.marketValue, 0);
     const totalCash = cashAgg._sum.cashBalance ?? 0;
-    const closesByTicker = await this.closesForTickers(holdings.map((h) => h.ticker));
-    const movers = this.dailyMovers(holdings, closesByTicker);
+    const dayChanges = await this.dayChangesForTickers(holdings.map((h) => h.ticker));
+    const movers = this.dailyMovers(holdings, dayChanges);
 
     return {
       // Echoed back so the UI formats this payload in the currency it was
@@ -139,8 +139,8 @@ export class DashboardService {
       // regardless of how many clients hold it, ranked by combined market value.
       topHoldings: this.topHoldingsByTicker(holdings, totalAUM),
       // Per-client day change, weighted by each client's own holdings — reuses
-      // the same closes fetched for movers so this doesn't double the Yahoo calls.
-      clientMovers: this.clientDailyMovers(holdings, clients, closesByTicker),
+      // the same day changes fetched for movers so this doesn't double the Yahoo calls.
+      clientMovers: this.clientDailyMovers(holdings, clients, dayChanges),
     };
   }
 
@@ -203,34 +203,32 @@ export class DashboardService {
       .sort((a, b) => b.marketValue - a.marketValue);
   }
 
-  /** Fetches recent daily closes for every distinct ticker, once, shared by movers and client movers. */
-  private async closesForTickers(tickers: string[]): Promise<Map<string, DailyClose[]>> {
+  /** Fetches the current session's move for every distinct ticker, once. */
+  private async dayChangesForTickers(tickers: string[]): Promise<Map<string, DayChange>> {
     const distinct = [...new Set(tickers)];
-    // A short window comfortably spans the last two trading days through any
-    // weekend/holiday gap without pulling a year of history per ticker.
-    const from = toIsoDate(daysAgo(10));
-
-    const closesByTicker = new Map<string, DailyClose[]>();
+    const byTicker = new Map<string, DayChange>();
     await Promise.all(
       distinct.map(async (ticker) => {
         try {
-          closesByTicker.set(ticker, await this.market.history(ticker, from));
+          const change = await this.market.dayChange(ticker);
+          if (change) byTicker.set(ticker, change);
         } catch {
-          closesByTicker.set(ticker, []);
+          // A ticker we can't price is left out of the map, and dailyMovers
+          // drops it rather than showing a fabricated 0%.
         }
       }),
     );
-    return closesByTicker;
+    return byTicker;
   }
 
   /**
-   * Day-over-day % change per ticker (today's close vs. the prior trading
+   * Day-over-day % change per ticker (the live price vs. the prior trading
    * day's close), ranked. One ticker held by multiple clients collapses
    * to a single row, so a widely-held name can't fill the board on its own.
    */
   private dailyMovers(
     holdings: Array<{ ticker: string; company: string; clientId: string; marketValue: number }>,
-    closesByTicker: Map<string, DailyClose[]>,
+    dayChanges: Map<string, DayChange>,
   ): HoldingMover[] {
     // Collapse to one row per ticker. The % move belongs to the security, not
     // to any one client's lot, so multiple holders would otherwise produce
@@ -245,18 +243,16 @@ export class DashboardService {
         continue;
       }
 
-      const bars = closesByTicker.get(h.ticker) ?? [];
-      if (bars.length < 2) continue;
-      const [prior, last] = bars.slice(-2);
-      if (prior.close === 0) continue;
+      const change = dayChanges.get(h.ticker);
+      if (!change) continue;
       byTicker.set(h.ticker, {
         ticker: h.ticker,
         displayTicker: displaySymbol(h.ticker),
         company: h.company,
         clientId: h.clientId,
         marketValue: h.marketValue,
-        currentPrice: last.close,
-        changePercent: ((last.close - prior.close) / prior.close) * 100,
+        currentPrice: change.currentPrice,
+        changePercent: change.changePercent,
       });
     }
 
@@ -273,20 +269,18 @@ export class DashboardService {
   private clientDailyMovers(
     holdings: Array<{ ticker: string; clientId: string; marketValue: number; quantity: number }>,
     clients: Array<{ id: string; name: string }>,
-    closesByTicker: Map<string, DailyClose[]>,
+    dayChanges: Map<string, DayChange>,
   ): ClientMover[] {
     const nameById = new Map(clients.map((c) => [c.id, c.name]));
     const byClient = new Map<string, { priorValue: number; currentValue: number }>();
 
     for (const h of holdings) {
-      const bars = closesByTicker.get(h.ticker) ?? [];
-      if (bars.length < 2) continue;
-      const [prior, last] = bars.slice(-2);
-      if (prior.close === 0) continue;
+      const change = dayChanges.get(h.ticker);
+      if (!change) continue;
 
       const entry = byClient.get(h.clientId) ?? { priorValue: 0, currentValue: 0 };
-      entry.priorValue += h.quantity * prior.close;
-      entry.currentValue += h.quantity * last.close;
+      entry.priorValue += h.quantity * change.priorClose;
+      entry.currentValue += h.quantity * change.currentPrice;
       byClient.set(h.clientId, entry);
     }
 
@@ -323,9 +317,22 @@ export class DashboardService {
     return Promise.all(
       all.map(async (entry) => {
         try {
-          const bars = await this.market.history(entry.symbol, from);
-          const currentPrice = bars.length > 0 ? bars[bars.length - 1].close : null;
-          return { ...entry, currentPrice, ...changeFromBars(bars, ytdBase) };
+          // The YTD base still needs the full series, but the day change comes
+          // from the quote metadata: a gap in the daily bars would otherwise
+          // turn a multi-day move into today's headline number.
+          const [bars, change] = await Promise.all([
+            this.market.history(entry.symbol, from),
+            this.market.dayChange(entry.symbol).catch((): DayChange | null => null),
+          ]);
+          const currentPrice =
+            change?.currentPrice ?? (bars.length > 0 ? bars[bars.length - 1].close : null);
+          const { dayChangePercent, ytdChangePercent } = changeFromBars(bars, ytdBase);
+          return {
+            ...entry,
+            currentPrice,
+            dayChangePercent: change ? change.changePercent : dayChangePercent,
+            ytdChangePercent,
+          };
         } catch {
           return { ...entry, currentPrice: null, dayChangePercent: null, ytdChangePercent: null };
         }
