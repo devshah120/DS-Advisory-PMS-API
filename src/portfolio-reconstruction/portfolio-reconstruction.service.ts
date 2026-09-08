@@ -270,19 +270,126 @@ export class PortfolioReconstructionService {
         return 0;
 
       case 'SPLIT':
-      case 'BONUS': {
-        // Corporate actions change share count, not cash or cost basis total —
-        // t.quantity here is the ADDITIONAL shares received (matches how the
-        // Transactions module already records a bonus/split entry).
+      case 'BONUS':
+      case 'REVERSE_SPLIT':
+      case 'SPINOFF':
+      case 'MERGER':
+      case 'ACQUISITION':
+      case 'DELISTING_SETTLEMENT': {
+        /**
+         * Corporate actions change share count, not cash or cost basis total —
+         * t.quantity here is the DELTA shares (matches how the Transactions
+         * module already records a bonus/split entry, and how the Corporate
+         * Action Engine's processors write every share-moving row).
+         *
+         * Negative deltas are expected and correct: a reverse split, a merger
+         * closing the outgoing position, and a delisting all reduce the count.
+         * A merger's incoming leg arrives as a separate positive row stamped
+         * with the NEW ticker, which is why this one branch handles both sides
+         * without needing to know which is which.
+         *
+         * Cost basis total is deliberately untouched for all of these. That is
+         * what preserves the economic value of the position through a split
+         * (200 shares at half the average cost is the same $10,000) and what
+         * stops a corporate action manufacturing a return — see the Corporate
+         * Action Engine's schema note.
+         *
+         * A row for a ticker this replay has not seen creates the position at
+         * zero cost. That is the spin-off and merger case: the client received
+         * shares they never bought, and until the issuer publishes a basis
+         * allocation, zero is the honest figure rather than an invented one.
+         */
         if (!t.ticker || !t.quantity) return 0;
         const existing = positions.get(t.ticker);
-        if (existing) existing.quantity += t.quantity;
+        if (existing) {
+          existing.quantity += t.quantity;
+        } else if (t.quantity > 0) {
+          positions.set(t.ticker, {
+            ticker: t.ticker,
+            quantity: t.quantity,
+            costBasisTotal: 0,
+            currency: 'USD',
+            sector: 'Unclassified',
+            industry: 'Unclassified',
+            country: 'Unknown',
+          });
+        }
+        return 0;
+      }
+
+      case 'SPECIAL_DIVIDEND':
+      case 'CASH_IN_LIEU':
+        // Real money arriving, exactly like an ordinary DIVIDEND. Cash rises;
+        // no shares move and no basis changes.
+        addCash(Math.abs(t.amount));
+        return 0;
+
+      case 'RETURN_OF_CAPITAL':
+        /**
+         * Cash arrives AND the position's cost basis falls by the same amount
+         * — the company is handing back capital, not paying income. Floored at
+         * zero: once basis is exhausted the excess is a capital gain, which
+         * needs tax-lot treatment the Corporate Action Engine flags for manual
+         * handling rather than guessing at here.
+         */
+        addCash(Math.abs(t.amount));
+        if (t.ticker) {
+          const existing = positions.get(t.ticker);
+          if (existing) {
+            existing.costBasisTotal = Math.max(
+              0,
+              existing.costBasisTotal - Math.abs(t.amount),
+            );
+          }
+        }
+        return 0;
+
+      case 'RIGHTS_SUBSCRIPTION': {
+        // The client paid to take up rights: cash out, shares in at the
+        // subscription price. This one IS a purchase in all but name.
+        if (!t.ticker || !t.quantity) {
+          addCash(-Math.abs(t.amount));
+          return 0;
+        }
+        const existing = positions.get(t.ticker);
+        if (existing) {
+          existing.quantity += t.quantity;
+          existing.costBasisTotal += Math.abs(t.amount);
+        } else {
+          positions.set(t.ticker, {
+            ticker: t.ticker,
+            quantity: t.quantity,
+            costBasisTotal: Math.abs(t.amount),
+            currency: 'USD',
+            sector: 'Unclassified',
+            industry: 'Unclassified',
+            country: 'Unknown',
+          });
+        }
+        addCash(-Math.abs(t.amount));
         return 0;
       }
 
       case 'TRANSFER':
         // Changes custody, not money or shares held for this reconstruction's
         // purposes — no cash, cost basis, or quantity effect.
+        return 0;
+
+      case 'RIGHTS_ENTITLEMENT':
+      case 'TICKER_CHANGE':
+      case 'CORPORATE_ACTION':
+        /**
+         * Deliberately inert.
+         *
+         * RIGHTS_ENTITLEMENT records an OPTION the client holds, not shares
+         * they own — adding its figure to a quantity would invent a position.
+         * TICKER_CHANGE is a relabelling with no economic content. Bare
+         * CORPORATE_ACTION rows are explanatory (a basis reallocation note),
+         * and any cash they carry is booked by the specific row beside them.
+         *
+         * Listed explicitly rather than falling through to `default` so that a
+         * reader can see these were considered and are meant to do nothing.
+         */
         return 0;
 
       default:

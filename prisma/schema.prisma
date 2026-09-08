@@ -319,6 +319,10 @@ model Client {
   /// future billing only, never a quarter already closed.
   feeSchedules ClientFeeSchedule[]
 
+  /// Every corporate action that has touched this mandate — one row per action
+  /// applied, never deleted (see CorporateActionLedger).
+  corporateActionLedger CorporateActionLedger[]
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -429,6 +433,20 @@ model Transaction {
   @@map("transactions")
 }
 
+/// Ledger row kinds.
+///
+/// The first nine values predate the Corporate Action Engine and their replay
+/// semantics in PortfolioReconstructionService are load-bearing for Historical
+/// Reports and Performance — none of them may change meaning.
+///
+/// Everything from CORPORATE_ACTION down is written ONLY by a corporate-action
+/// processor. They share one rule that separates them from BUY/SELL: a
+/// corporate action is not a trade. Where such a row carries `quantity` it is
+/// the ADDITIONAL (delta) share count, never the post-action total, and its
+/// `amount` is 0 unless real cash moved. That convention is what lets the
+/// existing replay treat a split as economically neutral — quantity rises,
+/// cost basis total does not, so average cost falls out arithmetically and no
+/// artificial return is created (see PART 26/52 of the engine spec).
 enum TransactionType {
   BUY
   SELL
@@ -439,6 +457,34 @@ enum TransactionType {
   CASH_DEPOSIT
   CASH_WITHDRAWAL
   FEES
+
+  // ── Corporate-action rows ────────────────────────────────────────────────
+  /// Umbrella kind for an action with no more specific row type.
+  CORPORATE_ACTION
+  /// Share-count decrease from a reverse split. `quantity` is NEGATIVE delta.
+  REVERSE_SPLIT
+  SPECIAL_DIVIDEND
+  /// Rights ACCRUED to the holder. Carries no shares and no cash — it records
+  /// an entitlement the client may or may not take up (PART 16).
+  RIGHTS_ENTITLEMENT
+  /// The client actually subscribed: cash out, shares in.
+  RIGHTS_SUBSCRIPTION
+  /// Shares of a NEW security received from a parent. Zero cost unless a
+  /// basis-allocation policy is configured.
+  SPINOFF
+  /// Share leg of a merger/acquisition — the outgoing position is closed and
+  /// the incoming one opened at carried-over basis.
+  MERGER
+  ACQUISITION
+  /// Symbol relabelling only. Never changes quantity, basis or cash; exists so
+  /// the ledger shows WHY a symbol differs either side of a date (PART 19).
+  TICKER_CHANGE
+  /// Cash paid for a fractional entitlement that could not be issued (PART 11).
+  CASH_IN_LIEU
+  DELISTING_SETTLEMENT
+  /// Cash distribution / return of capital (PART 15 cash leg, PART 16 of the
+  /// action list). Return of capital reduces basis rather than booking income.
+  RETURN_OF_CAPITAL
 }
 
 model Research {
@@ -702,12 +748,34 @@ model InstrumentProfile {
   /// overwrite a considered manual decision.
   reviewedAt DateTime?
 
+  // ── Security-master identity (Corporate Action Engine, PART 46) ───────────
+  //
+  // A ticker is not an identity: it changes at a rename, and it is REUSED by
+  // unrelated issuers afterwards. Corporate actions therefore reference this
+  // row's `id` where one exists, and these codes are what let a profile
+  // survive its own symbol changing.
+  //
+  // All optional, and deliberately so. InstrumentProfile is populated by the
+  // workbook importer and so today covers the US book alone — every Indian
+  // symbol is absent. A REQUIRED identifier here would make an Indian
+  // corporate action unstorable, which is why CorporateAction.securityId is a
+  // soft reference and `symbol` remains the resolution key that always works.
+  /// 12-character ISIN, the globally unique instrument identifier.
+  isin String?
+  /// 9-character CUSIP. North America only; null for Indian listings.
+  cusip String?
+  /// Symbols this instrument previously traded under, appended by
+  /// TickerChangeProcessor. Lets a historical row written as 'FB' still resolve
+  /// to the profile now called 'META' without rewriting accounting history.
+  previousSymbols String[] @default([])
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@index([sector])
   @@index([region])
   @@index([market])
+  @@index([isin])
   @@map("instrument_profiles")
 }
 
@@ -1320,6 +1388,45 @@ model AppSetting {
   /// testing. Surfaced as a badge next to the key on the settings screen.
   razorpayMode String @default("test")
 
+  // ── Corporate Action Engine settings (PART 44) ────────────────────────────
+  // On the existing singleton rather than a new collection: these are firm-wide
+  // operational policy, exactly like the fields above, and a second
+  // one-row table would be duplicate functionality of the kind PART 57 warns
+  // against.
+  //
+  /// Master switch for unattended processing (PART 34). FALSE by default and
+  /// deliberately so: the first implementation detects and queues, and a human
+  /// clears the data-quality gate. Turning this on lets the scheduler process
+  /// actions that clear BOTH the confidence threshold and validation.
+  caAutoProcessEnabled Boolean @default(false)
+
+  /// PART 33's threshold. 90 admits official filings, exchange sources and
+  /// primary APIs, and excludes secondary (75) and unverified (40) feeds.
+  caMinimumConfidenceScore Int @default(90)
+
+  /// 'RETAIN' keeps fractional shares on the holding (the broker supports
+  /// them); 'CASH_IN_LIEU' rounds DOWN to whole shares and settles the
+  /// remainder in cash; 'ROUND_DOWN' drops the fraction with no compensation.
+  /// Whichever applies, the fraction is always recorded on the ledger row —
+  /// PART 11's "never round silently" is not a policy option.
+  caFractionalSharePolicy String @default("RETAIN")
+
+  /// How cash-in-lieu is priced when the policy calls for it: 'MARKET_PRICE'
+  /// values the fraction at the holding's current price, 'COST_BASIS' at its
+  /// average cost. Ignored when the fractional policy is RETAIN.
+  caCashInLieuPolicy String @default("MARKET_PRICE")
+
+  /// Provider identifiers in descending priority (PART 5/32). The first entry
+  /// that reports an event wins the `source` field; later ones are merged in
+  /// as secondary references.
+  caSourcePriority String[] @default(["company_ir", "sec", "exchange", "fmp", "finnhub"])
+
+  /// Whether a detected action raises a UI notification (PART 53).
+  caNotificationEnabled Boolean @default(true)
+
+  /// UTC hour (0-23) the daily scheduler sweep runs at (PART 34/44).
+  caProcessingHourUtc Int @default(2)
+
   /// Who last touched these values, for the "Last updated" line. A plain id
   /// with no relation: the audit line must survive that user being deleted,
   /// and a FK with a cascade would erase the very record we want to keep.
@@ -1394,4 +1501,334 @@ model SubscriptionPayment {
   @@index([userId])
   @@index([status])
   @@map("subscription_payments")
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// CORPORATE ACTION ENGINE
+//
+// Three collections, one direction of dependency:
+//
+//   CorporateAction  (the EVENT — one row per real-world corporate event)
+//        │
+//        ├─> CorporateActionLedger  (the EFFECT — one row per client affected)
+//        │
+//        └─> CorporateActionAuditLog (the RECORD — who did what, append-only)
+//
+// ── The load-bearing design decision ────────────────────────────────────────
+//
+// This engine does NOT own a holdings-history table, and that omission is the
+// most important thing about it. PortfolioReconstructionService already
+// rebuilds any past date by replaying Transaction rows onto a baseline, and it
+// already treats SPLIT/BONUS as delta-quantity, zero-cash, zero-cost-basis
+// events. So a processor's job is to write ONE correctly-shaped Transaction
+// row per client and update the CURRENT Holding — after which:
+//
+//   * a report for a date BEFORE the ex-date replays without that row and sees
+//     the old quantity (PART 24/41),
+//   * a report AFTER it replays with the row and sees the new quantity,
+//   * historical PortfolioValuation snapshots are never touched (PART 25/50),
+//   * performance shows no artificial return, because quantity rose while cost
+//     basis total and cash both stayed put (PART 26/52).
+//
+// Building a parallel holdings-history table would have duplicated that replay
+// and created two answers to "what did this client own on 30-Jun". There is
+// one answer, and it is the ledger.
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// One real-world corporate event, deduplicated across every provider that
+/// reported it (PART 3).
+///
+/// Identity is `fingerprint`, not the provider's id: two feeds reporting the
+/// same APH 2:1 split must converge on ONE row carrying TWO sources, never two
+/// rows that each half-process the same event. See corporate-action.dedupe.ts.
+model CorporateAction {
+  id String @id @default(cuid()) @map("_id")
+
+  /// Soft reference to InstrumentProfile.id — NOT a Prisma relation.
+  ///
+  /// A hard FK would reject every Indian corporate action, because
+  /// InstrumentProfile is populated by the US workbook importer and has no row
+  /// for RELIANCE.NS. Null here is normal and is not a data error; `symbol`
+  /// below is the identifier that always resolves.
+  securityId String?
+  /// Canonical Yahoo-style symbol ('AAPL' / 'RELIANCE.NS'), normalised through
+  /// normalizeSymbol() so it joins directly against Holding.ticker.
+  symbol String
+  /// Company name as reported at announcement — kept even after a rename, so
+  /// the action reads correctly against the name in force at the time.
+  company String?
+  /// Which book the symbol trades in, derived by marketForSymbol().
+  market Market @default(US)
+
+  actionType CorporateActionType
+
+  // ── Dates (PART 3) ────────────────────────────────────────────────────────
+  // Every one is optional except `effectiveDate`, because feeds are genuinely
+  // incomplete and refusing to STORE a partially-dated action would mean
+  // losing the only warning the desk gets. The validator decides which dates a
+  // given action type actually requires before it may be PROCESSED.
+  announcementDate DateTime?
+  declarationDate  DateTime?
+  recordDate       DateTime?
+  exDate           DateTime?
+  /// The date the action takes effect on holdings. Required: it is the date
+  /// the ledger row is stamped with and therefore the hinge the whole
+  /// before/after history turns on.
+  effectiveDate DateTime
+  paymentDate   DateTime?
+  /// When this engine actually applied it. Null until PROCESSED.
+  processingDate DateTime?
+
+  // ── Ratio (PART 6) ────────────────────────────────────────────────────────
+  /// '1:2' is stored oldRatio=1, newRatio=2 and means each 1 old share becomes
+  /// 2 new ones. '3:2' is oldRatio=3, newRatio=2. The multiplier applied to a
+  /// quantity is always newRatio/oldRatio, for forward and reverse alike —
+  /// there is no separate reverse-split formula, only a ratio below 1.
+  oldRatio Float?
+  newRatio Float?
+
+  // ── Cash (PART 13/15/18/22) ───────────────────────────────────────────────
+  /// Per-share cash for dividends/distributions, or the per-old-share cash
+  /// component of a merger. NOT a total — totals are per-client and live on
+  /// the ledger.
+  cashAmount Float?
+  currency   String?
+
+  // ── Target security, for actions that create or replace one ───────────────
+  newSecurityId String?
+  newSymbol     String?
+  newCompany    String?
+
+  // ── Type-specific payload ─────────────────────────────────────────────────
+  /// Fields only some action types carry: rights (subscriptionRatio,
+  /// subscriptionPrice, subscriptionStart, subscriptionEnd), spin-off
+  /// (distributionRatio), exchange change (oldExchange, newExchange),
+  /// delisting (reason, cashSettlement, replacementSymbol), merger
+  /// (exchangeRatio, cashPerShare).
+  ///
+  /// Json rather than 20 mostly-null columns: a new action type is then a new
+  /// processor plus an enum value, with no migration — which is what PART 1's
+  /// "must allow additional types later" actually requires.
+  details Json?
+
+  // ── Provenance (PART 5) ───────────────────────────────────────────────────
+  /// The WINNING source's identifier — the highest-priority feed that reported
+  /// this event. Denormalised from `sources` so the review grid sorts without
+  /// unpacking Json.
+  source          String
+  sourceUrl       String?
+  sourceReference String?
+  /// Every source that reported this event, primary first (PART 7's merge
+  /// result). Shape: [{ source, tier, url, reference, fetchedAt, payload }].
+  /// Never overwritten on a re-fetch — appended to, so provenance accumulates.
+  sources Json?
+
+  status CorporateActionStatus @default(DETECTED)
+
+  /// 0-100 (PART 33). Derived from the winning source's tier and degraded by
+  /// missing fields or cross-source disagreement.
+  confidenceScore Int @default(0)
+
+  /// Set when two sources report materially different figures for the same
+  /// event (PART 32). Blocks automatic processing outright, whatever the
+  /// confidence score says.
+  hasConflict Boolean @default(false)
+  /// Human-readable description of the disagreement, shown in the Review
+  /// Center. Shape: [{ field, values: [{ source, value }] }].
+  conflicts Json?
+
+  /// Deterministic dedupe key over (symbol, type, the dates that identify the
+  /// event, ratio) — see fingerprintOf(). Unique: the database, not
+  /// application logic, is what makes a double-import impossible.
+  fingerprint String @unique
+
+  /// Validation findings from the last validate() run. Shape:
+  /// [{ code, severity, message }]. Kept even after a pass so the Review
+  /// Center can show warnings that did not block.
+  validationErrors Json?
+  validatedAt      DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  createdBy  String?
+  approvedBy String?
+  approvedAt DateTime?
+  /// Why it was rejected, for the audit trail and the grid's tooltip.
+  rejectionReason String?
+
+  notes String?
+
+  ledger CorporateActionLedger[]
+
+  @@index([symbol])
+  @@index([status])
+  @@index([actionType])
+  @@index([effectiveDate])
+  @@index([market])
+  @@index([status, effectiveDate])
+  @@map("corporate_actions")
+}
+
+/// Every corporate action this engine knows how to represent (PART 1).
+///
+/// Adding a type here plus a processor registered against it is the entire
+/// extension path — no migration, because `details` absorbs type-specific
+/// fields and MongoDB has no enum constraint to alter.
+enum CorporateActionType {
+  STOCK_SPLIT
+  REVERSE_SPLIT
+  BONUS_ISSUE
+  SPECIAL_DIVIDEND
+  DIVIDEND
+  STOCK_DIVIDEND
+  RIGHTS_ISSUE
+  SPIN_OFF
+  MERGER
+  ACQUISITION
+  TICKER_CHANGE
+  NAME_CHANGE
+  EXCHANGE_CHANGE
+  DELISTING
+  CASH_DISTRIBUTION
+  RETURN_OF_CAPITAL
+}
+
+/// PART 4. The only transitions the service permits are:
+///
+///   DETECTED -> PENDING_VALIDATION -> VALIDATED -> PENDING_APPROVAL
+///                                  \> REJECTED    -> APPROVED -> PROCESSING
+///                                                             -> PROCESSED
+///                                                             \> FAILED
+///
+/// FAILED is re-runnable (PART 36 says "after fixing the error, re-run the
+/// entire corporate action"); PROCESSED is terminal and idempotent.
+enum CorporateActionStatus {
+  DETECTED
+  PENDING_VALIDATION
+  VALIDATED
+  PENDING_APPROVAL
+  APPROVED
+  PROCESSING
+  PROCESSED
+  REJECTED
+  CANCELLED
+  FAILED
+}
+
+/// One client's realised exposure to one corporate action — the audit trail of
+/// what actually changed (PART 23). Never deleted, including on a re-run:
+/// a failed attempt's row is UPDATED in place rather than replaced, so the
+/// error that occurred stays visible next to the eventual success.
+///
+/// `@@unique([corporateActionId, clientId])` is the idempotency key (PART 37).
+/// Enforcing it in the database rather than with an application-level "have I
+/// run this already?" check is deliberate: two concurrent process() calls
+/// racing each other cannot both pass a read-then-write guard, but they cannot
+/// both satisfy a unique index.
+model CorporateActionLedger {
+  id                String          @id @default(cuid()) @map("_id")
+  corporateActionId String
+  corporateAction   CorporateAction @relation(fields: [corporateActionId], references: [id], onDelete: Cascade)
+
+  clientId String
+  client   Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  /// The book this client's mandate sits in. Denormalised so the ledger can be
+  /// reported on without joining Client.
+  portfolioId String?
+
+  securityId String?
+  symbol     String
+
+  quantityBefore Float
+  quantityAfter  Float
+
+  averageCostBefore Float
+  averageCostAfter  Float
+
+  marketValueBefore Float
+  marketValueAfter  Float
+
+  /// Positive = cash INTO the portfolio (dividend, cash-in-lieu), negative =
+  /// cash out (a rights subscription the client took up).
+  cashImpact Float  @default(0)
+  currency   String @default("USD")
+
+  /// Fractional entitlement that could not be issued as whole shares, before
+  /// any cash-in-lieu settlement (PART 11). Zero when the policy retains
+  /// fractions or none arose. Recorded even when settled, so "never round
+  /// silently" is provable from the data.
+  fractionalShares Float @default(0)
+
+  /// The Transaction rows this ledger entry created, so a re-run or an
+  /// investigation can find them without guessing by date+ticker.
+  transactionIds String[] @default([])
+
+  processedAt DateTime @default(now())
+
+  status       CorporateActionLedgerStatus @default(PENDING)
+  errorMessage String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([corporateActionId, clientId])
+  @@index([corporateActionId])
+  @@index([clientId])
+  @@index([symbol])
+  @@map("corporate_action_ledger")
+}
+
+enum CorporateActionLedgerStatus {
+  /// Computed in a preview but not yet applied.
+  PENDING
+  APPLIED
+  FAILED
+  /// Applied, then reversed. Retained rather than deleted (PART 23).
+  REVERSED
+}
+
+/// Append-only record of every state change and every processing run (PART 43).
+///
+/// Separate from CorporateActionLedger because the two answer different
+/// questions: the ledger says what a CLIENT'S POSITION became, this says what a
+/// PERSON did. A rejection, a validation failure, or an approval that was never
+/// processed all belong here and have no ledger row at all.
+model CorporateActionAuditLog {
+  id String @id @default(cuid()) @map("_id")
+
+  /// Plain id, not a relation: the audit line must survive its action being
+  /// deleted, and a cascade would erase precisely the record worth keeping.
+  corporateActionId String
+
+  /// 'DETECTED' | 'VALIDATED' | 'APPROVED' | 'REJECTED' | 'PROCESSED' |
+  /// 'FAILED' | 'RECONCILED' | 'MERGED_SOURCE' | 'SETTINGS_CHANGED' | ...
+  action String
+
+  /// Who. Null for scheduler-driven entries, which are stamped actorLabel
+  /// 'system' instead — a null user with a label is honest about automation in
+  /// a way that attributing it to a service account would not be.
+  userId     String?
+  actorLabel String @default("system")
+
+  /// State either side of the change, as JSON. For a processing run this is
+  /// the aggregate (total shares before/after); per-client detail lives in the
+  /// ledger.
+  beforeValue Json?
+  afterValue  Json?
+
+  source String?
+  /// Present only where the request carried one — the existing Session model
+  /// captures IP for logins, and this mirrors that where available (PART 43).
+  ipAddress String?
+  userAgent String?
+
+  reason String?
+
+  createdAt DateTime @default(now())
+
+  @@index([corporateActionId])
+  @@index([action])
+  @@index([createdAt])
+  @@map("corporate_action_audit_log")
 }

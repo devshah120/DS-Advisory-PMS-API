@@ -148,10 +148,66 @@ const CASH_FLOW_TYPES = new Set(['CASH_DEPOSIT', 'CASH_WITHDRAWAL']);
  * they change the share count, not the money, and their `amount` column is not a
  * cash figure.
  */
-const TRANSACTIONAL_TYPES = new Set(['BUY', 'SELL', 'DIVIDEND', 'FEES']);
+const TRANSACTIONAL_TYPES = new Set([
+  'BUY',
+  'SELL',
+  'DIVIDEND',
+  'FEES',
+
+  /**
+   * ── Corporate-action rows that ARE real cash ─────────────────────────────
+   *
+   * Added with the Corporate Action Engine. Membership of this set is decided
+   * by ONE question: did money actually cross into or out of the portfolio?
+   *
+   * These three did. A special dividend is a dividend by another name; cash in
+   * lieu is a real payment for a fraction that could not be issued; a delisting
+   * settlement is the buyout proceeds for a cancelled position. Each is money
+   * that arrived and is not captured by any BUY or SELL, which is exactly the
+   * test the DIVIDEND and FEES entries above already pass.
+   *
+   * Every OTHER corporate-action type is deliberately absent — SPLIT,
+   * REVERSE_SPLIT, BONUS, SPINOFF, MERGER, TICKER_CHANGE, RIGHTS_ENTITLEMENT,
+   * CORPORATE_ACTION. They change share counts or labels, not money, and their
+   * processors write `amount: 0` precisely so that including them would be
+   * harmless — but they are kept out regardless, because a set that says what
+   * it means is worth more than one that relies on the data being right.
+   *
+   * This is what PART 26/52 of the engine spec reduces to in code: a 2-for-1
+   * split generates no flow, so a portfolio that went from 100 x $160 to
+   * 200 x $80 reports ~0%, not +100%.
+   *
+   * RETURN_OF_CAPITAL is the interesting omission. It IS real cash arriving,
+   * but it is not a return — it is the client's own capital handed back, and
+   * the replay reduces cost basis by the same amount. Counting it as a
+   * transactional inflow would report a gain on money that was never earned.
+   */
+  'SPECIAL_DIVIDEND',
+  'CASH_IN_LIEU',
+  'DELISTING_SETTLEMENT',
+
+  /**
+   * Cash OUT: the client paid the subscription price to take up rights. It is
+   * a purchase in all but name, and appears in OUTFLOW_TYPES below to get the
+   * negative sign. Both memberships are required — `isFlowType` gates on this
+   * set first, so a type listed only as an outflow would be dropped before its
+   * sign was ever applied.
+   *
+   * Note RIGHTS_ENTITLEMENT is NOT here: an unexercised right is an option, and
+   * no money has moved.
+   */
+  'RIGHTS_SUBSCRIPTION',
+]);
 
 /** Types whose `amount` represents money leaving the client's pocket. */
-const OUTFLOW_TYPES = new Set(['CASH_DEPOSIT', 'BUY', 'FEES']);
+const OUTFLOW_TYPES = new Set([
+  'CASH_DEPOSIT',
+  'BUY',
+  'FEES',
+  // The client paid the subscription price to take up rights — cash out, in
+  // exchange for shares. Economically a purchase, and treated as one.
+  'RIGHTS_SUBSCRIPTION',
+]);
 
 /**
  * The brief makes dividends and fees OPTIONAL under the transactional method,
