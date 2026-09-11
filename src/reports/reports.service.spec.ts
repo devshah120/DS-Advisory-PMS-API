@@ -3,11 +3,18 @@ import { PrismaService } from '../common/prisma/prisma.service';
 import { PortfolioHistoryService } from '../portfolio-reconstruction/portfolio-history.service';
 
 /**
- * These cover the two things that decide what a client is actually charged:
- * which quarter a code resolves to, and how many days of it are billable.
+ * These cover the things that decide what a client is actually charged: which
+ * quarter a code resolves to, how many days of it are billable, and — since
+ * fees moved onto deployed capital — that capital put to work mid-quarter is
+ * billed only for the days it was at work.
+ *
  * The proration bug class this guards against is the one that made a
  * mid-quarter read show "36 / 92" — correct for an estimate, wrong for a
  * closed quarter, which must always bill the full days it was open.
+ *
+ * Note the history mock now supplies the quarter's OPENING value rather than a
+ * closing one: the fee prorates forward from the start of the quarter, so that
+ * is the figure the service asks for.
  */
 describe('ReportsService', () => {
   const clientRow = {
@@ -16,7 +23,6 @@ describe('ReportsService', () => {
     feeRatePercent: 2,
     inceptionDate: new Date(Date.UTC(2026, 5, 30)), // 30 Jun 2026
     status: 'ACTIVE',
-    holdings: [{ marketValue: 1_000_000 }],
   };
 
   function build(overrides: {
@@ -24,11 +30,14 @@ describe('ReportsService', () => {
     stored?: any[];
     snapshot?: any;
     created?: any[];
+    /** BUY/SELL rows inside the quarter. Default: an untraded book. */
+    ledger?: any[];
   } = {}) {
     const created: any[] = overrides.created ?? [];
 
     const prisma = {
       client: { findMany: jest.fn().mockResolvedValue(overrides.clients ?? [clientRow]) },
+      transaction: { findMany: jest.fn().mockResolvedValue(overrides.ledger ?? []) },
       clientFeeSchedule: {
         findMany: jest.fn().mockResolvedValue(overrides.stored ?? []),
         create: jest.fn(async ({ data }: any) => {
@@ -78,7 +87,7 @@ describe('ReportsService', () => {
       jest.useRealTimers();
     });
 
-    it('bills the FULL quarter and values it on the quarter-end snapshot', async () => {
+    it('bills the FULL quarter on an untraded book', async () => {
       const { service, created } = build();
       const rows = await service.feesForQuarter('Q3-CY26');
 
@@ -95,9 +104,46 @@ describe('ReportsService', () => {
       // 1.2m * (2% / 4) * (92/92) = 6,000
       expect(row.feeAmount).toBeCloseTo(6_000, 6);
 
-      // …and the first read freezes it.
+      // …and the first read freezes it, breakdown included.
       expect(created).toHaveLength(1);
       expect(created[0]).toMatchObject({ quarter: 'Q3-CY26', feeAmount: row.feeAmount });
+      expect(created[0].openingValue).toBe(1_200_000);
+      expect(created[0].segments).toHaveLength(1);
+    });
+
+    /**
+     * THE CASE THE PRORATION EXISTS FOR, at the service level.
+     *
+     * 500k deployed on 11 Sep is at work for 20 of the quarter's 92 days. The
+     * old basis billed closing NAV flat and would have charged the full 2,500.
+     */
+    it('bills capital deployed mid-quarter only for the days it was at work', async () => {
+      const { service } = build({
+        ledger: [{ type: 'BUY', amount: 500_000, date: new Date(Date.UTC(2026, 8, 11)) }],
+      });
+      const [row] = await service.feesForQuarter('Q3-CY26');
+
+      const opening = 1_200_000 * 0.005; // full quarter
+      const deployed = 500_000 * 0.005 * (20 / 92); // 11–30 Sep inclusive
+
+      expect(row.feeAmount).toBeCloseTo(opening + deployed, 6);
+      expect(row.feeAmount).toBeLessThan(opening + 500_000 * 0.005);
+      expect(row.openingValue).toBe(1_200_000);
+      // The base charged against is opening + deployed capital.
+      expect(row.portfolioValue).toBeCloseTo(1_700_000, 6);
+      expect(row.segments.map((s) => s.kind)).toEqual(['opening', 'flow']);
+    });
+
+    it('does not bill the 1-July bulk-import artifacts as fresh deployment', async () => {
+      const { service } = build({
+        // The legacy book, imported as BUYs stamped 1 Jul — inside Q3.
+        ledger: [{ type: 'BUY', amount: 1_200_000, date: new Date(Date.UTC(2026, 6, 1)) }],
+      });
+      const [row] = await service.feesForQuarter('Q3-CY26');
+
+      // Charged once, on the opening value — not twice.
+      expect(row.feeAmount).toBeCloseTo(6_000, 6);
+      expect(row.segments).toHaveLength(1);
     });
 
     it('prorates a mandate that began mid-quarter', async () => {
@@ -111,7 +157,7 @@ describe('ReportsService', () => {
       expect(row.feeAmount).toBeCloseTo(1_200_000 * 0.005 * (61 / 92), 6);
     });
 
-    it('falls back to reconstruction when no quarter-end snapshot was written', async () => {
+    it('falls back to reconstruction when no opening snapshot was written', async () => {
       const { service } = build({ snapshot: null });
       const [row] = await service.feesForQuarter('Q3-CY26');
 
@@ -148,6 +194,8 @@ describe('ReportsService', () => {
             quarterEnd: new Date(Date.UTC(2026, 8, 30)),
             feeRatePercent: 2, // what was actually billed
             portfolioValue: 1_200_000,
+            openingValue: null,
+            segments: null,
             daysBilled: 92,
             daysInQuarter: 92,
             feeAmount: 6_000,
@@ -164,10 +212,43 @@ describe('ReportsService', () => {
       // An already-frozen quarter must never be re-written.
       expect(created).toHaveLength(0);
     });
+
+    /**
+     * Rows frozen before segmented proration shipped carry no breakdown. They
+     * must still READ — the invoice they represent was really issued — and
+     * must not fabricate segments they were never billed on.
+     */
+    it('reads a pre-proration frozen row without inventing a breakdown', async () => {
+      const { service } = build({
+        stored: [
+          {
+            clientId: 'c1',
+            quarter: 'Q3-CY26',
+            quarterLabel: 'Q3 CY26',
+            quarterStart: new Date(Date.UTC(2026, 6, 1)),
+            quarterEnd: new Date(Date.UTC(2026, 8, 30)),
+            feeRatePercent: 2,
+            portfolioValue: 1_200_000,
+            openingValue: null,
+            segments: null,
+            daysBilled: 92,
+            daysInQuarter: 92,
+            feeAmount: 6_000,
+            valuationSource: 'snapshot',
+          },
+        ],
+      });
+
+      const [row] = await service.feesForQuarter('Q3-CY26');
+
+      expect(row.feeAmount).toBe(6_000);
+      expect(row.segments).toEqual([]);
+      expect(row.openingValue).toBeNull();
+    });
   });
 
   describe('feesForQuarter — open quarter', () => {
-    it('estimates on live value, bills only elapsed days, and stores nothing', async () => {
+    it('bills only elapsed days and stores nothing', async () => {
       const { service, created } = build();
       jest.useFakeTimers().setSystemTime(new Date(Date.UTC(2026, 7, 5))); // 5 Aug 2026, mid-Q3
 
@@ -175,12 +256,32 @@ describe('ReportsService', () => {
         const [row] = await service.feesForQuarter('Q3-CY26');
 
         expect(row.isEstimate).toBe(true);
-        expect(row.valuationSource).toBe('live');
-        expect(row.portfolioValue).toBe(1_000_000); // live holdings, not the snapshot
         // 1 Jul – 5 Aug inclusive = 31 + 5 = 36 of 92 — the figure the desk saw.
         expect(row.daysBilled).toBe(36);
         expect(row.daysInQuarter).toBe(92);
+        expect(row.feeAmount).toBeCloseTo(1_200_000 * 0.005 * (36 / 92), 6);
         expect(created).toHaveLength(0); // an open quarter is never frozen
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    /**
+     * An estimate must never bill days that have not happened. A buy made
+     * today has worked for exactly one day, not for the rest of the quarter.
+     */
+    it('bills a deployment made today for a single day', async () => {
+      const { service } = build({
+        ledger: [{ type: 'BUY', amount: 500_000, date: new Date(Date.UTC(2026, 7, 5)) }],
+      });
+      jest.useFakeTimers().setSystemTime(new Date(Date.UTC(2026, 7, 5))); // 5 Aug
+
+      try {
+        const [row] = await service.feesForQuarter('Q3-CY26');
+
+        const opening = 1_200_000 * 0.005 * (36 / 92);
+        const deployed = 500_000 * 0.005 * (1 / 92);
+        expect(row.feeAmount).toBeCloseTo(opening + deployed, 6);
       } finally {
         jest.useRealTimers();
       }

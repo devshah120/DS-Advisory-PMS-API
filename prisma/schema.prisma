@@ -286,8 +286,12 @@ model Client {
   notes          String?
 
   /// Annual management fee, as a percent (e.g. 2 for 2%). Billed quarterly at
-  /// feeRatePercent / 4 of quarter-end portfolio value. Defaulted for clients
-  /// created before this field existed; required on create going forward.
+  /// feeRatePercent / 4, prorated over capital actually deployed: the opening
+  /// book bills for the whole quarter, and capital put to work mid-quarter
+  /// bills only for its remaining days. A BUY on day 80 of a 92-day quarter is
+  /// charged 12 days, not the full quarter — see fee-proration.ts for the
+  /// method and why quarter-end NAV alone could not express it. Defaulted for
+  /// clients created before this field existed; required on create going forward.
   feeRatePercent Float    @default(0)
   /// The mandate's actual start date, used to prorate the first (partial)
   /// billing quarter. NOT the same as createdAt, which is only when the
@@ -1305,11 +1309,31 @@ model ClientFeeSchedule {
   /// Copied from Client at close, NOT read through the relation. See the note
   /// above: the client's rate may since have changed.
   feeRatePercent Float
-  /// The quarter-end NAV the fee was charged on, per the Client model's stated
-  /// basis ("quarterly at feeRatePercent / 4 of quarter-end portfolio value").
+  /// The capital the fee was charged against: opening book plus net capital
+  /// deployed during the quarter. NOT simply quarter-end NAV — market movement
+  /// on already-billed capital does not change the base, only client
+  /// deployment does. See AnalyticsCalculators/fee-proration.ts.
   portfolioValue Float
 
-  /// Billable days, prorated from the later of (quarter start, inception).
+  /// Portfolio value at the quarter's start, before this quarter's trades.
+  /// The base the first fee segment bills on. Nullable: rows frozen before
+  /// segmented proration shipped have no opening figure to report, and a 0
+  /// there would read as "the book was empty" rather than "not recorded".
+  openingValue Float?
+
+  /// Why the fee is the number it is: one entry per billed component — the
+  /// opening book, then each day capital was net deployed or withdrawn —
+  /// each carrying its amount, days billed and resulting fee. See FeeSegment.
+  ///
+  /// Frozen with the row rather than recomputed on read, for the same reason
+  /// feeRatePercent is copied: the ledger behind a closed quarter can still be
+  /// corrected afterwards, and an issued invoice must always explain the
+  /// amount that was actually billed. Nullable for pre-proration rows.
+  segments Json?
+
+  /// Billable days for the OPENING book, prorated from the later of
+  /// (quarter start, inception). Capital deployed later carries its own
+  /// day-count inside `segments` — this field does not describe it.
   daysBilled   Int
   daysInQuarter Int
   feeAmount    Float

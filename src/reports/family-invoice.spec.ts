@@ -13,9 +13,16 @@ interface MemberSpec {
   id: string;
   name: string;
   feeRatePercent: number;
+  /**
+   * The member's book at the START of the quarter — the base the fee prorates
+   * from. Was a live holdings total before fees moved onto deployed capital;
+   * now it is what `valueAsOf(quarter start - 1 day)` resolves to.
+   */
   marketValue: number;
   inceptionDate: Date;
   status?: string;
+  /** BUY/SELL rows inside the quarter. Absent means an untraded book. */
+  ledger?: Array<{ type: string; amount: number; date: Date }>;
 }
 
 function build(members: MemberSpec[], opts: { familyMarket?: string } = {}) {
@@ -27,10 +34,14 @@ function build(members: MemberSpec[], opts: { familyMarket?: string } = {}) {
     status: m.status ?? 'ACTIVE',
     currency: 'INR',
     market: opts.familyMarket ?? 'INDIA',
-    holdings: [{ marketValue: m.marketValue }],
   }));
 
+  const byClient = new Map(members.map((m) => [m.id, m]));
+
   const prisma = {
+    transaction: {
+      findMany: jest.fn(async ({ where }: any) => byClient.get(where.clientId)?.ledger ?? []),
+    },
     family: {
       findUnique: jest.fn().mockResolvedValue({
         id: 'fam1',
@@ -55,9 +66,19 @@ function build(members: MemberSpec[], opts: { familyMarket?: string } = {}) {
     },
   } as unknown as PrismaService;
 
+  /**
+   * The opening book each member carried into the quarter. The fee now bills
+   * this, plus whatever the ledger deployed on top of it, rather than a live
+   * holdings total — so the member's value has to arrive through the history
+   * service that resolves it.
+   */
   const history = {
-    getSnapshot: jest.fn().mockResolvedValue(null),
-    getPortfolioAsOf: jest.fn().mockResolvedValue({ portfolioValue: 0 }),
+    getSnapshot: jest.fn(async (clientId: string) => ({
+      totalValue: byClient.get(clientId)?.marketValue ?? 0,
+    })),
+    getPortfolioAsOf: jest.fn(async (clientId: string) => ({
+      portfolioValue: byClient.get(clientId)?.marketValue ?? 0,
+    })),
   } as unknown as PortfolioHistoryService;
 
   return { service: new ReportsService(prisma, history), prisma };

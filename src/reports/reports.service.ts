@@ -1,7 +1,12 @@
 import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { PortfolioHistoryService } from '../portfolio-reconstruction/portfolio-history.service';
 import { INCEPTION_DATE } from '../analytics/calculators/flows';
+import {
+  FeeSegment,
+  computeProratedFee,
+} from '../analytics/calculators/fee-proration';
 import { Market, currencyForMarket } from '../common/market-scope';
 import { Actor, assertOwns, clientWhere, ownedWhere } from '../common/ownership-scope';
 
@@ -9,7 +14,18 @@ export interface ClientFeeRow {
   clientId: string;
   clientName: string;
   feeRatePercent: number;
+  /**
+   * The capital the fee was charged against: opening book plus net capital
+   * deployed during the quarter. Not quarter-end NAV — see computeFee.
+   */
   portfolioValue: number;
+  /** Portfolio value at the quarter's start. Null on pre-proration frozen rows. */
+  openingValue: number | null;
+  /**
+   * Why the fee is the number it is, one entry per billed component. Empty on
+   * frozen rows predating segmented proration — those carry only a total.
+   */
+  segments: FeeSegment[];
   /** Canonical quarter code, e.g. "Q3-CY26". Matches periods.ts's vocabulary. */
   quarter: string;
   quarterLabel: string;
@@ -184,7 +200,10 @@ export class ReportsService {
         // one list, so narrowing it narrows every fee surface at once.
         ...(actor ? clientWhere(actor) : {}),
       },
-      include: { holdings: true },
+      // Holdings are no longer loaded: the live-value sum they fed was the old
+      // single-NAV basis. The prorated fee reads the quarter's opening value
+      // and its BUY/SELL ledger instead, so pulling every holding of every
+      // client on a firm-wide fee run is pure waste.
       orderBy: { name: 'asc' },
     });
 
@@ -216,7 +235,7 @@ export class ReportsService {
           currency: client.currency,
         },
         { code, label, start, end },
-        { isClosed, liveValue: client.holdings.reduce((sum, h) => sum + h.marketValue, 0), asOf: today },
+        { isClosed, asOf: today },
       );
 
       if (isClosed) {
@@ -229,83 +248,106 @@ export class ReportsService {
   }
 
   /**
-   * Builds one client's fee for one quarter.
+   * Builds one client's fee for one quarter, prorated over deployed capital.
    *
-   * For a CLOSED quarter the value is the quarter-end NAV, per the billing
-   * basis stated on the Client model. It is read from the quarter-end
-   * PortfolioValuation snapshot; if the scheduler never wrote one for that
-   * date, PortfolioHistoryService.getPortfolioAsOf replays it from the
-   * baseline instead, so a missed snapshot degrades the audit trail
-   * (valuationSource says so) but never blocks the export.
+   * THE BASIS. The opening book bills for the whole quarter; capital deployed
+   * mid-quarter bills only for the days it was actually at work. A BUY on the
+   * 11th of September in a 92-day quarter is charged 20 days, not 92 — which
+   * the previous basis (quarter-end NAV x rate/4) could not express, because a
+   * single closing number carries no information about WHEN the money arrived.
+   * The arithmetic lives in fee-proration.ts; this method's job is to assemble
+   * its three inputs.
    *
-   * For an OPEN quarter there is no quarter-end value to read, so today's live
-   * holdings total stands in as a running estimate.
+   * THE OPENING VALUE is the portfolio at quarter start, read from that day's
+   * snapshot or replayed from the baseline. Note this is the day BEFORE the
+   * quarter opens: a trade on day one must count as a flow, not be silently
+   * folded into the opening book and billed for the full quarter.
+   *
+   * THE FLOWS are BUY and SELL rows — the TRANSACTIONAL method, the same
+   * ledger the client's XIRR is measured on. The client is billed on capital
+   * at work, consistent with how the manager's own return is computed. Cash
+   * handed over but not yet deployed is not billed until it is put to work.
+   *
+   * For an OPEN quarter there is no quarter-end to bill to, so segments run to
+   * today and the row is flagged an estimate.
    */
   private async computeFee(
     client: { id: string; name: string; feeRatePercent: number; inceptionDate: Date; currency: string },
     quarter: { code: string; label: string; start: Date; end: Date },
-    ctx: { isClosed: boolean; liveValue: number; asOf: Date },
+    ctx: { isClosed: boolean; asOf: Date },
   ): Promise<ClientFeeRow> {
-    let portfolioValue = ctx.liveValue;
-    let valuationSource = 'live';
-
-    if (ctx.isClosed) {
-      const resolved = await this.quarterEndValue(client.id, quarter.end);
-      portfolioValue = resolved.value;
-      valuationSource = resolved.source;
-    }
-
-    const daysInQuarter = diffDays(quarter.start, quarter.end) + 1;
-
-    // Bill from the later of (quarter start, inception): a mandate that began
-    // mid-quarter owes only the days it actually existed for. A closed quarter
-    // runs to quarter end; an open one runs to today.
-    const billingStart =
-      utcDay(client.inceptionDate) > quarter.start ? utcDay(client.inceptionDate) : quarter.start;
     const billingEnd = ctx.isClosed ? quarter.end : utcDay(ctx.asOf);
 
-    const daysBilled = Math.min(Math.max(0, diffDays(billingStart, billingEnd) + 1), daysInQuarter);
-    const proration = daysBilled / daysInQuarter;
+    // The day before the quarter opens — see the note above on why day-one
+    // trades must remain visible as flows.
+    const openingAsOf = new Date(quarter.start.getTime() - MS_PER_DAY);
+    const opening = await this.valueAsOf(client.id, openingAsOf);
+
+    const ledger = await this.prisma.transaction.findMany({
+      where: {
+        clientId: client.id,
+        date: { gte: quarter.start, lte: endOfDay(billingEnd) },
+        type: { in: ['BUY', 'SELL'] },
+      },
+      select: { type: true, amount: true, date: true },
+    });
+
+    const prorated = computeProratedFee({
+      openingValue: opening.value,
+      ledger,
+      feeRatePercent: client.feeRatePercent,
+      quarterStart: quarter.start,
+      quarterEnd: quarter.end,
+      inceptionDate: client.inceptionDate,
+      billingEnd,
+    });
 
     return {
       clientId: client.id,
       clientName: client.name,
       feeRatePercent: client.feeRatePercent,
-      portfolioValue,
+      portfolioValue: prorated.billableValue,
+      openingValue: prorated.openingValue,
+      segments: prorated.segments,
       quarter: quarter.code,
       quarterLabel: quarter.label,
       quarterStart: toIsoDate(quarter.start),
       quarterEnd: toIsoDate(quarter.end),
-      daysBilled,
-      daysInQuarter,
+      daysBilled: prorated.daysBilled,
+      daysInQuarter: prorated.daysInQuarter,
       isEstimate: !ctx.isClosed,
-      feeAmount: portfolioValue * (client.feeRatePercent / 100 / 4) * proration,
-      valuationSource,
+      feeAmount: prorated.feeAmount,
+      valuationSource: opening.source,
       currency: client.currency,
     };
   }
 
   /**
-   * The quarter-end NAV, preferring the stored snapshot and falling back to a
-   * replay. Returns 0 (source 'unavailable') rather than throwing when the
-   * client has no baseline to replay from — one unbillable client must not
-   * fail the whole firm's fee run.
+   * Portfolio value on a given date, preferring the stored snapshot and
+   * falling back to a replay. Returns 0 (source 'unavailable') rather than
+   * throwing when the client has no baseline to replay from — one unbillable
+   * client must not fail the whole firm's fee run.
+   *
+   * Generalised from a quarter-END helper when proration arrived: the fee now
+   * needs the quarter's OPENING value as well, and two copies of the
+   * snapshot-then-replay fallback would eventually disagree about which
+   * sources are acceptable.
    */
-  private async quarterEndValue(
+  private async valueAsOf(
     clientId: string,
-    quarterEnd: Date,
+    date: Date,
   ): Promise<{ value: number; source: string }> {
-    const snapshot = await this.history.getSnapshot(clientId, quarterEnd);
+    const snapshot = await this.history.getSnapshot(clientId, date);
     if (snapshot) {
       return { value: snapshot.totalValue, source: 'snapshot' };
     }
 
     try {
-      const replayed = await this.history.getPortfolioAsOf(clientId, quarterEnd);
+      const replayed = await this.history.getPortfolioAsOf(clientId, date);
       return { value: replayed.portfolioValue, source: 'reconstruction' };
     } catch (error) {
       this.logger.warn(
-        `No quarter-end value for client=${clientId} at ${toIsoDate(quarterEnd)}: ` +
+        `No portfolio value for client=${clientId} at ${toIsoDate(date)}: ` +
           `${(error as Error).message}`,
       );
       return { value: 0, source: 'unavailable' };
@@ -331,6 +373,15 @@ export class ReportsService {
           quarterEnd: new Date(`${row.quarterEnd}T00:00:00.000Z`),
           feeRatePercent: row.feeRatePercent,
           portfolioValue: row.portfolioValue,
+          openingValue: row.openingValue,
+          // Frozen, not recomputed on read: the ledger behind a closed quarter
+          // can still be corrected afterwards, and an issued invoice must
+          // always explain the amount that was actually billed.
+          //
+          // Cast because Prisma's InputJsonValue does not accept an interface
+          // array — FeeSegment has no index signature. The shape is plain data
+          // (strings and numbers), so the round-trip through Json is lossless.
+          segments: row.segments as unknown as Prisma.InputJsonValue,
           daysBilled: row.daysBilled,
           daysInQuarter: row.daysInQuarter,
           feeAmount: row.feeAmount,
@@ -482,16 +533,29 @@ export class ReportsService {
      * The household's effective annual rate, back-solved from what was actually
      * billed rather than averaged from the members' headline rates.
      *
-     * fee = Σ(value × rate/4 × daysBilled/daysInQuarter), so recovering an
-     * annual rate means dividing by the value-weighted proration, not by the
-     * raw value — otherwise a household whose accounts were billed for half
-     * the quarter would report half its true rate. Null when there is no
-     * billed base to divide by.
+     * fee = Σ(amount × rate/4 × days/daysInQuarter) summed over every SEGMENT,
+     * so recovering an annual rate means dividing by the day-weighted base, not
+     * by the raw value — otherwise a household that deployed capital late in
+     * the quarter would report a rate far below its true one, because the fee
+     * was prorated but the divisor was not.
+     *
+     * Each member's segments carry their own day-counts, so the base is summed
+     * segment by segment. A row frozen before proration shipped has no
+     * segments; it falls back to its single portfolioValue × daysBilled, which
+     * is exactly the basis it was billed on. Null when there is no billed base.
      */
-    const proratedBase = lines.reduce(
-      (s, r) => s + r.portfolioValue * (r.daysBilled / r.daysInQuarter),
-      0,
-    );
+    const proratedBase = lines.reduce((s, r) => {
+      if (r.segments.length > 0) {
+        return (
+          s +
+          r.segments.reduce(
+            (inner, seg) => inner + seg.amount * (seg.days / r.daysInQuarter),
+            0,
+          )
+        );
+      }
+      return s + r.portfolioValue * (r.daysBilled / r.daysInQuarter);
+    }, 0);
     const effectiveAnnualRatePercent =
       proratedBase > 0 ? (feeAmount / proratedBase) * 4 * 100 : null;
 
@@ -548,6 +612,18 @@ function utcDay(d: Date): Date {
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
 }
 
+/**
+ * The last instant of a day, for an inclusive `lte` date bound.
+ *
+ * Ledger rows carry a real timestamp, not a midnight-normalised date. Bounding
+ * a query at `utcDay(end)` would drop every trade made during the final day —
+ * on an open quarter that is TODAY's trades, the ones most likely to be
+ * queried about.
+ */
+function endOfDay(d: Date): Date {
+  return new Date(utcDay(d).getTime() + MS_PER_DAY - 1);
+}
+
 /** Quarter q (1-4) of a year → [start, end] in UTC, end = last day of the quarter. */
 function quarterRange(q: number, year: number): { start: Date; end: Date } {
   const startMonth = (q - 1) * 3;
@@ -585,6 +661,8 @@ function fromStoredRow(
     clientId: string;
     feeRatePercent: number;
     portfolioValue: number;
+    openingValue: number | null;
+    segments: unknown;
     quarter: string;
     quarterLabel: string;
     quarterStart: Date;
@@ -603,6 +681,14 @@ function fromStoredRow(
     currency,
     feeRatePercent: row.feeRatePercent,
     portfolioValue: row.portfolioValue,
+    openingValue: row.openingValue,
+    /**
+     * Rows frozen before segmented proration shipped carry no breakdown. An
+     * empty list is the honest answer — the fee was billed on the old
+     * single-NAV basis and there are no segments to show. Callers render the
+     * total alone rather than inventing a breakdown that was never billed.
+     */
+    segments: Array.isArray(row.segments) ? (row.segments as FeeSegment[]) : [],
     quarter: row.quarter,
     quarterLabel: row.quarterLabel,
     quarterStart: toIsoDate(row.quarterStart),
