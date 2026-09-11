@@ -110,6 +110,55 @@ const DEPLOYMENT_TYPES = new Set(['BUY', 'SELL']);
 /** Money leaving the deployed book reduces the base it is billed on. */
 const SIGN: Record<string, number> = { BUY: +1, SELL: -1 };
 
+/**
+ * Drops the part of each BUY that merely spends cash the client had already
+ * handed over before the quarter began.
+ *
+ * WHY THIS IS NEEDED. The opening value is the whole portfolio — securities
+ * AND uninvested cash. So a client who funded in advance and deployed inside
+ * the quarter is represented twice: once as opening cash, once as the BUY that
+ * spends it. Billing both charges the same rupee twice.
+ *
+ * Buys are absorbed oldest-first, because that is the order the cash is
+ * actually spent in. Only the excess over the opening cash is new capital and
+ * bills as a flow. A BUY that lands exactly on the opening cash contributes
+ * nothing, which is correct: that money was already billed in the opening book.
+ *
+ * SELLs pass through untouched. A sale returns money to the cash sleeve rather
+ * than drawing it down, and the opening book it reduces was billed in full — so
+ * absorbing it would quietly re-bill capital the client no longer has invested.
+ *
+ * Pure, and separate from `computeProratedFee`, because "which rupees are new"
+ * is a different question from "how many days was each rupee at work", and the
+ * first is the one most likely to need revisiting.
+ */
+export function absorbPrefundedCash<T extends FeeLedgerEntry>(
+  ledger: T[],
+  openingCash: number,
+): FeeLedgerEntry[] {
+  if (!(openingCash > 0)) return ledger;
+
+  let remaining = openingCash;
+  const ordered = [...ledger].sort((a, b) => a.date.getTime() - b.date.getTime());
+  const out: FeeLedgerEntry[] = [];
+
+  for (const row of ordered) {
+    if (row.type !== 'BUY' || remaining <= 0) {
+      out.push(row);
+      continue;
+    }
+
+    const spent = Math.abs(row.amount);
+    const absorbed = Math.min(spent, remaining);
+    remaining -= absorbed;
+
+    const excess = spent - absorbed;
+    if (excess > 0) out.push({ ...row, amount: excess });
+  }
+
+  return out;
+}
+
 export function computeProratedFee(input: ProrationInput): ProratedFee {
   const {
     openingValue,

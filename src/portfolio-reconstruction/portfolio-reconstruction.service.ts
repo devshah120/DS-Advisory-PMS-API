@@ -3,7 +3,7 @@ import { PrismaService } from '../common/prisma/prisma.service';
 import { BaselineService } from '../legacy-baseline/baseline.service';
 import { HistoricalPriceService } from '../historical-price/historical-price.service';
 import { allocationBy } from '../analytics/calculators/weights';
-import { isImportArtifact } from '../analytics/calculators/flows';
+import { JUN30_REBASE_DATE, isImportArtifact } from '../analytics/calculators/flows';
 import { Classification, PortfolioSnapshot, Position } from '../analytics/calculators/types';
 import { ReconstructedPortfolio, ReconstructedPosition } from './types';
 
@@ -45,12 +45,42 @@ export class PortfolioReconstructionService {
     const client = await this.prisma.client.findUnique({ where: { id: clientId } });
     if (!client) throw new NotFoundException(`Client ${clientId} not found`);
 
-    const baselineRow = await this.baseline.findOrNull(clientId);
-    if (!baselineRow) {
-      throw new NotFoundException(
-        `Client ${clientId} has no Legacy Portfolio Baseline — nothing to reconstruct from.`,
-      );
-    }
+    /**
+     * An account opened after tracking began never had a legacy position to
+     * import, so it has no baseline and never will. That is not missing data —
+     * its opening position is KNOWN, and it is nothing: no holdings, no cash.
+     *
+     * Standing in an empty baseline is what makes such an account
+     * reconstructible on the ordinary path. Everything
+     * below then works unchanged: the replay starts from zero positions and
+     * zero cash and applies the account's real trades, so the day it buys its
+     * first stock is the day it stops being worth nothing. Refusing instead
+     * (the previous behaviour) took down every caller that has to value the
+     * account — most visibly a FAMILY, where one such member threw and left the
+     * whole household unmeasurable even though its correct contribution to the
+     * opening total is simply zero.
+     *
+     * The synthetic baseline is dated at the house tracking date, NOT at the
+     * account's `createdAt`. Using `createdAt` looks more precise and is the
+     * wrong choice: it trips the pre-baseline guard below for any window that
+     * opens before the account was created — exactly the common case, a
+     * quarter already under way when the account joins — which would refuse the
+     * very family measurement this change exists to allow. Anchoring at the
+     * house date is also the truthful statement: on 30-June this account held
+     * nothing, and so did every date between then and its first trade.
+     */
+    const baselineRow = (await this.baseline.findOrNull(clientId)) ?? {
+      baselineDate: JUN30_REBASE_DATE,
+      openingCash: 0,
+      holdings: [] as Array<{
+        ticker: string;
+        quantity: number;
+        averageCost: number;
+        currency: string;
+        sector: string;
+        industry: string;
+      }>,
+    };
 
     if (asOfDate < baselineRow.baselineDate) {
       throw new BadRequestException(

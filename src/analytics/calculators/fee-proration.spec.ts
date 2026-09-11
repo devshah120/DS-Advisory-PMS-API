@@ -1,4 +1,4 @@
-import { computeProratedFee, FeeLedgerEntry } from './fee-proration';
+import { absorbPrefundedCash, computeProratedFee, FeeLedgerEntry } from './fee-proration';
 
 const d = (iso: string) => new Date(`${iso}T00:00:00.000Z`);
 
@@ -29,6 +29,43 @@ const sell = (amount: number, iso: string): FeeLedgerEntry => ({
   type: 'SELL',
   amount,
   date: d(iso),
+});
+
+describe('absorbPrefundedCash', () => {
+  it('drops a buy funded entirely by opening cash', () => {
+    const out = absorbPrefundedCash([buy(500_000, '2026-07-02')], 500_000);
+    expect(out).toHaveLength(0);
+  });
+
+  it('keeps only the excess over opening cash', () => {
+    const out = absorbPrefundedCash([buy(800_000, '2026-07-02')], 500_000);
+    expect(out).toHaveLength(1);
+    expect(out[0].amount).toBeCloseTo(300_000, 6);
+  });
+
+  it('spends opening cash oldest-first across several buys', () => {
+    const out = absorbPrefundedCash(
+      [buy(300_000, '2026-07-02'), buy(400_000, '2026-08-01')],
+      500_000,
+    );
+
+    // 300k fully absorbed; 200k of the second buy absorbed, 200k billable.
+    expect(out).toHaveLength(1);
+    expect(out[0].date).toEqual(d('2026-08-01'));
+    expect(out[0].amount).toBeCloseTo(200_000, 6);
+  });
+
+  it('never absorbs a sell — that money was already billed', () => {
+    const out = absorbPrefundedCash([sell(400_000, '2026-08-01')], 500_000);
+    expect(out).toHaveLength(1);
+    expect(out[0].type).toBe('SELL');
+    expect(out[0].amount).toBeCloseTo(400_000, 6);
+  });
+
+  it('passes the ledger through untouched when there is no opening cash', () => {
+    const ledger = [buy(500_000, '2026-07-02')];
+    expect(absorbPrefundedCash(ledger, 0)).toEqual(ledger);
+  });
 });
 
 describe('computeProratedFee', () => {
@@ -190,6 +227,39 @@ describe('computeProratedFee', () => {
     });
 
     expect(r.feeAmount).toBeCloseTo(50_000, 2);
+  });
+
+  /**
+   * THE DOUBLE-BILLING CASE, from the live book.
+   *
+   * Mamta Jain opened Q3-CY26 with 24,96,749 of cash and no holdings, then
+   * bought exactly that on 2 July. Counting the buy as new capital charged the
+   * same money twice — 14,695 instead of 7,368.
+   */
+  it('does not bill pre-funded cash twice when it is deployed', () => {
+    const openingCash = 2_496_749;
+    const ledger = absorbPrefundedCash(
+      [buy(2_496_749, '2026-07-02'), buy(991_621.31, '2026-09-11')],
+      openingCash,
+    );
+
+    const r = computeProratedFee({
+      ...base,
+      feeRatePercent: 1.5,
+      inceptionDate: d('2026-07-02'),
+      billingEnd: d('2026-09-11'),
+      openingValue: openingCash,
+      ledger,
+    });
+
+    // The 2-July buy spends opening cash and adds nothing; only the 11-Sep
+    // deployment is new capital, billed for its single day.
+    const opening = openingCash * 0.00375 * (72 / 92);
+    const deployed = 991_621.31 * 0.00375 * (1 / 92);
+
+    expect(r.feeAmount).toBeCloseTo(opening + deployed, 2);
+    expect(r.feeAmount).toBeCloseTo(7_367.83, 0);
+    expect(r.segments.filter((s) => s.kind === 'flow')).toHaveLength(1);
   });
 
   it('reports segments that reconcile to the billed total', () => {

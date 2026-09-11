@@ -5,6 +5,7 @@ import { PortfolioHistoryService } from '../portfolio-reconstruction/portfolio-h
 import { INCEPTION_DATE } from '../analytics/calculators/flows';
 import {
   FeeSegment,
+  absorbPrefundedCash,
   computeProratedFee,
 } from '../analytics/calculators/fee-proration';
 import { Market, currencyForMarket } from '../common/market-scope';
@@ -292,9 +293,28 @@ export class ReportsService {
       select: { type: true, amount: true, date: true },
     });
 
+    /**
+     * Cash the client had already handed over before the quarter opened is NOT
+     * new capital when it is finally invested.
+     *
+     * The opening value counts the whole portfolio — securities AND uninvested
+     * cash. A client who funded before the quarter and deployed inside it
+     * therefore appears twice: once in the opening book as cash, and again as
+     * the BUY that spent it. Mamta Jain opened Q3 with 24,96,749 of cash and no
+     * holdings, then bought exactly that on 2 July — and was billed for it
+     * twice, doubling her fee.
+     *
+     * Buys are netted against that opening cash, oldest first, and only the
+     * excess counts as newly deployed capital. A SELL is never absorbed: it
+     * returns money to the cash sleeve rather than drawing it down, and the
+     * opening book it reduces was already billed in full.
+     */
+    const openingCash = await this.uninvestedCashAt(client.id, openingAsOf);
+    const billableLedger = absorbPrefundedCash(ledger, openingCash);
+
     const prorated = computeProratedFee({
       openingValue: opening.value,
-      ledger,
+      ledger: billableLedger,
       feeRatePercent: client.feeRatePercent,
       quarterStart: quarter.start,
       quarterEnd: quarter.end,
@@ -320,6 +340,29 @@ export class ReportsService {
       valuationSource: opening.source,
       currency: client.currency,
     };
+  }
+
+  /**
+   * The UNINVESTED cash inside the opening value, which a later BUY spends
+   * rather than adds to.
+   *
+   * Read through the same snapshot-then-replay path as the opening value
+   * itself, so the cash figure and the total it is part of always come from
+   * the same picture of the portfolio. Returns 0 when the portfolio cannot be
+   * valued — the opening value is then 0 too, and nothing is absorbed.
+   */
+  private async uninvestedCashAt(clientId: string, date: Date): Promise<number> {
+    const snapshot = await this.history.getSnapshot(clientId, date);
+    if (snapshot) return Math.max(0, snapshot.cashValue);
+
+    try {
+      const replayed = await this.history.getPortfolioAsOf(clientId, date);
+      return Math.max(0, replayed.cash);
+    } catch {
+      // valueAsOf has already logged this client's valuation failure; a second
+      // warning for the same cause would only make the fee run noisier.
+      return 0;
+    }
   }
 
   /**
