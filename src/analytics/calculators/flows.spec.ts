@@ -1,4 +1,11 @@
-import { buildFlows, isImportArtifact, totalContributed, totalWithdrawn, LedgerEntry } from './flows';
+import {
+  buildFlows,
+  buildWindowFlows,
+  isImportArtifact,
+  totalContributed,
+  totalWithdrawn,
+  LedgerEntry,
+} from './flows';
 import { xirr } from './xirr';
 
 const d = (s: string) => new Date(s);
@@ -292,5 +299,142 @@ describe('isImportArtifact', () => {
     const replayed = cashOf(imported.filter((t) => !isImportArtifact(t)));
     expect(replayed).toBe(2000); // +5,000 sale − 3,000 genuine buy
     expect(replayed).toBeGreaterThanOrEqual(0);
+  });
+});
+
+/**
+ * The Mamta Jain regression.
+ *
+ * Reported from the Q2-FY27 sheet: a +43.54% "money-weighted, flow-adjusted"
+ * return and a +Rs10,87,063 "Gain", on a book whose holdings statement showed
+ * only Rs95,442 of unrealized gain. The window had shown "Deposits - withdrawals
+ * during the period: Rs0.00" while ~Rs9.92 lakh of fresh capital had in fact
+ * been deployed.
+ *
+ * Cause: the period engines filtered the window's ledger to CASH_DEPOSIT /
+ * CASH_WITHDRAWAL only. A TRANSACTIONAL book has no such rows, so the series
+ * collapsed to [opening, closing] and the headline became identical to the
+ * naive (close - open) / open figure printed beside it.
+ *
+ * These numbers are the fixture: an implementation that reports 43.54% here is
+ * reproducing the bug.
+ */
+describe('buildWindowFlows — period windows respect the accounting method', () => {
+  const FROM = d('2026-06-30');
+  const TO = d('2026-09-11');
+  const OPENING = 2_496_749.0;
+  const CLOSING = 3_583_812.33;
+  const DEPLOYED = 991_621.31;
+
+  const WINDOW: LedgerEntry[] = [
+    // Fresh capital deployed mid-quarter, as trades — the only way a
+    // transactional book ever records money arriving.
+    { type: 'BUY', amount: 600_000, date: d('2026-07-15') },
+    { type: 'BUY', amount: 391_621.31, date: d('2026-08-20') },
+  ];
+
+  const solve = (flows: ReturnType<typeof buildWindowFlows>) => {
+    const series = [
+      { date: FROM, amount: -OPENING },
+      ...flows,
+      { date: TO, amount: CLOSING },
+    ];
+    const r = xirr(series);
+    if (r.status !== 'ok') throw new Error('no solution');
+    const days = Math.round((TO.getTime() - FROM.getTime()) / 86_400_000);
+    return (1 + r.rate) ** (days / 365) - 1;
+  };
+
+  it('treats mid-window BUYs on a transactional book as capital, not return', () => {
+    const flows = buildWindowFlows(WINDOW, 'TRANSACTIONAL', FROM, TO);
+
+    expect(flows).toHaveLength(2);
+    // Net external money in = deposits − withdrawals, the sheet's netFlows.
+    const netFlows = flows.reduce((sum, f) => sum - f.amount, 0);
+    expect(netFlows).toBeCloseTo(DEPLOYED, 2);
+
+    // The Gain tile is closing − opening − netFlows, and must now land on the
+    // holdings statement's figure rather than on the whole value change.
+    const gain = CLOSING - OPENING - netFlows;
+    expect(gain).toBeCloseTo(95_442.02, 2);
+  });
+
+  it('no longer reports the naive return as the flow-adjusted one', () => {
+    const naive = (CLOSING - OPENING) / OPENING;
+    expect(naive).toBeCloseTo(0.4354, 4); // the number that was on the sheet
+
+    const adjusted = solve(buildWindowFlows(WINDOW, 'TRANSACTIONAL', FROM, TO));
+
+    // Materially below the naive figure, and in single digits — the book only
+    // really earned ~95k on ~34.9 lakh of capital at work.
+    expect(adjusted).toBeLessThan(0.1);
+    expect(adjusted).toBeGreaterThan(0);
+    expect(Math.abs(adjusted - naive)).toBeGreaterThan(0.3);
+  });
+
+  it('reproduces the old collapse when the window has no eligible rows', () => {
+    // A cash-flow reading of the same ledger finds nothing — which is exactly
+    // what the old hardcoded filter did to every transactional book.
+    const flows = buildWindowFlows(WINDOW, 'CASH_FLOW', FROM, TO);
+    expect(flows).toHaveLength(0);
+    expect(solve(flows)).toBeCloseTo((CLOSING - OPENING) / OPENING, 6);
+  });
+
+  it('still reads a cash-flow book by its deposits', () => {
+    const cashLedger: LedgerEntry[] = [
+      { type: 'CASH_DEPOSIT', amount: 500_000, date: d('2026-07-15') },
+      { type: 'CASH_WITHDRAWAL', amount: 100_000, date: d('2026-08-01') },
+      { type: 'BUY', amount: 400_000, date: d('2026-07-16') },
+    ];
+    const flows = buildWindowFlows(cashLedger, 'CASH_FLOW', FROM, TO);
+
+    expect(flows).toHaveLength(2); // the BUY is not a flow here
+    expect(flows[0].amount).toBe(-500_000);
+    expect(flows[1].amount).toBe(100_000);
+  });
+
+  it('excludes bulk-import BUY artifacts the 30-June baseline already holds', () => {
+    const withArtifacts: LedgerEntry[] = [
+      { type: 'BUY', amount: 2_496_749, date: d('2026-07-01') }, // the imported book
+      ...WINDOW,
+    ];
+    const flows = buildWindowFlows(withArtifacts, 'TRANSACTIONAL', FROM, TO);
+
+    expect(flows).toHaveLength(2);
+    const netFlows = flows.reduce((sum, f) => sum - f.amount, 0);
+    expect(netFlows).toBeCloseTo(DEPLOYED, 2); // not 34.9 lakh
+  });
+
+  it('nets same-day buys and sells, and drops a day that cancelled out', () => {
+    const sameDay: LedgerEntry[] = [
+      { type: 'BUY', amount: 100_000, date: d('2026-07-15') },
+      { type: 'SELL', amount: 100_000, date: d('2026-07-15') },
+      { type: 'BUY', amount: 250_000, date: d('2026-08-10') },
+      { type: 'SELL', amount: 50_000, date: d('2026-08-10') },
+    ];
+    const flows = buildWindowFlows(sameDay, 'TRANSACTIONAL', FROM, TO);
+
+    expect(flows).toHaveLength(1);
+    expect(flows[0].amount).toBe(-200_000); // 250k out, 50k back in
+  });
+
+  it('ignores rows on the window boundaries, which the valuations already hold', () => {
+    const boundary: LedgerEntry[] = [
+      { type: 'BUY', amount: 500_000, date: FROM },
+      { type: 'BUY', amount: 500_000, date: TO },
+    ];
+    expect(buildWindowFlows(boundary, 'TRANSACTIONAL', FROM, TO)).toHaveLength(0);
+  });
+
+  it('leaves share-count-only corporate actions out of the flow series', () => {
+    const actions: LedgerEntry[] = [
+      { type: 'SPLIT', amount: 0, date: d('2026-07-20') },
+      { type: 'BONUS', amount: 0, date: d('2026-07-21') },
+      { type: 'DIVIDEND', amount: 12_000, date: d('2026-08-05') },
+    ];
+    const flows = buildWindowFlows(actions, 'TRANSACTIONAL', FROM, TO);
+
+    expect(flows).toHaveLength(1);
+    expect(flows[0].amount).toBe(12_000); // cash out to the client, not a split
   });
 });
