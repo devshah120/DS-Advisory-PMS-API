@@ -352,3 +352,74 @@ export function totalContributed(flows: CashFlow[]): number {
 export function totalWithdrawn(flows: CashFlow[]): number {
   return flows.slice(0, -1).filter((f) => f.amount > 0).reduce((s, f) => s + f.amount, 0);
 }
+
+/**
+ * The interior flows of a PERIOD window — the rows that landed strictly between
+ * a window's opening and closing valuation.
+ *
+ * This exists because the period engines (performance-baseline.service.ts and
+ * family-performance.service.ts) were each hand-rolling their own version that
+ * looked only for CASH_DEPOSIT / CASH_WITHDRAWAL rows. On a CASH_FLOW book that
+ * is right. On a TRANSACTIONAL book — which is every Indian mandate, and the
+ * schema default — it is silently, catastrophically wrong: such a book has no
+ * cash rows at all, so the window saw zero flows, XIRR collapsed to a two-point
+ * series, and the "money-weighted, flow-adjusted" headline degenerated into the
+ * exact `(close - open) / open` figure the sheet prints beside it as the naive
+ * one. A client who deployed ~10 lakh of fresh capital during the quarter had
+ * every rupee of it reported as return.
+ *
+ * So the method decides which rows are flows, exactly as it does for the
+ * since-inception series — one rule, one place, both engines.
+ *
+ * ── Why BUY rows, and why that is not double-counting ─────────────────────
+ * Under the transactional method the deployment of capital IS the flow, and the
+ * window's opening value already contains whatever was deployed before `from`.
+ * A BUY inside the window is therefore new capital arriving at a known date,
+ * and pricing it on that date is precisely what stops it being booked as
+ * performance. A SELL is the mirror image: money out, not a loss.
+ *
+ * Import artifacts are dropped (`isImportArtifact`): the bulk-imported BUY rows
+ * stamped 2026-07-01 are the opening position wearing a transaction's clothing,
+ * and the 30-June baseline already represents them in full. Replaying one on top
+ * of the baseline books the same purchase twice — the same defect documented on
+ * IMPORT_CUTOVER_DATE, which is why that predicate is reused rather than
+ * re-derived.
+ *
+ * Same-day BUY/SELL netting is inherited from `toNettedCashFlows`, so a window
+ * agrees with the since-inception series about what one trading day's flow was.
+ *
+ * Boundaries are STRICT on both sides (`from < date < to`), matching the
+ * previous behaviour: a trade dated on the opening day is already inside the
+ * opening valuation, and one dated on the closing day is inside the closing
+ * valuation. Counting either again would double-book it.
+ */
+export function buildWindowFlows(
+  ledger: LedgerEntry[],
+  method: AccountingMethod,
+  from: Date,
+  to: Date,
+  opts: FlowOptions = {},
+): CashFlow[] {
+  const eligible = ledger.filter(
+    (t) =>
+      t.date > from &&
+      t.date < to &&
+      isFlowType(t.type, method, opts) &&
+      !isImportArtifact(t),
+  );
+
+  const flows =
+    method === 'TRANSACTIONAL'
+      ? toNettedCashFlows(eligible)
+      : eligible.map((t) => ({
+          date: t.date,
+          amount: OUTFLOW_TYPES.has(t.type) ? -Math.abs(t.amount) : Math.abs(t.amount),
+        }));
+
+  // A netted flow of exactly zero (a buy and a sell of equal value on one day)
+  // is not an event: it is two events that cancelled. Dropping it keeps the
+  // series honest about how many decisions the window actually contained.
+  return flows
+    .filter((f) => f.amount !== 0)
+    .sort((a, b) => a.date.getTime() - b.date.getTime());
+}

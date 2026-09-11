@@ -3,6 +3,7 @@ import { PrismaService } from '../common/prisma/prisma.service';
 import { PortfolioHistoryService } from './portfolio-history.service';
 import { BenchmarkHistoryService, BenchmarkWindowResult } from './benchmark-history.service';
 import { CashFlow, xirr } from '../analytics/calculators/xirr';
+import { AccountingMethod, buildWindowFlows } from '../analytics/calculators/flows';
 import { ResolvedPeriod } from './periods';
 import { Market, currencyForMarket } from '../common/market-scope';
 import { Actor, assertOwns } from '../common/ownership-scope';
@@ -152,7 +153,16 @@ export class FamilyPerformanceService {
       where: { id: familyId },
       include: {
         clients: {
-          select: { id: true, name: true, createdAt: true, benchmarkId: true },
+          // accountingMethod is selected because it decides which ledger rows
+          // are flows for this member's window - a transactional book's BUYs,
+          // a cash-flow book's deposits. See buildWindowFlows.
+          select: {
+            id: true,
+            name: true,
+            createdAt: true,
+            benchmarkId: true,
+            accountingMethod: true,
+          },
           orderBy: { name: 'asc' },
         },
       },
@@ -179,7 +189,12 @@ export class FamilyPerformanceService {
         const [openPortfolio, closePortfolio, flows] = await Promise.all([
           this.history.getPortfolioAsOf(c.id, from),
           this.history.getPortfolioAsOf(c.id, to),
-          this.memberFlows(c.id, from, to),
+          this.memberFlows(
+            c.id,
+            from,
+            to,
+            (c.accountingMethod ?? 'TRANSACTIONAL') as AccountingMethod,
+          ),
         ]);
         return {
           client: c,
@@ -324,26 +339,28 @@ export class FamilyPerformanceService {
   /**
    * One member's real external flows inside the window.
    *
-   * Same TYPE → sign convention as the single-client engine's `windowFlows`
-   * and analytics/calculators/flows.ts: CASH_DEPOSIT is money in,
-   * CASH_WITHDRAWAL is money out. Strictly inside the window, so a deposit
-   * landing on the opening date is already inside the opening value and is not
-   * counted a second time.
+   * Delegates to the shared `buildWindowFlows` so a member contributes the
+   * SAME flows to the household series that its own sheet is solved on - the
+   * property the household figure depends on, since it is one XIRR over the
+   * merged flows rather than an average of member returns.
+   *
+   * The method matters: this previously looked only for CASH_DEPOSIT /
+   * CASH_WITHDRAWAL rows, which a transactional book never has, so every
+   * member contributed an empty flow list and the household's fresh capital
+   * was reported as household return. See buildWindowFlows.
    */
-  private async memberFlows(clientId: string, from: Date, to: Date): Promise<CashFlow[]> {
+  private async memberFlows(
+    clientId: string,
+    from: Date,
+    to: Date,
+    method: AccountingMethod,
+  ): Promise<CashFlow[]> {
     const rows = await this.prisma.transaction.findMany({
-      where: {
-        clientId,
-        type: { in: ['CASH_DEPOSIT', 'CASH_WITHDRAWAL'] },
-        date: { gt: from, lt: to },
-      },
+      where: { clientId, date: { gt: from, lt: to } },
       orderBy: { date: 'asc' },
     });
 
-    return rows.map((t) => ({
-      date: t.date,
-      amount: t.type === 'CASH_DEPOSIT' ? -Math.abs(t.amount) : Math.abs(t.amount),
-    }));
+    return buildWindowFlows(rows, method, from, to);
   }
 
   /**

@@ -3,6 +3,7 @@ import { PrismaService } from '../common/prisma/prisma.service';
 import { PortfolioHistoryService } from './portfolio-history.service';
 import { BenchmarkHistoryService, BenchmarkWindowResult } from './benchmark-history.service';
 import { CashFlow, xirr } from '../analytics/calculators/xirr';
+import { AccountingMethod, buildWindowFlows } from '../analytics/calculators/flows';
 import { ResolvedPeriod } from './periods';
 import { Market } from '../common/market-scope';
 
@@ -131,7 +132,8 @@ export class PerformanceBaselineService {
     const simpleReturnPct =
       openingValue > 0 ? (closingValue - openingValue) / openingValue : null;
 
-    const flows = await this.windowFlows(clientId, from, to, openingValue, closingValue);
+    const method = (client?.accountingMethod ?? 'TRANSACTIONAL') as AccountingMethod;
+    const flows = await this.windowFlows(clientId, from, to, openingValue, closingValue, method);
     // The client's own book decides the benchmark: an Indian mandate is measured
     // against the Nifty 50, not the S&P 500. Passing market here is what makes
     // the unset-benchmarkId case (every client seeded so far) resolve correctly.
@@ -211,15 +213,19 @@ export class PerformanceBaselineService {
   }
 
   /**
-   * The unit-purchase flow series for one window: the opening value stands
-   * in for "money invested at the start of the window" (negative — money
-   * in), the closing value is the terminal flow (positive — money out /
-   * still held). Any real deposit/withdrawal that falls strictly inside the
-   * window is added as its own flow, using the same TYPE → sign convention
-   * as buildFlows in analytics/calculators/flows.ts (CASH_DEPOSIT is money
-   * in, CASH_WITHDRAWAL is money out) — so a QTD window that happens to
-   * contain a real contribution still prices the benchmark correctly rather
-   * than pretending the whole window's money arrived on day one.
+   * The flow series for one window: the opening value stands in for "money
+   * invested at the start of the window" (negative - money in), the closing
+   * value is the terminal flow (positive - money out / still held), and every
+   * real flow strictly inside the window sits between them on its own date.
+   *
+   * Which ledger rows count as "a real flow" is decided by the CLIENT'S
+   * ACCOUNTING METHOD, via the shared `buildWindowFlows` - not by a hardcoded
+   * CASH_DEPOSIT/CASH_WITHDRAWAL filter. That filter is correct for a cash-flow
+   * book and silently wrong for a transactional one, which has no cash rows at
+   * all: the window then saw no flows, XIRR reduced to a two-point series, and
+   * the headline "flow-adjusted" return became the naive (close - open) / open
+   * figure - reporting freshly deployed capital as though it were gain. See the
+   * doc comment on buildWindowFlows for the full account.
    */
   private async windowFlows(
     clientId: string,
@@ -227,27 +233,20 @@ export class PerformanceBaselineService {
     to: Date,
     openingValue: number,
     closingValue: number,
+    method: AccountingMethod,
   ): Promise<CashFlow[]> {
-    const midWindowDeposits = await this.prisma.transaction.findMany({
-      where: {
-        clientId,
-        type: { in: ['CASH_DEPOSIT', 'CASH_WITHDRAWAL'] },
-        date: { gt: from, lt: to },
-      },
+    const ledger = await this.prisma.transaction.findMany({
+      where: { clientId, date: { gt: from, lt: to } },
       orderBy: { date: 'asc' },
     });
 
-    const flows: CashFlow[] = [{ date: from, amount: -openingValue }];
+    const interior = buildWindowFlows(ledger, method, from, to);
 
-    for (const t of midWindowDeposits) {
-      flows.push({
-        date: t.date,
-        amount: t.type === 'CASH_DEPOSIT' ? -Math.abs(t.amount) : Math.abs(t.amount),
-      });
-    }
-
-    flows.push({ date: to, amount: closingValue });
-    return flows;
+    return [
+      { date: from, amount: -openingValue },
+      ...interior,
+      { date: to, amount: closingValue },
+    ];
   }
 
 }
