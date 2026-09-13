@@ -172,7 +172,32 @@ export class BaselineService {
       }),
     );
 
-    const openingCash = await this.backOutOpeningCash(clientId, baselineDate, client.cashBalance);
+    /**
+     * A client with no surviving position at the baseline date never held
+     * anything on it — which, for the shared house date, includes every
+     * account onboarded after 30-June with no legacy book at all (Prashant
+     * Salecha HUF's first trade was 11-Aug; there is no 30-June balance to
+     * recover). `backOutOpeningCash` assumes today's cash balance is the
+     * result of replaying real flows FORWARD from an actual baseline-date
+     * balance, and unwinds those flows to find it — but for such a client
+     * every one of those "post-baseline" transactions IS the account's whole
+     * history, not activity on top of a pre-existing balance. Running the
+     * back-out anyway manufactures an opening balance sized to the account's
+     * own future trading (₹21.46L of phantom capital for an account that
+     * deposited and traded exactly that much from zero), which then seats a
+     * cash position that both invents a household's opening value and gets
+     * counted again when those same trades replay as real flows on top of
+     * it — the exact mechanism that reported Prashant Salecha HUF's Q2 FY27
+     * return as −60.94% instead of its true small gain.
+     *
+     * A client that DOES carry a real legacy book has at least one surviving
+     * position after the rollback, so this only zeroes the no-legacy case —
+     * a house-baseline client with holdings is unaffected.
+     */
+    const openingCash =
+      holdings.length === 0
+        ? 0
+        : await this.backOutOpeningCash(clientId, baselineDate, client.cashBalance);
 
     const openingPortfolioValue =
       holdings.reduce((sum, h) => sum + h.quantity * h.averageCost, 0) + openingCash;
