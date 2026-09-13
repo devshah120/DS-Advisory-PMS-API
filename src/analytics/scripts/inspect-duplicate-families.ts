@@ -1,14 +1,16 @@
 /**
- * Read-only inspection: find every family name duplicated within its own
- * market, and report enough about each row for a human to decide whether it
- * is a genuine accidental duplicate (should be merged) or two households that
- * legitimately share a name (should be renamed to disambiguate).
+ * Read-only inspection: find every family name duplicated within the SAME
+ * manager's book (same ownerId and market) — the case the current
+ * `@@unique([ownerId, market, name])` on Family actually forbids. Two
+ * different managers naming a household the same thing (e.g. two unrelated
+ * "Vaidya Family" mandates) is expected and allowed; this script does not
+ * flag that.
  *
- * This is what surfaced `families_market_name_key` failing to build during a
- * `prisma db push` — the schema's `@@unique([market, name])` on Family cannot
- * be created while two "Vaidya Family" rows exist in the same market. See the
- * Family model's own doc comment in schema.prisma for why the index is scoped
- * to market rather than global.
+ * This surfaced the original `families_market_name_key` (back when the index
+ * was firm-wide, `@@unique([market, name])`) failing to build against two
+ * real "Vaidya Family" households under different managers — which is exactly
+ * why the index was narrowed to include ownerId. See the Family model's own
+ * doc comment in schema.prisma for the full history.
  *
  * WRITES NOTHING. Prints each duplicate group with:
  *   - both Family document ids, ownerId, createdAt
@@ -46,9 +48,12 @@ async function main() {
       orderBy: [{ market: 'asc' }, { name: 'asc' }, { createdAt: 'asc' }],
     });
 
+    // Grouped by (ownerId, market, name) — the exact key the current unique
+    // index enforces. Two different managers sharing a household name is
+    // expected and intentionally excluded from this report.
     const groups = new Map<string, typeof families>();
     for (const f of families) {
-      const key = `${f.market}::${f.name}`;
+      const key = `${f.ownerId ?? '(unowned)'}::${f.market}::${f.name}`;
       const list = groups.get(key) ?? [];
       list.push(f);
       groups.set(key, list);
@@ -57,15 +62,15 @@ async function main() {
     const duplicates = [...groups.entries()].filter(([, rows]) => rows.length > 1);
 
     if (duplicates.length === 0) {
-      console.log('\n  No duplicate family names within any market. Nothing to resolve.\n');
+      console.log('\n  No duplicate family names within any single manager\'s book. Nothing to resolve.\n');
       return;
     }
 
-    console.log(`\n  Found ${duplicates.length} family name(s) duplicated within their market:\n`);
+    console.log(`\n  Found ${duplicates.length} family name(s) duplicated within the SAME manager's book:\n`);
 
     for (const [key, rows] of duplicates) {
-      const [market, name] = key.split('::');
-      console.log(`  ── "${name}" [${market}] — ${rows.length} rows ──────────────────────────`);
+      const [ownerId, market, name] = key.split('::');
+      console.log(`  ── "${name}" [${market}, owner ${ownerId}] — ${rows.length} rows ──────────────────────────`);
 
       for (const f of rows) {
         const clientIds = f.clients.map((c) => c.id);
@@ -92,9 +97,10 @@ async function main() {
     }
 
     console.log(
-      '  Decide, per group, whether these are one household split by accident (merge — move every\n' +
-        '  member client onto a single Family id, then delete the empty one) or two real households that\n' +
-        '  happen to share a name (rename one, e.g. "Vaidya Family (2)"). Nothing has been changed.\n',
+      '  Each group above shares BOTH an owner and a name — almost certainly one household\n' +
+        '  duplicated by accident within a single manager\'s book (e.g. created twice). Decide whether to\n' +
+        '  merge (move every member client onto a single Family id, then delete the empty one) or rename\n' +
+        '  one. Nothing has been changed.\n',
     );
   } finally {
     await prisma.$disconnect();

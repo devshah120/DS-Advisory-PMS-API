@@ -652,15 +652,30 @@ model Family {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  /// Families are listed per book, and a household name is unique within one.
+  /// Families are listed per book, and a household name is unique within one
+  /// MANAGER'S book, not firm-wide.
   ///
-  /// Deliberately NOT widened to include ownerId. Two managers cannot both name
-  /// a household "Salecha Family" — but that collision is vanishingly rare next
-  /// to the cost of the alternative: on MongoDB a unique index whose key
-  /// includes an optional field treats every unstamped row (ownerId absent) as
-  /// a duplicate, so the index would fail to build against the existing data
-  /// this migration is designed to preserve. Same reasoning as User.clientId.
-  @@unique([market, name])
+  /// Originally `@@unique([market, name])` — firm-wide within a market — on the
+  /// theory that two managers naming a household "Vaidya Family" was rare
+  /// enough to not be worth the risk below. It happened on the very first
+  /// production book: two managers each independently onboarded an unrelated
+  /// "Vaidya Family", and the firm-wide constraint made that a hard error
+  /// rather than the ordinary occurrence it is — two different desks are not
+  /// expected to coordinate on household names.
+  ///
+  /// The risk this widening was written to avoid is real on MongoDB: a unique
+  /// index whose key includes an optional field treats every document missing
+  /// that field as sharing the same "absent" value, so two families that both
+  /// predate `ownerId` (never stamped by `backfill-ownership.ts`) would still
+  /// collide with each other even under the new key. That risk is accepted
+  /// here because every family in this book has been backfilled with an owner
+  /// — see backfill-ownership.ts, run once, after which no family is created
+  /// without one — so no row should ever hit the absent-field case in
+  /// practice. If `prisma db push` ever fails on THIS index with a duplicate
+  /// among unowned rows, that means an unowned family exists and
+  /// backfill-ownership.ts needs to be re-run before retrying, not that this
+  /// key should be reverted.
+  @@unique([ownerId, market, name])
   @@index([market])
   @@index([ownerId, market])
   @@map("families")
