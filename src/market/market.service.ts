@@ -42,10 +42,14 @@ const UA =
 export class MarketService {
   private readonly logger = new Logger(MarketService.name);
 
-  // Classification data is effectively static, and this keeps a fast-typing
-  // user from firing one upstream call per keystroke.
+  // Classification data (company/sector/industry) is effectively static, but
+  // this cache also carries currentPrice, which is not — a hoisted holdings
+  // read can otherwise show a quote that's stale by up to a full cache
+  // lifetime. Kept short so "Last Price" tracks the market during the
+  // session; still long enough to collapse a fast-typing user's per-keystroke
+  // lookups and the burst of identical calls one holdings list fires.
   private readonly cache = new Map<string, { value: LookupResult; expiresAt: number }>();
-  private static readonly CACHE_TTL_MS = 60 * 60 * 1000;
+  private static readonly CACHE_TTL_MS = 2 * 60 * 1000;
 
   // Daily closes only change once a day (at market close), so a cache keyed by
   // ticker+fromDate can live a lot longer than the quote/classification cache.
