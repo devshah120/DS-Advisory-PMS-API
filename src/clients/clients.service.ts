@@ -85,7 +85,7 @@ function deriveMetrics(
   client: {
     cashBalance: number;
     holdings: Array<{ ticker: string; quantity: number; averageCost: number; currentPrice: number }>;
-    transactions: Array<{ type: string; amount: number; date: Date }>;
+    transactions: Array<{ type: string; amount: number; date: Date; ticker: string | null; quantity: number | null }>;
   },
   jun30Close: Map<string, number>,
   /** ticker → live price; falls back to the holding's stored currentPrice when absent. */
@@ -105,7 +105,8 @@ function deriveMetrics(
   // list's XIRR matches the Performance page instead of showing the exploded
   // pre-rebase figure. Without this the two pages disagreed: Performance read
   // −16.9% while the list still showed +23,000,000%.
-  const rebased = rebaseLedgerToJun30(client.holdings, client.transactions, jun30Close);
+  const currentQuantity = new Map(client.holdings.map((h) => [h.ticker, h.quantity]));
+  const rebased = rebaseLedgerToJun30(client.transactions, jun30Close, currentQuantity);
   const built = buildFlows(rebased, 'TRANSACTIONAL', holdingsValue, new Date());
   let rate = 0;
   if (built.status === 'ok') {

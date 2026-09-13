@@ -10,6 +10,8 @@ import {
   AccountingMethod,
   buildFlows,
   FlowOptions,
+  isImportArtifact,
+  jun30Quantities,
   JUN30_REBASE_DATE,
   rebaseLedgerToJun30,
   totalContributed,
@@ -181,7 +183,7 @@ export class PerformanceService {
      * purchase cost, which is correct: for those, the purchase IS the inception.
      */
     const positionsForGains =
-      method === 'TRANSACTIONAL' ? await this.rebasePositionCosts(snap) : snap.positions;
+      method === 'TRANSACTIONAL' ? await this.rebasePositionCosts(snap, ledger) : snap.positions;
 
     // ── Values ────────────────────────────────────────────────────────────────
     // Holdings are always DERIVED (quantity × price). The stored
@@ -765,33 +767,64 @@ export class PerformanceService {
     ledger: LedgerRow[],
   ): Promise<LedgerRow[]> {
     const closeOf = await this.jun30Closes(snap.positions.map((p) => p.ticker));
-    const holdings = snap.positions.map((p) => ({
-      ticker: p.ticker,
-      quantity: p.quantity,
-      averageCost: p.costBasis,
-    }));
-    return rebaseLedgerToJun30(holdings, ledger, closeOf) as LedgerRow[];
+    const currentQuantity = new Map(snap.positions.map((p) => [p.ticker, p.quantity]));
+    return rebaseLedgerToJun30(ledger, closeOf, currentQuantity) as LedgerRow[];
   }
 
   /**
    * Restate each position's cost basis at its 30-June-2026 close, so that every gain
    * on the sheet measures from the same inception the XIRR measures from.
    *
-   * Mirrors `rebaseLedgerToJun30`'s fallback order exactly — 30-June close, else
-   * the position's own recorded average cost — so a position the rebase priced
-   * one way for the flow series cannot be priced another way for the gain.
+   * Shares eligibility AND quantity with `rebaseLedgerToJun30` via the shared
+   * `jun30Quantities` — not just the fallback order (30-June close, else
+   * recorded cost) — so a position priced one way for the flow series cannot
+   * be priced another way for the gain. Two failure modes that showed up
+   * independently when the two engines disagreed about ELIGIBILITY or
+   * QUANTITY:
    *
-   * A position with no 30-June bar was (almost always) opened after inception, so
-   * its recorded cost already IS its inception cost and passes through unchanged.
+   *   - A ticker bought fresh after inception can have a genuine 30-June
+   *     market close (it was already public) without this client having held
+   *     it then. Rebasing its cost onto that close restates a purchase that
+   *     never happened — this broke Karan Raiyani's reconciliation before
+   *     `jun30Quantities` gated eligibility on a real import BUY.
+   *   - A position added to AFTER 30-June (Shubh Laiwala's OKE/VIRT/SNDK/CRWV)
+   *     has only PART of its current quantity eligible for the 30-June price;
+   *     pricing the FULL current quantity at that close overstated the
+   *     30-June cost by the later purchase's own real cost, which is exactly
+   *     what `jun30Quantities`'s share-rollback corrects — the position here
+   *     is a BLEND: the rolled-back quantity at the 30-June (or import)
+   *     price, plus whatever was added since at its own recorded cost.
+   *
+   * A position absent from `jun30Quantities` was opened entirely after
+   * inception (or is inert import noise with nothing eligible), so its
+   * recorded cost already IS its inception cost and passes through unchanged.
    */
   private async rebasePositionCosts(
     snap: Awaited<ReturnType<SnapshotService['forClient']>>,
+    ledger: LedgerRow[],
   ): Promise<Awaited<ReturnType<SnapshotService['forClient']>>['positions']> {
     const closeOf = await this.jun30Closes(snap.positions.map((p) => p.ticker));
+    const currentQuantity = new Map(snap.positions.map((p) => [p.ticker, p.quantity]));
+    const jun30 = jun30Quantities(ledger, currentQuantity);
+    const realCostAddedSince = this.realCostAddedSinceJun30(ledger);
 
     return snap.positions.map((p) => {
-      const unit = closeOf.get(p.ticker) ?? p.costBasis;
-      const costBasisTotal = unit * p.quantity;
+      const rebased = jun30.get(p.ticker);
+      if (!rebased) return p;
+
+      const jun30Unit = closeOf.get(p.ticker) ?? rebased.averageCost;
+      // The shares added since 30-June kept their OWN real purchase cost —
+      // NOT `p.costBasis`, which is the position's overall blended average
+      // and already mixes the 30-June-priced shares in with the later ones.
+      // Multiplying that blended figure by just the added quantity re-blends
+      // an already-blended number, which is what undercounted Mrugesh
+      // Patel's CMI position by ₹485.52 (2.277 shares added 26-Aug at a real
+      // ₹570.93/share got priced at the position's ₹357.70 blended average
+      // instead). `realCostAddedSinceJun30` replays only the real BUY/SELL
+      // rows for the ticker to recover their own isolated cost.
+      const added = realCostAddedSince.get(p.ticker);
+      const costBasisTotal = jun30Unit * rebased.quantity + (added?.costBasisTotal ?? 0);
+      const unit = p.quantity > 0 ? costBasisTotal / p.quantity : jun30Unit;
 
       return {
         ...p,
@@ -800,6 +833,40 @@ export class PerformanceService {
         unrealizedPnl: p.marketValue - costBasisTotal,
       };
     });
+  }
+
+  /**
+   * Average-cost replay of the REAL (non-import) BUY/SELL rows for every
+   * ticker, giving the isolated cost basis of just what was added since
+   * 30-June — the piece `jun30Quantities` deliberately excludes from the
+   * 30-June-priced portion. Mirrors `PortfolioReconstructionService
+   * .applyTransaction`'s average-cost convention (a SELL draws down quantity
+   * and cost proportionally, at the average cost per share BEFORE that sale)
+   * so this cannot disagree with how the rest of the book prices a trade.
+   */
+  private realCostAddedSinceJun30(
+    ledger: LedgerRow[],
+  ): Map<string, { quantity: number; costBasisTotal: number }> {
+    const out = new Map<string, { quantity: number; costBasisTotal: number }>();
+    for (const t of ledger) {
+      if (!t.ticker || !t.quantity || isImportArtifact(t, true)) continue;
+      const existing = out.get(t.ticker) ?? { quantity: 0, costBasisTotal: 0 };
+
+      if (t.type === 'BUY') {
+        existing.quantity += t.quantity;
+        existing.costBasisTotal += Math.abs(t.amount);
+      } else if (t.type === 'SELL' && existing.quantity > 0) {
+        const avgCost = existing.costBasisTotal / existing.quantity;
+        const soldQty = Math.min(t.quantity, existing.quantity);
+        existing.quantity -= soldQty;
+        existing.costBasisTotal -= avgCost * soldQty;
+      } else {
+        continue;
+      }
+
+      out.set(t.ticker, existing);
+    }
+    return out;
   }
 
   /**

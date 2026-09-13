@@ -23,6 +23,12 @@ export interface LedgerEntry {
   date: Date;
 }
 
+/** The subset of a Transaction row `rebaseLedgerToJun30` needs — `LedgerEntry` plus ticker/quantity. */
+export interface RebaseLedgerEntry extends LedgerEntry {
+  ticker: string | null;
+  quantity: number | null;
+}
+
 export type FlowBuildResult =
   | { status: 'ok'; flows: CashFlow[] }
   | { status: 'insufficient'; reason: string };
@@ -117,27 +123,164 @@ export function isHouseBaselineDate(baselineDate: Date): boolean {
   return baselineDate.getTime() === INCEPTION_DATE.getTime();
 }
 
-export interface RebaseHolding {
-  ticker: string;
+/**
+ * Which tickers actually carry a legacy import BUY, and how many shares that
+ * import represents — the only positions (and quantities) the 30-June
+ * baseline is entitled to speak for.
+ *
+ * A caller's CURRENT holdings are not evidence of what was held on 30-June,
+ * in either direction:
+ *
+ *   - A ticker bought fresh after inception is `quantity > 0` today too, and
+ *     the market can easily have a real 30-June close for it (it was already
+ *     public, just not yet in this client's book) — using current holdings
+ *     as the eligibility test priced Karan Raiyani's August purchases of
+ *     NLCINDIA.NS/GESHIP.NS/ANUP.NS as if he'd held them since 30-June.
+ *   - A ticker that WAS imported but has since been fully sold is
+ *     `quantity = 0` today, which is the opposite mistake: using current
+ *     holdings as the SIZE (or the eligibility test) drops its synthetic
+ *     30-June buy entirely, leaving its later real SELL with no matching
+ *     outflow in the flow series and manufacturing a gain out of the full
+ *     sale proceeds. This is what turned Nirav Patel's real ₹325.05 gain on
+ *     an imported-then-sold LYV lot into an unexplained ₹2,999.95 residual.
+ *
+ * The import BUY rows themselves are the only reliable record of what was
+ * actually imported, so the synthetic quantity is summed from THEM, not from
+ * today's `Holding` table — correct whether the position is still fully held,
+ * partially sold, added to, or closed out entirely since.
+ *
+ * Shared by `rebaseLedgerToJun30` (the flow series) and
+ * `PerformanceService.rebasePositionCosts` (the cost basis) so the two can
+ * never disagree about which tickers are eligible for the 30-June basis —
+ * they did once, which is exactly the kind of drift `reconciliation.balanced`
+ * exists to catch.
+ */
+export interface ImportedPosition {
   quantity: number;
-  /** Per-share recorded cost — the fallback unit price when no 30-June close exists. */
-  averageCost: number;
+  /** Total recorded cost across every import BUY row for this ticker — the fallback basis when no 30-June close exists. */
+  costBasisTotal: number;
 }
 
-export function rebaseLedgerToJun30<T extends LedgerEntry>(
-  holdings: RebaseHolding[],
+export function importedPositions(
+  ledger: Array<{ ticker: string | null; type: string; date: Date; quantity: number | null; amount: number }>,
+): Map<string, ImportedPosition> {
+  const out = new Map<string, ImportedPosition>();
+  for (const r of ledger) {
+    if (!r.ticker || !r.quantity || !isImportArtifact(r, true)) continue;
+    const existing = out.get(r.ticker) ?? { quantity: 0, costBasisTotal: 0 };
+    existing.quantity += r.quantity;
+    existing.costBasisTotal += Math.abs(r.amount);
+    out.set(r.ticker, existing);
+  }
+  return out;
+}
+
+/** Convenience wrapper over `importedPositions` for callers that only need eligibility, not size/cost. */
+export function importedTickers(
+  ledger: Array<{ ticker: string | null; type: string; date: Date; quantity: number | null; amount: number }>,
+): Set<string> {
+  return new Set(importedPositions(ledger).keys());
+}
+
+/**
+ * The 30-June-2026 quantity for every ticker eligible for the rebase — the
+ * shared arithmetic behind both `rebaseLedgerToJun30` (the flow series) and
+ * `PerformanceService.rebasePositionCosts` (the cost basis), so the two can
+ * never price a different quantity as "the 30-June position" for the same
+ * ticker.
+ *
+ * Mirrors `BaselineService.autoSeed`'s `sharesAddedSince` rollback exactly:
+ * current quantity, minus every REAL (non-import) BUY/SELL since the
+ * cutover. Using current quantity un-rolled-back double-counts any later
+ * real purchase — Shubh Laiwala bought more OKE, VIRT, SNDK and CRWV after
+ * the import, and pricing their FULL current quantity at the 30-June close
+ * counted those later shares once at the (wrong) 30-June price and again at
+ * their own real purchase price, which survives unchanged in `nonBuys`.
+ *
+ * A ticker ABSENT from `currentQuantity` — fully exited, with no current
+ * `Holding` row left — falls back to the ledger's own imported quantity, the
+ * only source left once the holding itself is gone (Nirav Patel's LYV:
+ * imported, later fully sold, `Holding` row long gone).
+ *
+ * A ticker present in neither `currentQuantity` nor with a later real SELL is
+ * inert import noise with nothing downstream that ever needs its cost basis —
+ * Radhika Vaidya's ledger carries a duplicate/typo import BUY for
+ * `INDOSMC.NS` alongside the real position under `INDOSMC.BO`; `.NS` has no
+ * holding and no SELL, so it is excluded rather than synthesized as a second,
+ * phantom 152,000-rupee position.
+ */
+export function jun30Quantities<T extends RebaseLedgerEntry>(
+  ledger: T[],
+  /**
+   * ticker → CURRENT quantity, for every ticker the book actually recognises
+   * (present in `Holding`, including a zero for one fully exited via a
+   * post-import BUY/SELL round trip that closed it out).
+   */
+  currentQuantity: ReadonlyMap<string, number>,
+): Map<string, { quantity: number; averageCost: number }> {
+  const imported = importedPositions(ledger);
+  const soldAfterImport = new Set(
+    ledger.filter((r) => r.ticker && r.type === 'SELL' && !isImportArtifact(r, true)).map((r) => r.ticker as string),
+  );
+
+  const realSharesAddedSince = new Map<string, number>();
+  for (const r of ledger) {
+    if (!r.ticker || !r.quantity || isImportArtifact(r, true)) continue;
+    const delta = r.type === 'BUY' ? r.quantity : r.type === 'SELL' ? -r.quantity : 0;
+    if (delta !== 0) realSharesAddedSince.set(r.ticker, (realSharesAddedSince.get(r.ticker) ?? 0) + delta);
+  }
+
+  const out = new Map<string, { quantity: number; averageCost: number }>();
+  for (const [ticker, pos] of imported) {
+    if (!currentQuantity.has(ticker) && !soldAfterImport.has(ticker)) continue;
+
+    const quantity = currentQuantity.has(ticker)
+      ? currentQuantity.get(ticker)! - (realSharesAddedSince.get(ticker) ?? 0)
+      : pos.quantity;
+    if (quantity <= 0) continue;
+
+    // Per-share, from the ORIGINAL import quantity/cost — a ratio, so it
+    // stays valid as a fallback unit price even though `quantity` above may
+    // have been rolled back to a different (smaller) number.
+    out.set(ticker, { quantity, averageCost: pos.costBasisTotal / pos.quantity });
+  }
+  return out;
+}
+
+export function rebaseLedgerToJun30<T extends RebaseLedgerEntry>(
   ledger: T[],
   /** ticker → 30-June-2026 close. */
   jun30Close: Map<string, number>,
+  currentQuantity: ReadonlyMap<string, number>,
 ): LedgerEntry[] {
-  const synthetic: LedgerEntry[] = holdings
-    .filter((h) => h.quantity > 0)
-    .map((h) => {
-      const unit = jun30Close.get(h.ticker) ?? h.averageCost;
-      return { type: 'BUY', amount: unit * h.quantity, date: JUN30_REBASE_DATE };
-    });
+  const jun30 = jun30Quantities(ledger, currentQuantity);
 
-  const nonBuys = ledger.filter((r) => r.type !== 'BUY');
+  const synthetic: LedgerEntry[] = [...jun30.entries()].map(([ticker, pos]) => {
+    const unit = jun30Close.get(ticker) ?? pos.averageCost;
+    return { type: 'BUY', amount: unit * pos.quantity, date: JUN30_REBASE_DATE };
+  });
+
+  /**
+   * Drop only the bulk-import BUYs the 30-June baseline now represents —
+   * NOT every BUY ever recorded. The doc above only ever justifies dropping
+   * the legacy import rows ("every BUY is dropped" was written when the
+   * ledger's only BUYs WERE those import rows); it was never a license to
+   * drop an ordinary post-inception purchase too.
+   *
+   * A BUY dated after the cutover is a real trade with nothing to do with
+   * the unpriced legacy history this rebase exists to paper over. Blanket-
+   * dropping it is only invisible for a position still held — the position
+   * still shows up (priced off `holdings`, whatever this rebase does to the
+   * ledger) and its SELL just never fires. But for a position bought AND
+   * fully sold after inception, the BUY has no synthetic replacement (it
+   * only exists for tickers in `importedTickers`) — so the SELL's proceeds
+   * survive as pure inflow with no matching outflow, manufacturing a gain
+   * out of a round-trip trade. On Keyur Vaidya (DWS0002) this took a
+   * ₹13,905.95 real gain on a 30-share STYLAMIND.NS round trip and reported
+   * it as ₹111,769.15 — the full sale proceeds, because the ₹97,863.20
+   * purchase that funded it had been silently erased.
+   */
+  const nonBuys = ledger.filter((r) => r.type !== 'BUY' || !isImportArtifact(r, true));
   return [...synthetic, ...nonBuys];
 }
 
