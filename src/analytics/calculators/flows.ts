@@ -82,15 +82,39 @@ export const INCEPTION_DATE = JUN30_REBASE_DATE;
 export const IMPORT_CUTOVER_DATE = new Date('2026-07-01T23:59:59.999Z');
 
 /**
- * Is this ledger row a bulk-import artifact that the 30-June baseline already
+ * Is this ledger row a bulk-import artifact that the client's baseline already
  * accounts for?
  *
  * Only BUY rows qualify. A SELL, DIVIDEND or FEES row dated in the same window is
  * a real event that the baseline does NOT represent — the baseline is a position
  * snapshot, not a cash history — so those must still replay.
+ *
+ * The artifact concept only exists for clients swept up in the ORIGINAL bulk
+ * import — the ones whose `PortfolioBaseline.baselineDate` is the shared house
+ * date (`INCEPTION_DATE`). For any other client — one onboarded afterward with
+ * no legacy position, whose baseline is empty and dated at their own first
+ * transaction — nothing was ever bulk-imported, so nothing is an artifact:
+ * every one of their BUYs is a real trade, no matter what calendar date it
+ * happens to fall on.
+ *
+ * `isHouseBaseline` therefore gates the whole check, not just the cutover
+ * date. Passing `false` (or omitting it for a client with a distinct
+ * baseline) makes this always return false — the fixed 2026-07-01 date must
+ * never be applied to a client whose baseline isn't the one it describes.
+ * Getting this backwards is exactly what silently dropped Abhishek Oberoi's
+ * ~₹14L of December-2025 purchases: they fell before the house cutover date
+ * by coincidence of calendar, not because his baseline represented them.
  */
-export function isImportArtifact(row: { type: string; date: Date }): boolean {
-  return row.type === 'BUY' && row.date <= IMPORT_CUTOVER_DATE;
+export function isImportArtifact(
+  row: { type: string; date: Date },
+  isHouseBaseline = true,
+): boolean {
+  return isHouseBaseline && row.type === 'BUY' && row.date <= IMPORT_CUTOVER_DATE;
+}
+
+/** True when `baselineDate` is the shared house baseline (same instant as INCEPTION_DATE). */
+export function isHouseBaselineDate(baselineDate: Date): boolean {
+  return baselineDate.getTime() === INCEPTION_DATE.getTime();
 }
 
 export interface RebaseHolding {
@@ -399,13 +423,15 @@ export function buildWindowFlows(
   from: Date,
   to: Date,
   opts: FlowOptions = {},
+  /** True when this client's own baseline is the shared house baseline. See isImportArtifact. */
+  isHouseBaseline = true,
 ): CashFlow[] {
   const eligible = ledger.filter(
     (t) =>
       t.date > from &&
       t.date < to &&
       isFlowType(t.type, method, opts) &&
-      !isImportArtifact(t),
+      !isImportArtifact(t, isHouseBaseline),
   );
 
   const flows =

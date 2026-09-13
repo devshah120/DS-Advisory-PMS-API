@@ -58,6 +58,9 @@ function build(members: MemberSpec[]) {
         return (m?.flows ?? []).map(([date, type, amount]) => ({ date, type, amount }));
       }),
     },
+    portfolioBaseline: {
+      findUnique: jest.fn().mockResolvedValue(null),
+    },
   } as unknown as PrismaService;
 
   const history = {

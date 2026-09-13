@@ -74,6 +74,9 @@ function build(opts: {
     family: {
       findUnique: jest.fn(),
     },
+    portfolioBaseline: {
+      findUnique: jest.fn().mockResolvedValue(null),
+    },
   } as unknown as PrismaService;
 
   const history = {

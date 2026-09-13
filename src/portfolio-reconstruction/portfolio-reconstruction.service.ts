@@ -3,7 +3,7 @@ import { PrismaService } from '../common/prisma/prisma.service';
 import { BaselineService } from '../legacy-baseline/baseline.service';
 import { HistoricalPriceService } from '../historical-price/historical-price.service';
 import { allocationBy } from '../analytics/calculators/weights';
-import { JUN30_REBASE_DATE, isImportArtifact } from '../analytics/calculators/flows';
+import { JUN30_REBASE_DATE, isImportArtifact, isHouseBaselineDate } from '../analytics/calculators/flows';
 import { Classification, PortfolioSnapshot, Position } from '../analytics/calculators/types';
 import { ReconstructedPortfolio, ReconstructedPosition } from './types';
 
@@ -125,8 +125,27 @@ export class PortfolioReconstructionService {
      * an import artifact lives in flows.ts next to the rebase that follows the same
      * convention — so the Current tab and this tab cannot disagree about which
      * rows are real trades.
+     *
+     * The filter is gated on whether THIS client's baseline is the shared
+     * house baseline (`isHouseBaselineDate`), not just its date. A client
+     * swept up in the original bulk import has a baseline dated exactly at
+     * the house date, so the gate is true and their 2026-07-01 bulk-import
+     * BUYs are correctly dropped as artifacts already represented by that
+     * baseline's holdings.
+     *
+     * A client onboarded afterward with no legacy position has a distinct
+     * baseline dated at their own first transaction — the gate is false, so
+     * NOTHING is treated as an artifact for them, regardless of calendar
+     * date. Using a date-only comparison here (e.g. "on or before the house
+     * cutover") is the bug this replaced: a client whose real trading began
+     * in December 2025, well before the house's 2026-07-01 import date,
+     * would have every one of those genuine BUYs misclassified as import
+     * artifacts and silently dropped — exactly what left a fully-invested
+     * client's reconstructed book empty.
      */
-    const replayable = ledger.filter((t) => !isImportArtifact(t));
+    const replayable = ledger.filter(
+      (t) => !isImportArtifact(t, isHouseBaselineDate(baselineRow.baselineDate)),
+    );
 
     for (const t of replayable) {
       realizedGain += this.applyTransaction(positions, t, (delta) => (cash += delta));

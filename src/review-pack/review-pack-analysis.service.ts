@@ -84,22 +84,37 @@ export class ReviewPackAnalysisService {
     // Reuses the same window-flow construction the client's own Performance
     // page is measured on, so the return quoted here is the return that page
     // shows — never a re-derivation. See analytics/calculators/flows.ts.
-    const { buildWindowFlows } = await import('../analytics/calculators/flows');
+    const { buildWindowFlows, isHouseBaselineDate } = await import('../analytics/calculators/flows');
     const { xirr } = await import('../analytics/calculators/xirr');
-    const txns = await this.prisma.transaction.findMany({
-      where: { clientId, date: { gt: resolved.from, lt: resolved.to } },
-      orderBy: { date: 'asc' },
-    });
-    const clientRow = await this.prisma.client.findUnique({
-      where: { id: clientId },
-      select: { accountingMethod: true, includeDividends: true, includeFees: true },
-    });
+    const [txns, clientRow, baseline] = await Promise.all([
+      this.prisma.transaction.findMany({
+        where: { clientId, date: { gt: resolved.from, lt: resolved.to } },
+        orderBy: { date: 'asc' },
+      }),
+      this.prisma.client.findUnique({
+        where: { id: clientId },
+        select: { includeDividends: true, includeFees: true },
+      }),
+      this.prisma.portfolioBaseline.findUnique({
+        where: { clientId },
+        select: { baselineDate: true },
+      }),
+    ]);
+    // The cash-flow method is retired product-wide: every client is measured
+    // transactionally regardless of what is stored, matching
+    // PerformanceService / PerformanceBaselineService / FamilyPerformanceService.
+    //
+    // The import-artifact filter only applies when this client's baseline IS
+    // the shared house baseline (absence falls back to the synthetic
+    // house-dated one). See isImportArtifact's doc comment.
+    const isHouseBaseline = !baseline || isHouseBaselineDate(baseline.baselineDate);
     const interior = buildWindowFlows(
       txns,
-      (clientRow?.accountingMethod ?? 'TRANSACTIONAL') as 'TRANSACTIONAL' | 'CASH_FLOW',
+      'TRANSACTIONAL',
       resolved.from,
       resolved.to,
       { includeDividends: clientRow?.includeDividends, includeFees: clientRow?.includeFees },
+      isHouseBaseline,
     );
     const flows = [
       { date: resolved.from, amount: -openPortfolio.portfolioValue },

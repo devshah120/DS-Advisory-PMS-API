@@ -3,7 +3,7 @@ import { PrismaService } from '../common/prisma/prisma.service';
 import { PortfolioHistoryService } from './portfolio-history.service';
 import { BenchmarkHistoryService, BenchmarkWindowResult } from './benchmark-history.service';
 import { CashFlow, xirr } from '../analytics/calculators/xirr';
-import { AccountingMethod, buildWindowFlows } from '../analytics/calculators/flows';
+import { AccountingMethod, buildWindowFlows, isHouseBaselineDate } from '../analytics/calculators/flows';
 import { ResolvedPeriod } from './periods';
 import { Market, currencyForMarket } from '../common/market-scope';
 import { Actor, assertOwns } from '../common/ownership-scope';
@@ -186,15 +186,16 @@ export class FamilyPerformanceService {
     // own page are answered by the same code rather than by two engines.
     const measured = await Promise.all(
       family.clients.map(async (c) => {
+        // The cash-flow method is retired product-wide: every member is
+        // measured transactionally regardless of what is stored, matching
+        // PerformanceService and PerformanceBaselineService. A member left
+        // as CASH_FLOW in the database must not compute differently in the
+        // household view than on their own Performance page.
+        const method: AccountingMethod = 'TRANSACTIONAL';
         const [openPortfolio, closePortfolio, flows] = await Promise.all([
           this.history.getPortfolioAsOf(c.id, from),
           this.history.getPortfolioAsOf(c.id, to),
-          this.memberFlows(
-            c.id,
-            from,
-            to,
-            (c.accountingMethod ?? 'TRANSACTIONAL') as AccountingMethod,
-          ),
+          this.memberFlows(c.id, from, to, method),
         ]);
         return {
           client: c,
@@ -355,12 +356,24 @@ export class FamilyPerformanceService {
     to: Date,
     method: AccountingMethod,
   ): Promise<CashFlow[]> {
-    const rows = await this.prisma.transaction.findMany({
-      where: { clientId, date: { gt: from, lt: to } },
-      orderBy: { date: 'asc' },
-    });
+    const [rows, baseline] = await Promise.all([
+      this.prisma.transaction.findMany({
+        where: { clientId, date: { gt: from, lt: to } },
+        orderBy: { date: 'asc' },
+      }),
+      this.prisma.portfolioBaseline.findUnique({
+        where: { clientId },
+        select: { baselineDate: true },
+      }),
+    ]);
 
-    return buildWindowFlows(rows, method, from, to);
+    // The import-artifact filter only applies when this member's baseline IS
+    // the shared house baseline (absence falls back to the synthetic
+    // house-dated one). See isImportArtifact's doc comment and the matching
+    // gate in PortfolioReconstructionService.reconstruct.
+    const isHouseBaseline = !baseline || isHouseBaselineDate(baseline.baselineDate);
+
+    return buildWindowFlows(rows, method, from, to, undefined, isHouseBaseline);
   }
 
   /**

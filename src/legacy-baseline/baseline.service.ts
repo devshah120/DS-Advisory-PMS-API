@@ -1,7 +1,7 @@
 import { ConflictException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { HistoricalPriceService } from '../historical-price/historical-price.service';
-import { JUN30_REBASE_DATE, isImportArtifact } from '../analytics/calculators/flows';
+import { JUN30_REBASE_DATE, isImportArtifact, isHouseBaselineDate } from '../analytics/calculators/flows';
 import { CreateBaselineDto } from './dto/create-baseline.dto';
 
 export interface AutoSeedSummary {
@@ -128,10 +128,16 @@ export class BaselineService {
       orderBy: { date: 'asc' },
     });
 
+    // The import-artifact filter only applies when seeding AT the shared
+    // house baseline date. A no-legacy client seeded at their own first
+    // transaction date must not have their own real BUYs misclassified as
+    // bulk-import artifacts. See the doc comment on isImportArtifact.
+    const isHouseBaseline = isHouseBaselineDate(baselineDate);
+
     const sharesAddedSince = new Map<string, number>();
     for (const t of postBaseline) {
       if (!t.ticker || !t.quantity) continue;
-      if (isImportArtifact(t)) continue;
+      if (isImportArtifact(t, isHouseBaseline)) continue;
 
       const delta =
         t.type === 'BUY' || t.type === 'SPLIT' || t.type === 'BONUS'
@@ -206,6 +212,8 @@ export class BaselineService {
       where: { clientId, date: { gt: baselineDate } },
     });
 
+    const isHouseBaseline = isHouseBaselineDate(baselineDate);
+
     let netCashSinceBaseline = 0;
     for (const t of ledger) {
       /**
@@ -221,7 +229,7 @@ export class BaselineService {
        * book and push the reconstructed cash just as far positive as it used to
        * sit negative.
        */
-      if (isImportArtifact(t)) continue;
+      if (isImportArtifact(t, isHouseBaseline)) continue;
 
       switch (t.type) {
         case 'BUY':

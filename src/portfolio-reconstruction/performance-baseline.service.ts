@@ -3,7 +3,7 @@ import { PrismaService } from '../common/prisma/prisma.service';
 import { PortfolioHistoryService } from './portfolio-history.service';
 import { BenchmarkHistoryService, BenchmarkWindowResult } from './benchmark-history.service';
 import { CashFlow, xirr } from '../analytics/calculators/xirr';
-import { AccountingMethod, buildWindowFlows } from '../analytics/calculators/flows';
+import { AccountingMethod, buildWindowFlows, isHouseBaselineDate } from '../analytics/calculators/flows';
 import { ResolvedPeriod } from './periods';
 import { Market } from '../common/market-scope';
 
@@ -132,7 +132,15 @@ export class PerformanceBaselineService {
     const simpleReturnPct =
       openingValue > 0 ? (closingValue - openingValue) / openingValue : null;
 
-    const method = (client?.accountingMethod ?? 'TRANSACTIONAL') as AccountingMethod;
+    /**
+     * The cash-flow method is retired product-wide (see PerformanceService,
+     * which hardcodes this same override and explains why: a legacy row still
+     * stored as CASH_FLOW must not compute differently here than it does on
+     * the Clients list). This service previously read `client.accountingMethod`
+     * directly, which is the exact split bug that override closes elsewhere —
+     * left open here, so this fix must match it.
+     */
+    const method: AccountingMethod = 'TRANSACTIONAL';
     const flows = await this.windowFlows(clientId, from, to, openingValue, closingValue, method);
     // The client's own book decides the benchmark: an Indian mandate is measured
     // against the Nifty 50, not the S&P 500. Passing market here is what makes
@@ -235,12 +243,24 @@ export class PerformanceBaselineService {
     closingValue: number,
     method: AccountingMethod,
   ): Promise<CashFlow[]> {
-    const ledger = await this.prisma.transaction.findMany({
-      where: { clientId, date: { gt: from, lt: to } },
-      orderBy: { date: 'asc' },
-    });
+    const [ledger, baseline] = await Promise.all([
+      this.prisma.transaction.findMany({
+        where: { clientId, date: { gt: from, lt: to } },
+        orderBy: { date: 'asc' },
+      }),
+      this.prisma.portfolioBaseline.findUnique({
+        where: { clientId },
+        select: { baselineDate: true },
+      }),
+    ]);
 
-    const interior = buildWindowFlows(ledger, method, from, to);
+    // The import-artifact filter only applies when this client's baseline IS
+    // the shared house baseline. A client with no baseline row at all falls
+    // back to the synthetic house-dated one (PortfolioReconstructionService),
+    // so absence counts as "house baseline" too. See isImportArtifact's doc
+    // comment and the matching gate in PortfolioReconstructionService.reconstruct.
+    const isHouseBaseline = !baseline || isHouseBaselineDate(baseline.baselineDate);
+    const interior = buildWindowFlows(ledger, method, from, to, undefined, isHouseBaseline);
 
     return [
       { date: from, amount: -openingValue },
