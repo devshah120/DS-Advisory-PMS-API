@@ -18,6 +18,14 @@ export class ConfigService {
     smtpPass: process.env.SMTP_PASS,
     smtpFromName: process.env.SMTP_FROM_NAME || 'DS Advisory',
     smtpFromEmail: process.env.SMTP_FROM_EMAIL,
+
+    // Automated Client Review Pack — AI commentary. `commentaryProvider`
+    // defaults to "fallback" so a checkout with no Gemini key still generates
+    // usable (deterministic) commentary; see TemplateCommentaryProvider.
+    geminiApiKey: process.env.GEMINI_API_KEY,
+    geminiModel: process.env.GEMINI_MODEL || 'gemini-2.0-flash',
+    commentaryProvider: process.env.COMMENTARY_PROVIDER || 'fallback',
+    commentaryEnabled: process.env.COMMENTARY_ENABLED !== 'false',
   };
 
   get(key: string): string {

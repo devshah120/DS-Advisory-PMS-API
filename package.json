@@ -44,6 +44,8 @@
     "class-validator": "^0.14.0",
     "csv-parser": "^3.0.0",
     "dotenv": "^16.3.1",
+    "jspdf": "^4.2.1",
+    "jspdf-autotable": "^5.0.8",
     "mongodb": "^6.3.0",
     "nodemailer": "^9.0.3",
     "otplib": "^13.4.1",

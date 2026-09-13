@@ -54,6 +54,25 @@ export class FamilyPerformanceController {
   }
 
   /**
+   * The household's own start date: the EARLIEST `inceptionDate` among its
+   * members, since the family is measured as one account and that account's
+   * money-weighted flows (see FamilyPerformanceService) cannot predate its
+   * first member's own start. A family with no members yet has no floor of
+   * its own — `undefined` leaves `effectiveInception` at the house date, which
+   * is moot anyway because `emptyHousehold` short-circuits before any window
+   * math runs.
+   */
+  private async householdInceptionFor(familyId: string): Promise<Date | undefined> {
+    const family = await this.prisma.family.findUnique({
+      where: { id: familyId },
+      select: { clients: { select: { inceptionDate: true } } },
+    });
+    const dates = family?.clients.map((c) => c.inceptionDate) ?? [];
+    if (dates.length === 0) return undefined;
+    return new Date(Math.min(...dates.map((d) => d.getTime())));
+  }
+
+  /**
    * The periods a household can be measured over — the same list a member
    * would offer, generated from the FAMILY'S market calendar so the dropdown
    * cannot drift from what `resolvePeriod` will accept.
@@ -64,7 +83,11 @@ export class FamilyPerformanceController {
     @Req() req: AuthedRequest,
     @Query('market') market?: string,
   ) {
-    return availablePeriods(new Date(), await this.marketFor(familyId, req.user, market));
+    const [resolvedMarket, householdInception] = await Promise.all([
+      this.marketFor(familyId, req.user, market),
+      this.householdInceptionFor(familyId),
+    ]);
+    return availablePeriods(new Date(), resolvedMarket, householdInception);
   }
 
   /**
@@ -83,7 +106,10 @@ export class FamilyPerformanceController {
     @Query('to') to?: string,
     @Query('market') market?: string,
   ) {
-    const resolvedMarket = await this.marketFor(familyId, req.user, market);
+    const [resolvedMarket, householdInception] = await Promise.all([
+      this.marketFor(familyId, req.user, market),
+      this.householdInceptionFor(familyId),
+    ]);
 
     const to_ = to ? this.parseDate(to) : undefined;
     const from_ = from ? this.parseDate(from) : undefined;
@@ -91,7 +117,12 @@ export class FamilyPerformanceController {
     // An explicit ?from= with no ?period= is the custom-range call.
     const code = period ?? (from_ ? 'CUSTOM' : 'INCEPTION');
 
-    const resolved = resolvePeriod(code, { from: from_, to: to_, market: resolvedMarket });
+    const resolved = resolvePeriod(code, {
+      from: from_,
+      to: to_,
+      market: resolvedMarket,
+      clientInception: householdInception,
+    });
     return this.familyPerformance.periodReturn(familyId, resolved, req.user);
   }
 

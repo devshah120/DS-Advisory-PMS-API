@@ -33,11 +33,11 @@ model User {
   /// Settings > Notifications. Nullable for the same reason as above: absent
   /// means "never chosen", which resolves to the default in UsersService rather
   /// than to `false` — otherwise every existing user would silently be opted out.
-  notifyTradeAlerts       Boolean?
-  notifyPriceTargets      Boolean?
-  notifyWeeklyDigest      Boolean?
-  notifyCorporateActions  Boolean?
-  notifyProductUpdates    Boolean?
+  notifyTradeAlerts      Boolean?
+  notifyPriceTargets     Boolean?
+  notifyWeeklyDigest     Boolean?
+  notifyCorporateActions Boolean?
+  notifyProductUpdates   Boolean?
 
   /// Settings > Security, Two-Factor Authentication (TOTP).
   ///
@@ -46,12 +46,12 @@ model User {
   /// `twoFactorEnabled` is the only flag the login gate reads. A secret with the
   /// flag still false means "setup started but never confirmed", and is simply
   /// overwritten by the next setup attempt.
-  twoFactorEnabled Boolean @default(false)
-  twoFactorSecret  String?
+  twoFactorEnabled       Boolean   @default(false)
+  twoFactorSecret        String?
   /// bcrypt hashes of the single-use recovery codes shown once at enrolment.
   /// Hashed for the same reason passwords are: a database leak must not hand
   /// over a working second factor. A consumed code is spliced out of the array.
-  twoFactorRecoveryCodes String[] @default([])
+  twoFactorRecoveryCodes String[]  @default([])
   twoFactorEnabledAt     DateTime?
 
   sessions Session[]
@@ -221,7 +221,7 @@ model Client {
   includeDividends Boolean @default(true)
   includeFees      Boolean @default(true)
 
-  currency       String       @default("USD")
+  currency String @default("USD")
 
   /// Which book of business this mandate belongs to — see common/market-scope.ts.
   ///
@@ -235,7 +235,7 @@ model Client {
   /// derived from `currency`: currency is a reporting unit that a US mandate
   /// could in principle change, whereas market determines which exchange the
   /// tickers resolve against and which indices benchmark the book.
-  market         Market       @default(US)
+  market Market @default(US)
 
   /// The staff user whose book this mandate sits in — the firm's privacy
   /// boundary, and the dimension every client-scoped read filters on alongside
@@ -268,16 +268,16 @@ model Client {
   /// deleted is therefore CODE, in UsersService.deleteUser, and that check is
   /// the only thing actually standing between a departing manager and their
   /// clients' data. Do not remove it on the strength of this annotation.
-  ownerId        String?
-  owner          User?        @relation("ClientOwner", fields: [ownerId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  ownerId String?
+  owner   User?   @relation("ClientOwner", fields: [ownerId], references: [id], onDelete: NoAction, onUpdate: NoAction)
 
   /// The household this mandate belongs to, if any — see Family.
   ///
   /// Nullable because most mandates stand alone; only the accounts a manager
   /// has explicitly grouped carry it. Set to null (not cascaded) when the
   /// family is deleted, so dissolving a household never deletes a client.
-  familyId       String?
-  family         Family?      @relation(fields: [familyId], references: [id], onDelete: SetNull)
+  familyId String?
+  family   Family? @relation(fields: [familyId], references: [id], onDelete: SetNull)
 
   status         ClientStatus @default(ACTIVE)
   cashBalance    Float        @default(0)
@@ -313,11 +313,11 @@ model Client {
   /// `@unique` here — the one-per-client rule is a Prisma-relation-field
   /// convenience only; PortfolioBaseline.clientId carries the real @unique
   /// constraint that enforces it at the database level.
-  baseline   PortfolioBaseline?
+  baseline     PortfolioBaseline?
   /// Historical daily NAV rows written by the snapshot scheduler — see
   /// PortfolioHistoryService. Empty until the first snapshot runs for this
   /// client.
-  valuations PortfolioValuation[]
+  valuations   PortfolioValuation[]
   /// Frozen per-quarter fee records, one per CLOSED quarter. Note that these
   /// carry their own copy of feeRatePercent: editing the rate above changes
   /// future billing only, never a quarter already closed.
@@ -537,7 +537,7 @@ model Watchlist {
   ///
   /// Defaults to US so every ticker added before the Indian book keeps showing
   /// on the US watchlist rather than vanishing from both.
-  market   Market @default(US)
+  market Market @default(US)
 
   /// The manager whose watchlist this row belongs to. Each manager keeps their
   /// own five slots; the list is a working research tool, and one manager's
@@ -552,7 +552,7 @@ model Watchlist {
   /// Prisma's query layer rather than the database, so UsersService clears
   /// these rows explicitly when deleting a manager.
   ownerId String?
-  owner   User?  @relation("WatchlistOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  owner   User?   @relation("WatchlistOwner", fields: [ownerId], references: [id], onDelete: Cascade)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -643,7 +643,7 @@ model Family {
   /// which has no foreign keys to enforce either way: deleting a manager who
   /// still owns households is blocked in UsersService, not by the database.
   ownerId String?
-  owner   User?  @relation("FamilyOwner", fields: [ownerId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  owner   User?   @relation("FamilyOwner", fields: [ownerId], references: [id], onDelete: NoAction, onUpdate: NoAction)
 
   notes String?
 
@@ -718,6 +718,164 @@ model Benchmark {
   @@map("benchmarks")
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Automated Client Review Pack — AI-generated quarterly commentary.
+//
+// The AI never sources a number. Every figure on a ReviewPack is copied from
+// PortfolioHistoryService / FamilyPerformanceService / BenchmarkHistoryService /
+// the analysis service's own arithmetic over Holding rows — this collection
+// only stores the result plus the prose written about it. See
+// ReviewPackAnalysisService and CommentaryGenerationService.
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum ReviewSubjectType {
+  CLIENT
+  FAMILY
+}
+
+enum CommentaryStatus {
+  DRAFT
+  GENERATED
+  EDITED
+  APPROVED
+  FAILED
+}
+
+/// One quarterly (or other period) review pack for one client or family.
+///
+/// `@@unique([subjectType, subjectId, periodCode])` is the regeneration guard
+/// from spec §76-77: generating twice for the same subject and period reuses
+/// this row and appends a ReviewPackVersion, rather than calling the AI again
+/// on every dialog open. REGENERATE is the only thing that mints a new version.
+model ReviewPack {
+  id          String            @id @default(cuid()) @map("_id")
+  subjectType ReviewSubjectType
+  subjectId   String
+  market      Market
+
+  /// Matches the vocabulary in portfolio-reconstruction/periods.ts, e.g. "Q2-FY27".
+  periodCode  String
+  periodStart DateTime
+  periodEnd   DateTime
+
+  benchmarkCode   String?
+  portfolioValue  Float?
+  portfolioReturn Float?
+  benchmarkReturn Float?
+  difference      Float?
+
+  headline              String?
+  portfolioCommentary   String?
+  macroCommentary       String?
+  positioningCommentary String?
+  keyPoints             String[] @default([])
+
+  /// HIGH | MEDIUM | LOW — set by ReviewPackAnalysisService from how much of the
+  /// underlying data was actually measurable. Never invented by the AI.
+  dataQuality String
+  warnings    String[] @default([])
+
+  status        CommentaryStatus @default(DRAFT)
+  /// "gemini" | "template" — which provider actually produced the saved prose,
+  /// which may differ from what was requested if the AI call failed validation
+  /// and the deterministic fallback took over.
+  aiProvider    String?
+  aiModel       String?
+  promptVersion String?
+
+  generatedAt DateTime?
+  generatedBy String?
+  approvedAt  DateTime?
+  approvedBy  String?
+
+  /// The manager whose book this pack belongs to, mirrors Client.ownerId /
+  /// Family.ownerId — stamped from the subject at creation. See
+  /// common/ownership-scope.ts; a review pack must obey the same boundary as
+  /// the client or household it is about.
+  ownerId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  versions ReviewPackVersion[]
+
+  @@unique([subjectType, subjectId, periodCode])
+  @@index([ownerId, market])
+  @@map("review_packs")
+}
+
+/// One generation or edit of a pack's prose. Regeneration and manual editing
+/// both append here rather than overwrite — spec §64-65, "the system must
+/// preserve original AI version, edited version and final approved version."
+model ReviewPackVersion {
+  id           String     @id @default(cuid()) @map("_id")
+  reviewPackId String
+  reviewPack   ReviewPack @relation(fields: [reviewPackId], references: [id], onDelete: Cascade)
+
+  versionNumber Int
+
+  portfolioCommentary   String?
+  macroCommentary       String?
+  positioningCommentary String?
+  headline              String?
+  keyPoints             String[] @default([])
+
+  /// "ai" | "user" | "template" — or the editing user's id when a person typed
+  /// the change by hand.
+  generatedBy String?
+  provider    String?
+  model       String?
+
+  createdAt DateTime @default(now())
+
+  @@index([reviewPackId])
+  @@map("review_pack_versions")
+}
+
+/// Cached macro/economic observations, refreshed on a schedule rather than
+/// fetched per report — spec §25-27. A historical quarter's report must read
+/// data that was relevant to THAT period, never today's figures, so lookups
+/// are always by (market, indicator, periodStart..periodEnd), never "latest".
+model MacroDataCache {
+  id              String    @id @default(cuid()) @map("_id")
+  market          Market
+  /// e.g. "REPO_RATE", "CPI", "NIFTY50_RETURN", "FED_FUNDS_RATE", "US_CPI".
+  indicator       String
+  observationDate DateTime
+  value           Float
+  unit            String
+  source          String
+  sourceUrl       String?
+  retrievedAt     DateTime  @default(now())
+  periodStart     DateTime?
+  periodEnd       DateTime?
+
+  @@unique([market, indicator, observationDate])
+  @@index([market, periodStart, periodEnd])
+  @@map("macro_data_cache")
+}
+
+/// A discrete macro/economic event (a rate decision, a CPI release) worth
+/// mentioning in commentary. Only HIGH/MEDIUM importance rows are ever fed to
+/// the AI — spec §56 caps this at 5 events per report.
+model MacroEvent {
+  id                String    @id @default(cuid()) @map("_id")
+  market            Market
+  eventDate         DateTime
+  publicationDate   DateTime?
+  title             String
+  summary           String
+  source            String
+  sourceUrl         String?
+  /// HIGH | MEDIUM | LOW.
+  importance        String
+  relatedIndicators String[]  @default([])
+  createdAt         DateTime  @default(now())
+
+  @@index([market, eventDate])
+  @@map("macro_events")
+}
+
 /// One row per instrument. Today sector/industry/country are copied onto every
 /// holding row of every client, so reclassifying one ticker is an N-client write
 /// and any partial failure leaves the house-level rollup inconsistent with itself.
@@ -740,7 +898,7 @@ model InstrumentProfile {
   /// than re-derived on every read so exposure rollups can group by it without
   /// parsing strings, and so a future market whose symbols are NOT
   /// suffix-distinguishable can be corrected by hand.
-  market     Market     @default(US)
+  market Market @default(US)
 
   /// ETF decomposition: { region: [{ key: "China", weight: 1 }], sector: [...] }.
   /// Null for single stocks. Without this, a book holding MCHI reports 0% China
@@ -765,9 +923,9 @@ model InstrumentProfile {
   // corporate action unstorable, which is why CorporateAction.securityId is a
   // soft reference and `symbol` remains the resolution key that always works.
   /// 12-character ISIN, the globally unique instrument identifier.
-  isin String?
+  isin            String?
   /// 9-character CUSIP. North America only; null for Indian listings.
-  cusip String?
+  cusip           String?
   /// Symbols this instrument previously traded under, appended by
   /// TickerChangeProcessor. Lets a historical row written as 'FB' still resolve
   /// to the profile now called 'META' without rewriting accounting history.
@@ -821,26 +979,26 @@ model PortfolioValuation {
   /// Sum of quantity * averageCost across positions as of `date` — the
   /// accounting-cost figure, distinct from `totalValue` (market value). Used by
   /// gain/loss reporting; never fed into performance-return math.
-  totalCost Float @default(0)
+  totalCost      Float   @default(0)
   /// totalValue's securities leg minus totalCost. Derived at write time and
   /// cached here so historical reports don't need a live replay to show it.
-  unrealizedPnL Float @default(0)
+  unrealizedPnL  Float   @default(0)
   /// Cumulative realized gain from every SELL replayed up to and including
   /// `date`. Cumulative (not "since last snapshot") so any single row is a
   /// complete answer on its own.
-  realizedPnL Float @default(0)
+  realizedPnL    Float   @default(0)
   /// Benchmark value on the same unit-purchase basis as PerformanceService,
   /// valued as of `date`. Null until a benchmark is resolved for the client.
   benchmarkValue Float?
   /// Portfolio XIRR as of `date`, using PortfolioHistoryService's own flow
   /// build (not PerformanceService's) — see PortfolioHistoryService for why
   /// the two are computed independently rather than sharing one call site.
-  xirr Float?
+  xirr           Float?
   /// True only for the row the quarter-end scheduler wrote (or backfilled) for
   /// a given quarter. A quarter can also acquire an ordinary daily row on the
   /// same date before the scheduler runs; the scheduler upserts and sets this
   /// flag rather than assuming its row is the first to exist for that date.
-  isQuarterEnd Boolean @default(false)
+  isQuarterEnd   Boolean @default(false)
 
   holdings HoldingSnapshot[]
 
@@ -871,17 +1029,17 @@ model HoldingSnapshot {
   marketValue  Float
   /// Weight against the parent snapshot's totalValue (TOTAL_ASSETS basis, matching
   /// weights.ts elsewhere in the codebase).
-  allocation Float
-  sector     String
-  industry   String
+  allocation   Float
+  sector       String
+  industry     String
   /// Not in the original Part 6 field list, but needed so a snapshot-served
   /// read (PortfolioHistoryService.getPortfolioAsOf) can rebuild country and
   /// asset allocation from stored data alone — without them, a snapshot-served
   /// date silently returns empty breakdowns while a reconstructed one doesn't,
   /// breaking "the user should not know whether Snapshot or Reconstruction was
   /// used" (PART 7).
-  country    String @default("Unknown")
-  assetClass String @default("EQUITY")
+  country      String @default("Unknown")
+  assetClass   String @default("EQUITY")
 
   createdAt DateTime @default(now())
 
@@ -1077,7 +1235,7 @@ model EventSnapshot {
   /// earnings/splits and for payers the upstream has no rate for. Annual
   /// rather than per-payment because that is what the upstream reports; see
   /// WatchlistEvent.dividendRate.
-  dividendRate Float?
+  dividendRate   Float?
   /// Payments per year (1/2/4/12), inferred from the trailing yield. Null when
   /// it could not be determined, which suppresses the per-payment estimate.
   payoutsPerYear Int?
@@ -1121,7 +1279,7 @@ model NewsArticle {
   /// Canonical link. Also the dedupe key: the same story reaching us from two
   /// upstreams (a BSE filing and the Reuters write-up of it) is two distinct
   /// rows, but one story fetched twice is one row.
-  url       String @unique
+  url       String  @unique
   /// Short teaser. Null when the upstream gives only a headline.
   summary   String?
 
@@ -1167,9 +1325,9 @@ model NewsArticle {
 /// automatic resolution safe: a wrong auto-match can be corrected and will
 /// never be silently overwritten by a later refresh.
 model BseScripCode {
-  id     String @id @default(cuid()) @map("_id")
+  id        String  @id @default(cuid()) @map("_id")
   /// Normalized Yahoo-style symbol, e.g. "RELIANCE.NS".
-  ticker String @unique
+  ticker    String  @unique
   /// BSE scrip code, e.g. "500325".
   scripCode String
   /// Company name as BSE spells it — shown when confirming an ambiguous match.
@@ -1334,9 +1492,9 @@ model ClientFeeSchedule {
   /// Billable days for the OPENING book, prorated from the later of
   /// (quarter start, inception). Capital deployed later carries its own
   /// day-count inside `segments` — this field does not describe it.
-  daysBilled   Int
+  daysBilled    Int
   daysInQuarter Int
-  feeAmount    Float
+  feeAmount     Float
 
   /// Where portfolioValue came from: "snapshot" when the quarter-end
   /// PortfolioValuation row existed, "reconstruction" when the scheduler had
@@ -1402,8 +1560,8 @@ model AppSetting {
   /// and a boolean instead, so the UI can prove a key is configured and show
   /// its tail without the value itself ever reaching a client. A database dump
   /// therefore does not hand over the ability to charge cards.
-  razorpayKeyId     String?
-  razorpayKeySecret String?
+  razorpayKeyId       String?
+  razorpayKeySecret   String?
   /// Last 4 characters of the plaintext secret, kept alongside the ciphertext
   /// purely so the UI can render "••••4f2a" without a decrypt on every read.
   razorpaySecretLast4 String?
@@ -1500,7 +1658,7 @@ model SubscriptionPayment {
   /// Major currency units, matching AppSetting.monthlyAmount — see the note
   /// there on why this is not paise.
   amount   Float
-  currency String @default("INR")
+  currency String       @default("INR")
   cycle    BillingCycle
 
   /// Razorpay's own identifiers, kept so a row here can be reconciled against
@@ -1509,7 +1667,7 @@ model SubscriptionPayment {
   razorpayPaymentId String?
   /// "created" | "captured" | "failed" — Razorpay's vocabulary, not ours,
   /// because translating it would only obscure what the dashboard shows.
-  status String @default("created")
+  status            String  @default("created")
 
   /// The access window this payment bought. Copied onto User on capture.
   periodStart DateTime?
@@ -1577,12 +1735,12 @@ model CorporateAction {
   securityId String?
   /// Canonical Yahoo-style symbol ('AAPL' / 'RELIANCE.NS'), normalised through
   /// normalizeSymbol() so it joins directly against Holding.ticker.
-  symbol String
+  symbol     String
   /// Company name as reported at announcement — kept even after a rename, so
   /// the action reads correctly against the name in force at the time.
-  company String?
+  company    String?
   /// Which book the symbol trades in, derived by marketForSymbol().
-  market Market @default(US)
+  market     Market  @default(US)
 
   actionType CorporateActionType
 
@@ -1598,10 +1756,10 @@ model CorporateAction {
   /// The date the action takes effect on holdings. Required: it is the date
   /// the ledger row is stamped with and therefore the hinge the whole
   /// before/after history turns on.
-  effectiveDate DateTime
-  paymentDate   DateTime?
+  effectiveDate    DateTime
+  paymentDate      DateTime?
   /// When this engine actually applied it. Null until PROCESSED.
-  processingDate DateTime?
+  processingDate   DateTime?
 
   // ── Ratio (PART 6) ────────────────────────────────────────────────────────
   /// '1:2' is stored oldRatio=1, newRatio=2 and means each 1 old share becomes
@@ -1645,7 +1803,7 @@ model CorporateAction {
   /// Every source that reported this event, primary first (PART 7's merge
   /// result). Shape: [{ source, tier, url, reference, fetchedAt, payload }].
   /// Never overwritten on a re-fetch — appended to, so provenance accumulates.
-  sources Json?
+  sources         Json?
 
   status CorporateActionStatus @default(DETECTED)
 
@@ -1659,7 +1817,7 @@ model CorporateAction {
   hasConflict Boolean @default(false)
   /// Human-readable description of the disagreement, shown in the Review
   /// Center. Shape: [{ field, values: [{ source, value }] }].
-  conflicts Json?
+  conflicts   Json?
 
   /// Deterministic dedupe key over (symbol, type, the dates that identify the
   /// event, ratio) — see fingerprintOf(). Unique: the database, not
@@ -1675,9 +1833,9 @@ model CorporateAction {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  createdBy  String?
-  approvedBy String?
-  approvedAt DateTime?
+  createdBy       String?
+  approvedBy      String?
+  approvedAt      DateTime?
   /// Why it was rejected, for the audit trail and the grid's tooltip.
   rejectionReason String?
 
@@ -1755,8 +1913,8 @@ model CorporateActionLedger {
   corporateActionId String
   corporateAction   CorporateAction @relation(fields: [corporateActionId], references: [id], onDelete: Cascade)
 
-  clientId String
-  client   Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  clientId    String
+  client      Client  @relation(fields: [clientId], references: [id], onDelete: Cascade)
   /// The book this client's mandate sits in. Denormalised so the ledger can be
   /// reported on without joining Client.
   portfolioId String?
@@ -1833,7 +1991,7 @@ model CorporateActionAuditLog {
   /// 'system' instead — a null user with a label is honest about automation in
   /// a way that attributing it to a service account would not be.
   userId     String?
-  actorLabel String @default("system")
+  actorLabel String  @default("system")
 
   /// State either side of the change, as JSON. For a processing run this is
   /// the aggregate (total shares before/after); per-client detail lives in the
@@ -1841,7 +1999,7 @@ model CorporateActionAuditLog {
   beforeValue Json?
   afterValue  Json?
 
-  source String?
+  source    String?
   /// Present only where the request carried one — the existing Session model
   /// captures IP for logins, and this mirrors that where available (PART 43).
   ipAddress String?

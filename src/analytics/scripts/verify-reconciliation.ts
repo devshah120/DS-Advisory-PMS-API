@@ -59,7 +59,10 @@ async function main() {
       continue;
     }
 
-    const historical = await baseline.periodReturn(client.id, resolvePeriod('INCEPTION'));
+    const historical = await baseline.periodReturn(
+      client.id,
+      resolvePeriod('INCEPTION', { clientInception: client.inceptionDate }),
+    );
     const row = await prisma.portfolioBaseline.findUnique({ where: { clientId: client.id } });
     if (!row) {
       console.log(`SKIP  ${client.name} — no baseline`);

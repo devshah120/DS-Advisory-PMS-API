@@ -191,6 +191,84 @@ describe('resolvePeriod — inception guard', () => {
   });
 });
 
+/**
+ * A client (or household) whose own mandate began AFTER the house floor must
+ * never be credited with history it cannot have. This is the per-client
+ * inception floor: `effectiveInception` picks whichever of the house date and
+ * `clientInception` is later, so a mandate opened well after the house's
+ * 30-June-2026 date is clamped to ITS OWN start, not the house's.
+ *
+ * Every test in the earlier blocks passes no `clientInception` at all and all
+ * still pass unchanged — the house floor remains the answer whenever a client
+ * predates it or none is supplied, which covers every client seeded so far.
+ */
+describe('resolvePeriod / availablePeriods — per-client inception floor', () => {
+  const LATE_CLIENT = new Date('2027-02-10T00:00:00.000Z'); // after the house floor
+
+  it('opens INCEPTION on the client\'s own later start date, not the house one', () => {
+    const r = resolvePeriod('INCEPTION', {
+      asOf: new Date('2027-05-10T00:00:00.000Z'),
+      market: 'INDIA',
+      clientInception: LATE_CLIENT,
+    });
+    expect(iso(r.from)).toBe('2027-02-10');
+    expect(r.clampedToInception).toBe(false);
+    expect(r.daysClamped).toBe(0);
+  });
+
+  it('clamps FYTD forward to a client inception that falls inside the fiscal year', () => {
+    // FY27 (Apr-2026 → Mar-2027) nominally opens 1-April, but this client's
+    // mandate did not begin until 10-Feb-2027 — well inside that year.
+    const r = resolvePeriod('FYTD', {
+      asOf: new Date('2027-03-20T00:00:00.000Z'),
+      market: 'INDIA',
+      clientInception: LATE_CLIENT,
+    });
+    expect(iso(r.from)).toBe('2027-02-10');
+    expect(r.clampedToInception).toBe(true);
+    expect(iso(r.nominalFrom!)).toBe('2026-04-01'); // FY27's nominal start
+  });
+
+  it('ignores a client inception that falls before the house floor', () => {
+    const r = resolvePeriod('INCEPTION', {
+      asOf: AUG_2026,
+      market: 'INDIA',
+      clientInception: new Date('2025-12-16T00:00:00.000Z'),
+    });
+    // The house has no priced history before 30-June-2026 regardless of when
+    // this mandate began, so the house date still wins.
+    expect(iso(r.from)).toBe(INCEPTION);
+  });
+
+  it('rejects a window that closes before the client inception even opens', () => {
+    expect(() =>
+      resolvePeriod('Q4-FY26', {
+        asOf: new Date('2027-05-10T00:00:00.000Z'),
+        market: 'INDIA',
+        clientInception: LATE_CLIENT,
+      }),
+    ).toThrow(BadRequestException);
+  });
+
+  it('drops quarters and years that predate the client inception from the dropdown', () => {
+    const opts = availablePeriods(
+      new Date('2027-05-10T00:00:00.000Z'),
+      'INDIA',
+      LATE_CLIENT,
+    );
+    const codes = opts.map((o) => o.code);
+    // Q3-FY27 (Oct-Dec 2026) closed entirely before this client's 10-Feb-2027
+    // start and must not appear, even though the house floor would allow it.
+    expect(codes).not.toContain('Q3-FY27');
+  });
+
+  it('leaves the dropdown unchanged when no client inception is supplied', () => {
+    const withClient = availablePeriods(AUG_2026, 'INDIA', undefined);
+    const withoutClient = availablePeriods(AUG_2026, 'INDIA');
+    expect(withClient).toEqual(withoutClient);
+  });
+});
+
 describe('availablePeriods', () => {
   it('leads with the named current quarter on the Indian book', () => {
     const opts = availablePeriods(AUG_2026, 'INDIA');

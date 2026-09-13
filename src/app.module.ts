@@ -21,6 +21,7 @@ import { LegacyBaselineModule } from './legacy-baseline/legacy-baseline.module';
 import { PortfolioReconstructionModule } from './portfolio-reconstruction/portfolio-reconstruction.module';
 import { SubscriptionModule } from './subscription/subscription.module';
 import { CorporateActionsModule } from './corporate-actions/corporate-actions.module';
+import { ReviewPackModule } from './review-pack/review-pack.module';
 
 @Module({
   imports: [
@@ -53,6 +54,9 @@ import { CorporateActionsModule } from './corporate-actions/corporate-actions.mo
     // Reports and Performance reflect corporate actions without either module
     // importing this one.
     CorporateActionsModule,
+    // Automated Client Review Pack. Reads PortfolioReconstructionModule's
+    // verified engines; nothing existing depends on it. See review-pack.module.ts.
+    ReviewPackModule,
   ],
 })
 export class AppModule {}

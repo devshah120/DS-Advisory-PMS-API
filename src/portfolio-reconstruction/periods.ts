@@ -25,10 +25,20 @@ import {
  * nonsense returns on this book before.
  *
  * So `INCEPTION` opens there by definition, and every calendar window is
- * clamped to it. In practice that also makes the identity the desk expects
- * fall out for free: today the quarter opened 1-July, the day after inception
- * with no trading in between, so QTD and INCEPTION resolve to the same opening
- * value and report the same number.
+ * clamped to it — that is the HOUSE floor, the earliest date any client can be
+ * priced. In practice that also makes the identity the desk expects fall out
+ * for free: today the quarter opened 1-July, the day after inception with no
+ * trading in between, so QTD and INCEPTION resolve to the same opening value
+ * and report the same number.
+ *
+ * A CLIENT can also open later than the house. `resolvePeriod`/`availablePeriods`
+ * take an optional `clientInception` — the mandate's own `Client.inceptionDate`,
+ * or a household's earliest member — and raise the floor to it when it falls
+ * after the house date. A mandate that began 10-Feb-2027 has no priceable
+ * history in January even though the house does; "Since Inception" for that
+ * client must open 10-Feb-2027, not 30-June-2026. A mandate whose inception
+ * predates or matches the house floor (every client seeded so far) sees no
+ * change at all — the house date still wins.
  *
  * ── Two calendars ──────────────────────────────────────────────────────────
  * Every window here is resolved against the MARKET's reporting calendar, not
@@ -99,6 +109,23 @@ function utcDay(d: Date): Date {
 }
 
 /**
+ * The floor a window may not open before: whichever is LATER of the house
+ * inception and the client's own mandate start.
+ *
+ * `clientInception` is undefined for the house-wide dropdown listing
+ * (`availablePeriods`, which has no single client in view) and is otherwise
+ * the caller's `Client.inceptionDate` — or, for a household, its earliest
+ * member's — so a mandate that began after the house does is never credited
+ * with history it cannot have, while every mandate at or before the house
+ * floor (every client seeded so far) is completely unaffected.
+ */
+function effectiveInception(houseInception: Date, clientInception?: Date): Date {
+  if (!clientInception) return houseInception;
+  const c = utcDay(clientInception);
+  return c > houseInception ? c : houseInception;
+}
+
+/**
  * Does a window starting at `rawFrom` open on the trading day immediately after
  * inception, with no valuation of its own in between?
  *
@@ -153,9 +180,11 @@ export interface PeriodOption {
 export function availablePeriods(
   asOf: Date = new Date(),
   market: Market = DEFAULT_MARKET,
+  /** The client's (or household's earliest member's) own mandate start, if known. */
+  clientInception?: Date,
 ): PeriodOption[] {
   const day = utcDay(asOf);
-  const inception = utcDay(INCEPTION_DATE);
+  const inception = effectiveInception(utcDay(INCEPTION_DATE), clientInception);
   const iso = (d: Date) => d.toISOString().slice(0, 10);
   const fmt = (d: Date) =>
     d.toLocaleDateString('en-GB', {
@@ -236,7 +265,7 @@ export function availablePeriods(
     const range = fiscalQuarterRange(qq, qfy, market);
 
     try {
-      resolvePeriod(code, { asOf: day, market });
+      resolvePeriod(code, { asOf: day, market, clientInception });
     } catch {
       continue; // zero-length once clamped — not a measurable period
     }
@@ -260,7 +289,7 @@ export function availablePeriods(
 
     const code = fiscalYearCode(y, market);
     try {
-      resolvePeriod(code, { asOf: day, market });
+      resolvePeriod(code, { asOf: day, market, clientInception });
     } catch {
       continue;
     }
@@ -290,10 +319,17 @@ export function availablePeriods(
  */
 export function resolvePeriod(
   code: PeriodCode,
-  opts: { asOf?: Date; from?: Date; to?: Date; market?: Market } = {},
+  opts: {
+    asOf?: Date;
+    from?: Date;
+    to?: Date;
+    market?: Market;
+    /** The client's (or household's earliest member's) own mandate start, if known. */
+    clientInception?: Date;
+  } = {},
 ): ResolvedPeriod {
   const asOf = utcDay(opts.asOf ?? new Date());
-  const inception = utcDay(INCEPTION_DATE);
+  const inception = effectiveInception(utcDay(INCEPTION_DATE), opts.clientInception);
   const market = opts.market ?? DEFAULT_MARKET;
 
   const clamp = (

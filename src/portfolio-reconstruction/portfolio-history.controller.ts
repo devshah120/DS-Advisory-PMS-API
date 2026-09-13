@@ -52,6 +52,21 @@ export class PortfolioHistoryController {
   }
 
   /**
+   * The mandate's own start date — `Client.inceptionDate` — so a client whose
+   * history genuinely begins after the house floor (see periods.ts) is never
+   * credited with, or clamped to, history it cannot have. Every client at or
+   * before the house floor (every one seeded so far) is unaffected: the house
+   * date still wins in `effectiveInception`.
+   */
+  private async clientInceptionFor(clientId: string): Promise<Date | undefined> {
+    const client = await this.prisma.client.findUnique({
+      where: { id: clientId },
+      select: { inceptionDate: true },
+    });
+    return client?.inceptionDate;
+  }
+
+  /**
    * Every route here is mounted under `clients/:clientId` and serves that
    * mandate's history, so each one gates on ownership first.
    *
@@ -92,16 +107,21 @@ export class PortfolioHistoryController {
     @Query('market') market?: string,
   ) {
     await this.assertAccess(clientId, req.user);
-    return availablePeriods(new Date(), await this.marketFor(clientId, market));
+    const [resolvedMarket, clientInception] = await Promise.all([
+      this.marketFor(clientId, market),
+      this.clientInceptionFor(clientId),
+    ]);
+    return availablePeriods(new Date(), resolvedMarket, clientInception);
   }
 
   /**
    * ?period=INCEPTION|MTD|QTD|YTD|Q3-CY26|…, or ?from=YYYY-MM-DD&to=YYYY-MM-DD
    * for a custom range.
    *
-   * Every window is clamped so it can never open before the 30-June-2026
-   * inception (see periods.ts). Returns the opening/closing portfolio value and
-   * the simple return over the window, plus the benchmark over the same window.
+   * Every window is clamped so it can never open before the LATER of the house
+   * floor and this client's own `inceptionDate` (see periods.ts). Returns the
+   * opening/closing portfolio value and the simple return over the window, plus
+   * the benchmark over the same window.
    */
   @Get('return')
   async periodReturn(
@@ -120,10 +140,16 @@ export class PortfolioHistoryController {
     // An explicit ?from= with no ?period= is the custom-range call.
     const code: PerformancePeriod = period ?? (from_ ? 'CUSTOM' : 'INCEPTION');
 
+    const [resolvedMarket, clientInception] = await Promise.all([
+      this.marketFor(clientId, market),
+      this.clientInceptionFor(clientId),
+    ]);
+
     const resolved = resolvePeriod(code, {
       from: from_,
       to: to_,
-      market: await this.marketFor(clientId, market),
+      market: resolvedMarket,
+      clientInception,
     });
     return this.performanceBaseline.periodReturn(clientId, resolved);
   }
