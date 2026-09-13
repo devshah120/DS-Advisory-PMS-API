@@ -24,11 +24,17 @@ import { FamilyPerformanceController } from './family-performance.controller';
     SnapshotScheduler,
   ],
   // Exported so a future Reports/export feature can consume the read paths
-  // without re-declaring these as its own providers.
+  // without re-declaring these as its own providers. BenchmarkHistoryService
+  // joined this list for ReviewPackModule, which needs the same benchmark
+  // resolution (and the same market-scoped isDefault fix) that
+  // PortfolioHistoryService and FamilyPerformanceService already use
+  // internally — a second, re-declared instance would risk the two drifting
+  // apart on exactly the bug benchmark-resolution.spec.ts guards against.
   exports: [
     PortfolioReconstructionService,
     PortfolioHistoryService,
     PerformanceBaselineService,
+    BenchmarkHistoryService,
     FamilyPerformanceService,
   ],
 })
