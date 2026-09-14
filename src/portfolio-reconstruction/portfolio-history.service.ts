@@ -42,12 +42,72 @@ export class PortfolioHistoryService {
 
   /**
    * PART 7: snapshot-first, reconstruction-fallback, same output shape
-   * either way.
+   * either way — but only for a snapshot that is still ENTITLED to answer.
+   *
+   * A stored row is a cache of a replay, not an independent record, so it is
+   * only as true as the ledger it was replayed from. Trusting it unconditionally
+   * (the previous behaviour) meant a snapshot written at 16:00 permanently
+   * outranked a trade booked at 16:30 for the same day — the row said the book
+   * was empty, and it stayed empty forever no matter what was entered
+   * afterwards. That is exactly how a client holding 59 ANUP.NS worth ~98,353
+   * came to report a CLOSING VALUE OF ZERO, which in turn made the window's
+   * terminal flow zero and left XIRR with an all-negative series it cannot
+   * solve — the "Not available" return on a book that had plainly made a trade.
+   *
+   * So the snapshot is used only when nothing has been written since that could
+   * change it. `isStale` asks that question against the ledger itself rather
+   * than against a TTL: a date whose transactions all predate the snapshot is
+   * genuinely settled and the cache is served, and any other date is replayed.
+   * Correctness is restored without giving up the cache on the historical dates
+   * it exists for.
    */
   async getPortfolioAsOf(clientId: string, date: Date): Promise<ReconstructedPortfolio> {
     const snapshot = await this.getSnapshot(clientId, date);
-    if (snapshot) return this.fromSnapshotRow(clientId, snapshot);
+    if (snapshot && !(await this.isStale(clientId, snapshot))) {
+      return this.fromSnapshotRow(clientId, snapshot);
+    }
     return this.reconstruction.reconstruct(clientId, date);
+  }
+
+  /**
+   * Has anything been recorded since this snapshot was taken that would change
+   * what it says?
+   *
+   * Two independent reasons a row cannot be trusted:
+   *
+   *  1. **The day is not over.** A snapshot for today (or any future date) is a
+   *     reading taken mid-session: more trades can still be booked against it,
+   *     and prices are still moving. It is a progress figure, never a settled
+   *     one, so it is always replayed.
+   *
+   *  2. **The ledger moved underneath it.** A transaction dated on or before the
+   *     snapshot's date but CREATED after the snapshot was written was not seen
+   *     by the replay that produced it. This catches the ordinary back-dated
+   *     entry — a manager booking Thursday's trade on Monday — which is the
+   *     common case on this desk and silently corrupted every window that
+   *     touched the affected date.
+   *
+   * `createdAt` is the right comparison on both sides: it is when we LEARNED
+   * the fact, whereas `date` is when the fact happened, and staleness is a
+   * question about knowledge, not about chronology.
+   */
+  private async isStale(
+    clientId: string,
+    snapshot: { date: Date; createdAt: Date },
+  ): Promise<boolean> {
+    const today = utcDay(new Date());
+    if (utcDay(snapshot.date).getTime() >= today.getTime()) return true;
+
+    const newerEntry = await this.prisma.transaction.findFirst({
+      where: {
+        clientId,
+        date: { lte: snapshot.date },
+        createdAt: { gt: snapshot.createdAt },
+      },
+      select: { id: true },
+    });
+
+    return newerEntry !== null;
   }
 
   /**

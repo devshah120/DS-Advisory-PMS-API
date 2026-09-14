@@ -66,9 +66,13 @@ function build(members: MemberSpec[]) {
   const history = {
     getPortfolioAsOf: jest.fn(async (clientId: string, date: Date) => {
       const m = members.find((x) => x.id === clientId)!;
-      return {
-        portfolioValue: date.getTime() === FROM.getTime() ? m.opening : m.closing,
-      };
+      const value = date.getTime() === FROM.getTime() ? m.opening : m.closing;
+      // These fixtures describe fully-invested members holding no idle cash, so
+      // the two figures coincide. Both are supplied because the engine measures
+      // return on `holdingsValue` alone — a cash balance must never move a
+      // reported return — while `portfolioValue` remains what the household is
+      // WORTH. A stub that set only one would silently test the wrong one.
+      return { portfolioValue: value, holdingsValue: value };
     }),
   } as unknown as PortfolioHistoryService;
 

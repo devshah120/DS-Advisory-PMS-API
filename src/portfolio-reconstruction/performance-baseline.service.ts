@@ -108,10 +108,36 @@ export class PerformanceBaselineService {
    * fallback (PART 7) — reused here rather than reimplemented, so "opening
    * value for a return period" and "portfolio as of a historical date" can
    * never disagree about which source they used for the same date.
+   *
+   * ── SECURITIES ONLY — cash is never measured ──────────────────────────────
+   * This returns `holdingsValue`, NOT `portfolioValue`, and the closing side of
+   * the window does the same. The idle cash balance is a figure the manager
+   * maintains for their own bookkeeping (see CashFlowModal: its three modes all
+   * write `Client.cashBalance` directly and never create a ledger row), and it
+   * MUST NOT move any reported return in any direction.
+   *
+   * Including it did exactly that. Cash sat inside both ends of the window, so
+   * setting a balance, adding to it or withdrawing from it silently re-priced
+   * the opening and closing values of a window whose trades had not changed at
+   * all — and because the amount never appears in the flow series (a
+   * transactional book has no CASH_DEPOSIT rows, by design), XIRR had no way to
+   * recognise it as capital arriving. It was therefore solved as PERFORMANCE:
+   * park a lakh of cash and the book reports a gain it did not earn; withdraw
+   * it and the book reports a loss it did not suffer.
+   *
+   * Measuring securities alone makes the guarantee structural rather than
+   * conventional — there is no cash term left in the arithmetic to leak. It
+   * also matches what the Clients list already does (`deriveMetrics` sets the
+   * terminal value to holdings only, "idle cash is excluded from the
+   * transactional return"), so the two pages can no longer disagree.
+   *
+   * The cash balance is still reported everywhere it is genuinely informative —
+   * portfolio value, allocation weights, the household total — it simply has no
+   * vote on return.
    */
   async openingValue(clientId: string, periodStart: Date): Promise<number> {
     const portfolio = await this.history.getPortfolioAsOf(clientId, periodStart);
-    return portfolio.portfolioValue;
+    return portfolio.holdingsValue;
   }
 
   /**
@@ -128,7 +154,7 @@ export class PerformanceBaselineService {
       this.history.getPortfolioAsOf(clientId, to),
     ]);
 
-    const closingValue = closingPortfolio.portfolioValue;
+    const closingValue = closingPortfolio.holdingsValue;
     const simpleReturnPct =
       openingValue > 0 ? (closingValue - openingValue) / openingValue : null;
 

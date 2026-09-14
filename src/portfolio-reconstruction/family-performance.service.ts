@@ -199,8 +199,15 @@ export class FamilyPerformanceService {
         ]);
         return {
           client: c,
-          openingValue: openPortfolio.portfolioValue,
-          closingValue: closePortfolio.portfolioValue,
+          // Securities only, both ends — idle cash has no vote on a reported
+          // return. See the long note on PerformanceBaselineService.openingValue:
+          // a member's maintained cash balance never reaches the flow series, so
+          // leaving it inside the window's valuations made every "set cash" /
+          // "add cash" / "withdraw cash" edit register as household performance.
+          // The household must obey the same rule as the member's own sheet, or
+          // one member topping up their cash would move the family's number.
+          openingValue: openPortfolio.holdingsValue,
+          closingValue: closePortfolio.holdingsValue,
           flows,
         };
       }),
