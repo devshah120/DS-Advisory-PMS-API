@@ -142,7 +142,13 @@ describe('the cash balance has no vote on the return', () => {
           cashBalance: cashAtBothEnds,
         }),
       },
-      transaction: { findMany: jest.fn().mockResolvedValue([]) },
+      transaction: {
+        findMany: jest.fn().mockResolvedValue([]),
+        // No ledger at all, so no evidence of history predating the house date:
+        // `appliesHouseRebase` treats this client as a house-baseline one, which
+        // is what this fixture has always implicitly been.
+        findFirst: jest.fn().mockResolvedValue(null),
+      },
       portfolioBaseline: { findUnique: jest.fn().mockResolvedValue(null) },
     } as unknown as PrismaService;
 

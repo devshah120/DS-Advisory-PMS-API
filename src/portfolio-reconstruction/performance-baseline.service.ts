@@ -3,7 +3,7 @@ import { PrismaService } from '../common/prisma/prisma.service';
 import { PortfolioHistoryService } from './portfolio-history.service';
 import { BenchmarkHistoryService, BenchmarkWindowResult } from './benchmark-history.service';
 import { CashFlow, xirr } from '../analytics/calculators/xirr';
-import { AccountingMethod, buildWindowFlows, isHouseBaselineDate } from '../analytics/calculators/flows';
+import { AccountingMethod, appliesHouseRebase, buildWindowFlows } from '../analytics/calculators/flows';
 import { ResolvedPeriod } from './periods';
 import { Market } from '../common/market-scope';
 
@@ -269,7 +269,7 @@ export class PerformanceBaselineService {
     closingValue: number,
     method: AccountingMethod,
   ): Promise<CashFlow[]> {
-    const [ledger, baseline] = await Promise.all([
+    const [ledger, baseline, firstTransaction] = await Promise.all([
       this.prisma.transaction.findMany({
         where: { clientId, date: { gt: from, lt: to } },
         orderBy: { date: 'asc' },
@@ -278,14 +278,33 @@ export class PerformanceBaselineService {
         where: { clientId },
         select: { baselineDate: true },
       }),
+      /**
+       * The client's FIRST transaction ever — deliberately unbounded by the
+       * window, unlike `ledger` above.
+       *
+       * The window tells us nothing about whether this client was in the bulk
+       * import; only their earliest history does. Querying it separately is
+       * what lets a Q3-FY26 window on a December-2025 mandate know that the
+       * house rebase does not apply to it, even though no row inside that
+       * window would reveal it.
+       */
+      this.prisma.transaction.findFirst({
+        where: { clientId },
+        orderBy: { date: 'asc' },
+        select: { date: true },
+      }),
     ]);
 
     // The import-artifact filter only applies when this client's baseline IS
-    // the shared house baseline. A client with no baseline row at all falls
-    // back to the synthetic house-dated one (PortfolioReconstructionService),
-    // so absence counts as "house baseline" too. See isImportArtifact's doc
-    // comment and the matching gate in PortfolioReconstructionService.reconstruct.
-    const isHouseBaseline = !baseline || isHouseBaselineDate(baseline.baselineDate);
+    // the shared house baseline — and a ledger reaching back before the house
+    // date is proof that it is not, whatever the baseline row says. A client
+    // with no baseline row and no earlier history falls back to the synthetic
+    // house-dated one (PortfolioReconstructionService), so absence still counts
+    // as "house baseline". See appliesHouseRebase and isImportArtifact.
+    const isHouseBaseline = appliesHouseRebase({
+      baselineDate: baseline?.baselineDate,
+      firstTransactionDate: firstTransaction?.date ?? null,
+    });
     const interior = buildWindowFlows(ledger, method, from, to, undefined, isHouseBaseline);
 
     return [

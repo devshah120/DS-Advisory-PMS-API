@@ -8,6 +8,7 @@ import { replayLots, totalRealizedGain } from '../calculators/tax-lots';
 import { Actor, assertCanAccessClient } from '../../common/ownership-scope';
 import {
   AccountingMethod,
+  appliesHouseRebase,
   buildFlows,
   FlowOptions,
   isImportArtifact,
@@ -154,8 +155,27 @@ export class PerformanceService {
      * synthetic 30-June basis; SELL/DIVIDEND/FEES since then remain real events.
      * A position without a 30-June bar falls back to its recorded average cost.
      */
+    /**
+     * ...and it applies ONLY to the clients whose history the import destroyed.
+     *
+     * The paragraph above is the whole justification for this transform, and
+     * every sentence of it is about the bulk import: no true purchase dates, no
+     * trade history, nothing priceable before 30-June. None of that is true of a
+     * client who has a real ledger reaching further back. For them this rebase
+     * deletes genuine trades at genuine prices and substitutes an invented June
+     * purchase — turning a client who joined 16-Dec-2025 into one who joined
+     * 30-Jun-2026, and erasing the six months in between from every figure on
+     * this page.
+     *
+     * `ledger` is ordered ascending, so its first row IS the earliest
+     * transaction and the gate costs no extra query. See `appliesHouseRebase`.
+     */
+    const houseRebase = appliesHouseRebase({
+      firstTransactionDate: ledger[0]?.date ?? null,
+    });
+
     const ledgerForFlows =
-      method === 'TRANSACTIONAL'
+      method === 'TRANSACTIONAL' && houseRebase
         ? await this.rebaseToJun30(snap, ledger)
         : ledger;
 
@@ -183,7 +203,9 @@ export class PerformanceService {
      * purchase cost, which is correct: for those, the purchase IS the inception.
      */
     const positionsForGains =
-      method === 'TRANSACTIONAL' ? await this.rebasePositionCosts(snap, ledger) : snap.positions;
+      method === 'TRANSACTIONAL' && houseRebase
+        ? await this.rebasePositionCosts(snap, ledger)
+        : snap.positions;
 
     // ── Values ────────────────────────────────────────────────────────────────
     // Holdings are always DERIVED (quantity × price). The stored

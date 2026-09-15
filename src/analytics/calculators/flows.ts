@@ -124,6 +124,49 @@ export function isHouseBaselineDate(baselineDate: Date): boolean {
 }
 
 /**
+ * Does the 30-June-2026 rebase apply to this client at all?
+ *
+ * ONE question decides it: is the house baseline actually this client's
+ * baseline? Two ways it can be:
+ *
+ *   • They have a stored `PortfolioBaseline` dated on the house date — they
+ *     were in the bulk import.
+ *   • They have no stored baseline AND no ledger history predating the house
+ *     date, so the synthetic house-dated baseline stands in for them
+ *     (PortfolioReconstructionService.syntheticBaselineDate) and nothing is
+ *     lost by treating the house date as their opening.
+ *
+ * A client with a stored baseline on their OWN date, or with real transactions
+ * before 30-June-2026, is neither — and for them the rebase must not fire. The
+ * ledger is the evidence that outranks everything here: a trade recorded in
+ * December 2025 is proof the account existed and was priceable in December
+ * 2025, whatever any baseline row happens to say.
+ *
+ * Centralised because three call sites need the same answer and MUST agree —
+ * the Performance page, the Clients-list `deriveMetrics`, and the period
+ * engine. They have drifted before, and a client measured as house-baseline on
+ * one page and client-baseline on another reports two different returns for the
+ * same book.
+ */
+export function appliesHouseRebase(input: {
+  /** The client's stored `PortfolioBaseline.baselineDate`, if they have one. */
+  baselineDate?: Date | null;
+  /** The client's earliest transaction date, if they have any ledger at all. */
+  firstTransactionDate?: Date | null;
+}): boolean {
+  if (input.firstTransactionDate && utcDayOf(input.firstTransactionDate) < INCEPTION_DATE) {
+    return false;
+  }
+  if (!input.baselineDate) return true;
+  return isHouseBaselineDate(input.baselineDate);
+}
+
+/** Midnight-UTC truncation, so a same-day comparison is not decided by a timestamp. */
+function utcDayOf(d: Date): Date {
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+}
+
+/**
  * Which tickers actually carry a legacy import BUY, and how many shares that
  * import represents — the only positions (and quantities) the 30-June
  * baseline is entitled to speak for.
@@ -163,10 +206,18 @@ export interface ImportedPosition {
 
 export function importedPositions(
   ledger: Array<{ ticker: string | null; type: string; date: Date; quantity: number | null; amount: number }>,
+  /**
+   * True when this client's baseline IS the shared house baseline — i.e. they
+   * were actually swept up in the bulk import. Passing `false` returns an empty
+   * map, which is the correct answer for a client who has real history of their
+   * own: none of their BUYs are import artifacts, so none are eligible to be
+   * replaced by a synthetic 30-June position. See `isImportArtifact`.
+   */
+  isHouseBaseline = true,
 ): Map<string, ImportedPosition> {
   const out = new Map<string, ImportedPosition>();
   for (const r of ledger) {
-    if (!r.ticker || !r.quantity || !isImportArtifact(r, true)) continue;
+    if (!r.ticker || !r.quantity || !isImportArtifact(r, isHouseBaseline)) continue;
     const existing = out.get(r.ticker) ?? { quantity: 0, costBasisTotal: 0 };
     existing.quantity += r.quantity;
     existing.costBasisTotal += Math.abs(r.amount);
@@ -178,8 +229,9 @@ export function importedPositions(
 /** Convenience wrapper over `importedPositions` for callers that only need eligibility, not size/cost. */
 export function importedTickers(
   ledger: Array<{ ticker: string | null; type: string; date: Date; quantity: number | null; amount: number }>,
+  isHouseBaseline = true,
 ): Set<string> {
-  return new Set(importedPositions(ledger).keys());
+  return new Set(importedPositions(ledger, isHouseBaseline).keys());
 }
 
 /**
@@ -217,15 +269,19 @@ export function jun30Quantities<T extends RebaseLedgerEntry>(
    * post-import BUY/SELL round trip that closed it out).
    */
   currentQuantity: ReadonlyMap<string, number>,
+  /** True when this client was part of the bulk import. See `isImportArtifact`. */
+  isHouseBaseline = true,
 ): Map<string, { quantity: number; averageCost: number }> {
-  const imported = importedPositions(ledger);
+  const imported = importedPositions(ledger, isHouseBaseline);
   const soldAfterImport = new Set(
-    ledger.filter((r) => r.ticker && r.type === 'SELL' && !isImportArtifact(r, true)).map((r) => r.ticker as string),
+    ledger
+      .filter((r) => r.ticker && r.type === 'SELL' && !isImportArtifact(r, isHouseBaseline))
+      .map((r) => r.ticker as string),
   );
 
   const realSharesAddedSince = new Map<string, number>();
   for (const r of ledger) {
-    if (!r.ticker || !r.quantity || isImportArtifact(r, true)) continue;
+    if (!r.ticker || !r.quantity || isImportArtifact(r, isHouseBaseline)) continue;
     const delta = r.type === 'BUY' ? r.quantity : r.type === 'SELL' ? -r.quantity : 0;
     if (delta !== 0) realSharesAddedSince.set(r.ticker, (realSharesAddedSince.get(r.ticker) ?? 0) + delta);
   }
@@ -252,8 +308,28 @@ export function rebaseLedgerToJun30<T extends RebaseLedgerEntry>(
   /** ticker → 30-June-2026 close. */
   jun30Close: Map<string, number>,
   currentQuantity: ReadonlyMap<string, number>,
+  /**
+   * True when this client's baseline IS the shared house baseline — the only
+   * clients this rebase was ever meant to describe.
+   *
+   * Passing `false` makes this an IDENTITY transform: no synthetic 30-June buys
+   * are generated and no rows are dropped, so the client's real ledger reaches
+   * XIRR exactly as recorded, at the prices and on the dates it actually
+   * happened.
+   *
+   * That distinction is the whole point. This rebase exists to paper over
+   * history the bulk import destroyed — it fabricates a single purchase on
+   * 30-June-2026 because, for those clients, nothing truthful can be said about
+   * any earlier date. Applied to a client who HAS earlier history, it does the
+   * opposite of its purpose: it deletes real December trades at real prices and
+   * replaces them with an invented June one. A mandate that began 16-Dec-2025
+   * had ₹14L of genuine purchases erased exactly this way.
+   */
+  isHouseBaseline = true,
 ): LedgerEntry[] {
-  const jun30 = jun30Quantities(ledger, currentQuantity);
+  if (!isHouseBaseline) return ledger;
+
+  const jun30 = jun30Quantities(ledger, currentQuantity, isHouseBaseline);
 
   const synthetic: LedgerEntry[] = [...jun30.entries()].map(([ticker, pos]) => {
     const unit = jun30Close.get(ticker) ?? pos.averageCost;
@@ -280,7 +356,7 @@ export function rebaseLedgerToJun30<T extends RebaseLedgerEntry>(
    * it as ₹111,769.15 — the full sale proceeds, because the ₹97,863.20
    * purchase that funded it had been silently erased.
    */
-  const nonBuys = ledger.filter((r) => r.type !== 'BUY' || !isImportArtifact(r, true));
+  const nonBuys = ledger.filter((r) => r.type !== 'BUY' || !isImportArtifact(r, isHouseBaseline));
   return [...synthetic, ...nonBuys];
 }
 

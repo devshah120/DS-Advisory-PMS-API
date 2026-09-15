@@ -229,15 +229,69 @@ describe('resolvePeriod / availablePeriods — per-client inception floor', () =
     expect(iso(r.nominalFrom!)).toBe('2026-04-01'); // FY27's nominal start
   });
 
-  it('ignores a client inception that falls before the house floor', () => {
+  /**
+   * The regression this whole floor exists for.
+   *
+   * This case previously asserted the opposite — that the house date wins and
+   * an earlier mandate is dragged forward to it. That was the bug: a client
+   * onboarded 16-Dec-2025 had six months of real, priceable history erased from
+   * every figure on the Performance page, and every window inside it collapsed
+   * to zero length and rendered as "Not available".
+   */
+  const EARLY_CLIENT = new Date('2025-12-16T00:00:00.000Z'); // before the house date
+
+  it('opens INCEPTION on a client start that PREDATES the house date', () => {
     const r = resolvePeriod('INCEPTION', {
       asOf: AUG_2026,
       market: 'INDIA',
-      clientInception: new Date('2025-12-16T00:00:00.000Z'),
+      clientInception: EARLY_CLIENT,
     });
-    // The house has no priced history before 30-June-2026 regardless of when
-    // this mandate began, so the house date still wins.
-    expect(iso(r.from)).toBe(INCEPTION);
+    expect(iso(r.from)).toBe('2025-12-16');
+    expect(r.clampedToInception).toBe(false);
+    expect(r.daysClamped).toBe(0);
+  });
+
+  it('measures a full quarter that closed before the house date', () => {
+    // Q4 FY26 = Jan–Mar 2026: entirely before 30-June-2026, entirely after this
+    // client's 16-Dec-2025 start. A real, whole, measurable quarter.
+    const r = resolvePeriod('Q4-FY26', {
+      asOf: AUG_2026,
+      market: 'INDIA',
+      clientInception: EARLY_CLIENT,
+    });
+    expect(iso(r.from)).toBe('2026-01-01');
+    expect(iso(r.to)).toBe('2026-03-31');
+    expect(r.clampedToInception).toBe(false);
+  });
+
+  it("offers the client's own first PARTIAL quarter in the dropdown", () => {
+    /**
+     * Q3 FY26 = Oct–Dec 2025, the quarter this mandate STARTED in. It is the
+     * one quarter the backward walk used to drop: `anchor` sits on the 15th, so
+     * a mandate beginning on the 16th made the quarter containing it look
+     * earlier than the floor and broke the loop before it was ever offered.
+     */
+    const opts = availablePeriods(AUG_2026, 'INDIA', EARLY_CLIENT);
+    const codes = opts.map((o) => o.code);
+    expect(codes).toContain('Q3-FY26');
+    expect(codes).toContain('Q4-FY26');
+
+    const r = resolvePeriod('Q3-FY26', {
+      asOf: AUG_2026,
+      market: 'INDIA',
+      clientInception: EARLY_CLIENT,
+    });
+    // Clamped forward to the mandate start, and honest about the shortfall.
+    expect(iso(r.from)).toBe('2025-12-16');
+    expect(r.clampedToInception).toBe(true);
+    expect(r.daysClamped).toBe(76); // 1-Oct → 16-Dec
+  });
+
+  it('reports the client inception on every option, for the date picker', () => {
+    const opts = availablePeriods(AUG_2026, 'INDIA', EARLY_CLIENT);
+    expect(opts.length).toBeGreaterThan(0);
+    // Every row carries it, so the picker can read it off whichever it holds.
+    expect(opts.every((o) => o.inceptionIso === '2025-12-16')).toBe(true);
   });
 
   it('rejects a window that closes before the client inception even opens', () => {

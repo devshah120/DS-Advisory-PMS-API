@@ -1,7 +1,11 @@
 import {
+  appliesHouseRebase,
   buildFlows,
   buildWindowFlows,
+  INCEPTION_DATE,
   isImportArtifact,
+  JUN30_REBASE_DATE,
+  rebaseLedgerToJun30,
   totalContributed,
   totalWithdrawn,
   LedgerEntry,
@@ -436,5 +440,70 @@ describe('buildWindowFlows — period windows respect the accounting method', ()
 
     expect(flows).toHaveLength(1);
     expect(flows[0].amount).toBe(12_000); // cash out to the client, not a split
+  });
+});
+
+
+describe('appliesHouseRebase — who the 30-June rebase is actually for', () => {
+  it('applies to a client with no baseline and no history before the house date', () => {
+    expect(
+      appliesHouseRebase({ firstTransactionDate: new Date('2026-07-01T00:00:00.000Z') }),
+    ).toBe(true);
+  });
+
+  it('applies to a client with no ledger at all', () => {
+    expect(appliesHouseRebase({ firstTransactionDate: null })).toBe(true);
+  });
+
+  it('does NOT apply to a client whose ledger predates the house date', () => {
+    // Abhishek Oberoi: real trades from 16-Dec-2025. The ledger is the evidence
+    // that outranks everything — a trade recorded then proves the account was
+    // priceable then, so there is no lost history for the rebase to paper over.
+    expect(
+      appliesHouseRebase({ firstTransactionDate: new Date('2025-12-16T00:00:00.000Z') }),
+    ).toBe(false);
+  });
+
+  it('does not apply even when a house-dated baseline row says otherwise', () => {
+    expect(
+      appliesHouseRebase({
+        baselineDate: INCEPTION_DATE,
+        firstTransactionDate: new Date('2025-12-16T00:00:00.000Z'),
+      }),
+    ).toBe(false);
+  });
+
+  it('does not apply to a client with their own non-house baseline', () => {
+    expect(
+      appliesHouseRebase({ baselineDate: new Date('2026-08-10T00:00:00.000Z') }),
+    ).toBe(false);
+  });
+});
+
+describe('rebaseLedgerToJun30 — gated on the client actually being in the import', () => {
+  const ledger = [
+    { type: 'BUY', amount: 1_400_000, date: d('2025-12-16'), ticker: 'INFY.NS', quantity: 1000 },
+    { type: 'SELL', amount: 200_000, date: d('2026-08-11'), ticker: 'INFY.NS', quantity: 100 },
+  ];
+  const closes = new Map([['INFY.NS', 1600]]);
+  const held = new Map([['INFY.NS', 900]]);
+
+  it('leaves a pre-house-date ledger exactly as recorded', () => {
+    const out = rebaseLedgerToJun30(ledger, closes, held, false);
+    // Identity: the real December BUY survives, at its own date and amount.
+    expect(out).toEqual(ledger);
+    const buy = out.find((r) => r.type === 'BUY')!;
+    expect(buy.date).toEqual(d('2025-12-16'));
+    expect(buy.amount).toBe(1_400_000);
+  });
+
+  it('still rebases a genuine house-baseline client', () => {
+    const imported = [
+      { type: 'BUY', amount: 1_400_000, date: d('2026-07-01'), ticker: 'INFY.NS', quantity: 1000 },
+    ];
+    const out = rebaseLedgerToJun30(imported, closes, new Map([['INFY.NS', 1000]]), true);
+    const buy = out.find((r) => r.type === 'BUY')!;
+    expect(buy.date).toEqual(JUN30_REBASE_DATE);
+    expect(buy.amount).toBe(1600 * 1000);
   });
 });

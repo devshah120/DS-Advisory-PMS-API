@@ -11,6 +11,7 @@ import { MarketService } from '../market/market.service';
 import { CreateClientDto } from './dto/create-client.dto';
 import { UpdateClientDto } from './dto/update-client.dto';
 import {
+  appliesHouseRebase,
   buildFlows,
   JUN30_REBASE_DATE,
   rebaseLedgerToJun30,
@@ -106,7 +107,26 @@ function deriveMetrics(
   // pre-rebase figure. Without this the two pages disagreed: Performance read
   // −16.9% while the list still showed +23,000,000%.
   const currentQuantity = new Map(client.holdings.map((h) => [h.ticker, h.quantity]));
-  const rebased = rebaseLedgerToJun30(client.transactions, jun30Close, currentQuantity);
+
+  /**
+   * ...but ONLY for the clients that rebase actually describes. A client whose
+   * ledger starts before 30-June-2026 has real, priceable history, and rebasing
+   * it would delete those trades and invent a June purchase in their place. The
+   * earliest transaction is the evidence, and it is already loaded here, so the
+   * gate costs no extra query. See `appliesHouseRebase`.
+   */
+  const firstTransactionDate = client.transactions.reduce<Date | null>(
+    (earliest, t) => (earliest === null || t.date < earliest ? t.date : earliest),
+    null,
+  );
+  const houseRebase = appliesHouseRebase({ firstTransactionDate });
+
+  const rebased = rebaseLedgerToJun30(
+    client.transactions,
+    jun30Close,
+    currentQuantity,
+    houseRebase,
+  );
   const built = buildFlows(rebased, 'TRANSACTIONAL', holdingsValue, new Date());
   let rate = 0;
   if (built.status === 'ok') {

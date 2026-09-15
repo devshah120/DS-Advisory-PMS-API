@@ -17,28 +17,28 @@ import {
 /**
  * The period vocabulary behind the Performance sheet's period selector.
  *
- * One rule governs every entry here: **no window may open before
- * 30-June-2026**. That date is the house inception — the imported book's
- * opening value — and it is the only date before which we have no priceable
- * history. A window that opened earlier would divide by an opening value we
- * cannot substantiate, which is exactly the class of bug that produced
- * nonsense returns on this book before.
+ * One rule governs every entry here: **no window may open before the CLIENT'S
+ * OWN inception**. `resolvePeriod`/`availablePeriods` take a `clientInception`
+ * — the mandate's own `Client.inceptionDate`, or a household's earliest member
+ * — and every window is clamped to it, in BOTH directions.
  *
- * So `INCEPTION` opens there by definition, and every calendar window is
- * clamped to it — that is the HOUSE floor, the earliest date any client can be
- * priced. In practice that also makes the identity the desk expects fall out
- * for free: today the quarter opened 1-July, the day after inception with no
- * trading in between, so QTD and INCEPTION resolve to the same opening value
- * and report the same number.
+ * A mandate that began 10-Feb-2027 has no priceable history in January, so its
+ * "Since inception" opens 10-Feb-2027. A mandate that began 16-Dec-2025 has six
+ * months of real, priceable history before the house's own import date, so its
+ * "Since inception" opens 16-Dec-2025 — and its December and March quarters are
+ * genuine, measurable windows that must appear in the dropdown.
  *
- * A CLIENT can also open later than the house. `resolvePeriod`/`availablePeriods`
- * take an optional `clientInception` — the mandate's own `Client.inceptionDate`,
- * or a household's earliest member — and raise the floor to it when it falls
- * after the house date. A mandate that began 10-Feb-2027 has no priceable
- * history in January even though the house does; "Since Inception" for that
- * client must open 10-Feb-2027, not 30-June-2026. A mandate whose inception
- * predates or matches the house floor (every client seeded so far) sees no
- * change at all — the house date still wins.
+ * 30-June-2026 is NOT a floor. It is the date the legacy book was bulk-imported
+ * on, and it is the opening value for exactly those clients whose history the
+ * import destroyed — see INCEPTION_DATE in analytics/calculators/flows.ts, and
+ * the `isHouseBaselineDate` gate that decides, per client, whether it applies to
+ * them at all. For a client with a real ledger reaching further back, the house
+ * date is just another day on the calendar.
+ *
+ * Where it does apply, the identity the desk expects still falls out for free:
+ * that quarter opened 1-July, the day after the import with no trading in
+ * between, so QTD and INCEPTION resolve to the same opening value and report the
+ * same number.
  *
  * ── Two calendars ──────────────────────────────────────────────────────────
  * Every window here is resolved against the MARKET's reporting calendar, not
@@ -109,20 +109,29 @@ function utcDay(d: Date): Date {
 }
 
 /**
- * The floor a window may not open before: whichever is LATER of the house
- * inception and the client's own mandate start.
+ * The floor a window may not open before: THE CLIENT'S OWN MANDATE START,
+ * whenever the book knows it.
+ *
+ * This used to take whichever of the two dates was LATER, which made the
+ * 30-June-2026 house date a floor nobody could open before. That was written
+ * when it was true that no mandate predated the bulk import — the old comment
+ * said so out loud ("every client seeded so far") — and it stopped being true
+ * the moment a client with genuine earlier history was onboarded.
+ *
+ * The cost of the old rule was not cosmetic. A mandate that began 16-Dec-2025
+ * had its opening date silently dragged forward to 30-June-2026, so "Since
+ * inception" measured the last stretch of his holding period and called it his
+ * whole record, and every window before that date resolved to zero length and
+ * rendered as "Not available". The client's own start date is the fact of the
+ * matter; the house date is only a stand-in for when we do not have one.
  *
  * `clientInception` is undefined for the house-wide dropdown listing
- * (`availablePeriods`, which has no single client in view) and is otherwise
- * the caller's `Client.inceptionDate` — or, for a household, its earliest
- * member's — so a mandate that began after the house does is never credited
- * with history it cannot have, while every mandate at or before the house
- * floor (every client seeded so far) is completely unaffected.
+ * (`availablePeriods` called with no client in view) and for a family with no
+ * members yet. Only then does the house date stand in.
  */
 function effectiveInception(houseInception: Date, clientInception?: Date): Date {
   if (!clientInception) return houseInception;
-  const c = utcDay(clientInception);
-  return c > houseInception ? c : houseInception;
+  return utcDay(clientInception);
 }
 
 /**
@@ -166,6 +175,18 @@ export interface PeriodOption {
   /** The concrete window, so the UI can show dates without a round-trip. */
   hint: string;
   group: 'Current' | 'Quarters' | 'Years' | 'Custom';
+  /**
+   * The effective inception for this client, as `YYYY-MM-DD` — the earliest
+   * date any of their windows may open on.
+   *
+   * Carried on every option (rather than only on `INCEPTION`) so the custom
+   * date picker can read it off whichever option it happens to have, without
+   * scanning the list or parsing a human-readable `hint`. The frontend used a
+   * hardcoded '2026-06-30' for this and therefore refused to let anyone SELECT
+   * a date in a December-2025 mandate's real history — the server would have
+   * answered correctly, but the browser would not send the question.
+   */
+  inceptionIso: string;
 }
 
 /**
@@ -177,6 +198,13 @@ export interface PeriodOption {
  * rather than hard-coded so the sheet keeps working into FY28 without a
  * redeploy.
  */
+/**
+ * An option before the per-client `inceptionIso` is stamped on. The stamp is
+ * identical for every row, so it is applied once at the end rather than
+ * repeated at each construction site.
+ */
+type DraftOption = Omit<PeriodOption, 'inceptionIso'>;
+
 export function availablePeriods(
   asOf: Date = new Date(),
   market: Market = DEFAULT_MARKET,
@@ -203,7 +231,7 @@ export function availablePeriods(
    * "Quarter to date", because the desk thinks in the named quarter and a label
    * that hides which quarter it is forces a mental lookup on every read.
    */
-  const current: PeriodOption[] = [
+  const current: DraftOption[] = [
     {
       code: 'QTD',
       label: `${fiscalQuarterLabel(q, fy, market)} to date`,
@@ -247,7 +275,7 @@ export function availablePeriods(
    * that rule, we simply ask it and drop what it rejects, so the list and the
    * resolver cannot drift apart.
    */
-  const quarters: PeriodOption[] = [];
+  const quarters: DraftOption[] = [];
   for (let back = 1; back <= 12; back++) {
     const months = (q - 1) * 3 - back * 3;
     const anchor = new Date(
@@ -257,12 +285,25 @@ export function availablePeriods(
         15,
       ),
     );
-    if (anchor < inception) break;
-
     const qq = fiscalQuarterOf(anchor, market);
     const qfy = fiscalYearOf(anchor, market);
     const code = fiscalQuarterCode(qq, qfy, market);
     const range = fiscalQuarterRange(qq, qfy, market);
+
+    /**
+     * Stop on the quarter's END, not on the mid-quarter `anchor`.
+     *
+     * `anchor` sits on the 15th, so the quarter that CONTAINS the inception
+     * date has an anchor before it whenever the mandate started in the back
+     * half of a quarter — and testing the anchor broke the walk there,
+     * silently dropping the client's own first (partial) quarter from the
+     * dropdown. A mandate that began 16-Dec-2025 lost Q3 FY26 exactly this
+     * way: the quarter it started in was the one quarter it could not be
+     * measured over. The end date is the honest test of "does this quarter
+     * overlap the mandate at all", and `resolvePeriod` below still rejects
+     * the window if the overlap clamps to zero length.
+     */
+    if (range.end < inception) break;
 
     try {
       resolvePeriod(code, { asOf: day, market, clientInception });
@@ -279,7 +320,7 @@ export function availablePeriods(
   }
 
   /** Whole closed years, same logic: offered only when they resolve. */
-  const years: PeriodOption[] = [];
+  const years: DraftOption[] = [];
   for (let back = 0; back <= 5; back++) {
     const y = fy - back;
     const range = fiscalYearRange(y, market);
@@ -306,8 +347,8 @@ export function availablePeriods(
     ...current,
     ...quarters,
     ...years,
-    { code: 'CUSTOM', label: 'Custom range…', hint: 'Pick any two dates', group: 'Custom' },
-  ];
+    { code: 'CUSTOM', label: 'Custom range…', hint: 'Pick any two dates', group: 'Custom' } as DraftOption,
+  ].map((o): PeriodOption => ({ ...o, inceptionIso: iso(inception) }));
 }
 
 /**
@@ -385,7 +426,7 @@ export function resolvePeriod(
     if (to < from || (to.getTime() === from.getTime() && !live)) {
       throw new BadRequestException(
         `Period "${label}" spans no time once clamped: ${from.toISOString().slice(0, 10)} → ` +
-          `${to.toISOString().slice(0, 10)}. The house has no priced history before ` +
+          `${to.toISOString().slice(0, 10)}. This mandate has no history before ` +
           `${inception.toISOString().slice(0, 10)}, so this window has nothing to measure.`,
       );
     }
