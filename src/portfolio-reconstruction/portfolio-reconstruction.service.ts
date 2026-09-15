@@ -7,6 +7,13 @@ import { JUN30_REBASE_DATE, isImportArtifact, isHouseBaselineDate } from '../ana
 import { Classification, PortfolioSnapshot, Position } from '../analytics/calculators/types';
 import { ReconstructedPortfolio, ReconstructedPosition } from './types';
 
+const MS_PER_DAY = 86_400_000;
+
+/** Midnight UTC of the calendar day `d` falls on. */
+function utcDay(d: Date): Date {
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+}
+
 interface WorkingPosition {
   ticker: string;
   quantity: number;
@@ -46,31 +53,52 @@ export class PortfolioReconstructionService {
     if (!client) throw new NotFoundException(`Client ${clientId} not found`);
 
     /**
-     * An account opened after tracking began never had a legacy position to
-     * import, so it has no baseline and never will. That is not missing data —
-     * its opening position is KNOWN, and it is nothing: no holdings, no cash.
-     *
-     * Standing in an empty baseline is what makes such an account
-     * reconstructible on the ordinary path. Everything
-     * below then works unchanged: the replay starts from zero positions and
-     * zero cash and applies the account's real trades, so the day it buys its
-     * first stock is the day it stops being worth nothing. Refusing instead
-     * (the previous behaviour) took down every caller that has to value the
+     * An account with no stored baseline is stood up on a SYNTHETIC empty one —
+     * no holdings, no cash. That is not missing data: an account that never had
+     * a legacy position to import genuinely opened at nothing, and replaying its
+     * real trades onto zero is what makes it reconstructible on the ordinary
+     * path. Refusing instead took down every caller that has to value the
      * account — most visibly a FAMILY, where one such member threw and left the
      * whole household unmeasurable even though its correct contribution to the
      * opening total is simply zero.
      *
-     * The synthetic baseline is dated at the house tracking date, NOT at the
-     * account's `createdAt`. Using `createdAt` looks more precise and is the
-     * wrong choice: it trips the pre-baseline guard below for any window that
-     * opens before the account was created — exactly the common case, a
-     * quarter already under way when the account joins — which would refuse the
-     * very family measurement this change exists to allow. Anchoring at the
-     * house date is also the truthful statement: on 30-June this account held
-     * nothing, and so did every date between then and its first trade.
+     * WHERE that empty baseline is DATED is the subtle part, and anchoring it at
+     * the house date (the previous behaviour) is wrong for any account that
+     * traded BEFORE that date.
+     *
+     * Two things key off the baseline date, and both misfire:
+     *
+     *   1. The replay below reads only `date > baselineDate`. A client whose
+     *      real trading began in December 2025 has every one of those rows fall
+     *      outside the window, so a fully-invested book reconstructs as EMPTY.
+     *   2. `isHouseBaselineDate` becomes true, so `isImportArtifact` discards
+     *      every BUY dated on or before the import cutover as a bulk-import
+     *      artifact — including genuine trades — while the SELLs beside them
+     *      are kept.
+     *
+     * Together those produce a book of pure sales with no position to sell
+     * from: Abhishek Oberoi (30 real transactions from Dec-2025, no baseline
+     * row) reconstructed to a zero opening value and a NEGATIVE billable base
+     * of -68,441, which the fee floor then reported as a 0.00 fee on a live
+     * ~18L book.
+     *
+     * So the synthetic baseline is dated the day before the account's FIRST
+     * transaction, falling back to the house date only when there are no
+     * transactions at all. That date is the truthful statement in both cases —
+     * the account held nothing before its first trade — and it fixes both
+     * failures at once: the replay window now covers the client's entire real
+     * ledger, and the date no longer collides with the house baseline, so the
+     * client's own trades stop being misread as someone else's import.
+     *
+     * It also keeps the property the house-date anchor was chosen for: the date
+     * is never LATER than the account's real history, so the pre-baseline guard
+     * below cannot refuse a window that legitimately opens before the account
+     * started trading. A window opening earlier than the first trade is only
+     * refused when it also predates the house date, exactly as before.
      */
-    const baselineRow = (await this.baseline.findOrNull(clientId)) ?? {
-      baselineDate: JUN30_REBASE_DATE,
+    const stored = await this.baseline.findOrNull(clientId);
+    const baselineRow = stored ?? {
+      baselineDate: await this.syntheticBaselineDate(clientId),
       openingCash: 0,
       holdings: [] as Array<{
         ticker: string;
@@ -242,6 +270,38 @@ export class PortfolioReconstructionService {
       assetAllocation: allocationBy(snap, 'assetClass'),
       source: 'reconstruction',
     };
+  }
+
+  /**
+   * The date to stand a SYNTHETIC empty baseline on, for a client that has no
+   * stored one.
+   *
+   * The day BEFORE the client's first transaction. The replay window is
+   * exclusive at the lower bound (`date > baselineDate`), so dating it ON the
+   * first trade would drop that trade; a day earlier includes the client's
+   * entire ledger. When the account has no transactions at all there is nothing
+   * to anchor to and nothing to replay, so the house date stands in, preserving
+   * the original behaviour for the genuinely-empty accounts it was written for.
+   *
+   * Deliberately NOT the client's `inceptionDate`: that is a mandate field a
+   * human types and it can post-date the ledger it is supposed to bracket,
+   * which would silently truncate the replay again. The first transaction is
+   * the ledger's own evidence of when the account started moving.
+   *
+   * Never later than the house date, so a client whose trading began after
+   * cutover keeps the house anchor and the pre-baseline guard behaves exactly
+   * as it did before.
+   */
+  private async syntheticBaselineDate(clientId: string): Promise<Date> {
+    const first = await this.prisma.transaction.findFirst({
+      where: { clientId },
+      orderBy: { date: 'asc' },
+      select: { date: true },
+    });
+    if (!first) return JUN30_REBASE_DATE;
+
+    const dayBefore = new Date(utcDay(first.date).getTime() - MS_PER_DAY);
+    return dayBefore < JUN30_REBASE_DATE ? dayBefore : JUN30_REBASE_DATE;
   }
 
   /**
