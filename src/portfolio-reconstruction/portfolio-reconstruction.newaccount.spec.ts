@@ -27,8 +27,15 @@ describe('PortfolioReconstructionService — account opened after the baseline d
         }),
       },
       transaction: {
+        // `lte` is omitted when the caller asks for the CURRENT book, so that an
+        // already-entered trade dated slightly ahead still counts as held. The
+        // stub has to treat a missing upper bound as unbounded, the way Prisma
+        // does, rather than comparing against undefined.
         findMany: jest.fn(async ({ where }: any) =>
-          transactions.filter((t) => t.date > where.date.gt && t.date <= where.date.lte),
+          transactions.filter(
+            (t) =>
+              t.date > where.date.gt && (!where.date.lte || t.date <= where.date.lte),
+          ),
         ),
         // The synthetic baseline is anchored to the account's FIRST ledger row,
         // so the stand-in has to answer that question the way the real ledger
@@ -77,6 +84,78 @@ describe('PortfolioReconstructionService — account opened after the baseline d
     const r = await service.reconstruct(CLIENT, new Date('2026-07-01T00:00:00.000Z'));
 
     expect(r.portfolioValue).toBe(0);
+  });
+
+  /**
+   * The Meet Salecha incident. Two BUYs were ENTERED on the 15th but DATED the
+   * 17th, so while the Holdings screen showed all three positions and 4,92,466,
+   * every performance window replayed `date <= today` and reported 96,583 - the
+   * one correctly-dated position. A trade already in the ledger is a trade the
+   * client already holds, so the CURRENT book counts it.
+   */
+  it('counts an already-entered trade dated ahead of today in the current book', async () => {
+    const today = new Date();
+    const dayAfter = new Date(today.getTime() + 86_400_000);
+
+    const service = build([
+      {
+        id: 't1',
+        clientId: CLIENT,
+        type: 'BUY',
+        ticker: 'ANUP.NS',
+        quantity: 10,
+        amount: 1_400,
+        date: new Date('2026-09-11T09:15:00.000Z'),
+      },
+      {
+        id: 't2',
+        clientId: CLIENT,
+        type: 'BUY',
+        ticker: 'GRAPHITE.NS',
+        quantity: 20,
+        amount: 2_000,
+        date: dayAfter,
+      },
+    ]);
+
+    const r = await service.reconstruct(CLIENT, today);
+
+    // Both positions, not just the one whose date had already passed.
+    expect(r.positions.map((p) => p.ticker).sort()).toEqual(['ANUP.NS', 'GRAPHITE.NS']);
+    expect(r.holdingsValue).toBe(30 * 150);
+  });
+
+  /**
+   * The other half of the rule: widening the window must not let a September
+   * trade leak into what the book was worth in July. A historical date keeps
+   * the strict bound, or every past valuation silently becomes today's.
+   */
+  it('still excludes a later trade from a historical valuation', async () => {
+    const service = build([
+      {
+        id: 't1',
+        clientId: CLIENT,
+        type: 'BUY',
+        ticker: 'ANUP.NS',
+        quantity: 10,
+        amount: 1_400,
+        date: new Date('2026-09-11T09:15:00.000Z'),
+      },
+      {
+        id: 't2',
+        clientId: CLIENT,
+        type: 'BUY',
+        ticker: 'GRAPHITE.NS',
+        quantity: 20,
+        amount: 2_000,
+        date: new Date('2026-09-14T09:15:00.000Z'),
+      },
+    ]);
+
+    const r = await service.reconstruct(CLIENT, new Date('2026-09-12T00:00:00.000Z'));
+
+    expect(r.positions.map((p) => p.ticker)).toEqual(['ANUP.NS']);
+    expect(r.holdingsValue).toBe(10 * 150);
   });
 
   /**

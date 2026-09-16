@@ -9,6 +9,7 @@ import {
   IsString,
   MaxLength,
 } from 'class-validator';
+import { IsNotFutureDate } from '../../common/not-future-date.validator';
 
 /**
  * An external cash flow given by the client — the input for the cash-flow-basis
@@ -34,6 +35,7 @@ export class CreateCashFlowDto {
   amount: number;
 
   @IsDateString({}, { message: 'A valid date is required' })
+  @IsNotFutureDate()
   date: string;
 
   @IsString()

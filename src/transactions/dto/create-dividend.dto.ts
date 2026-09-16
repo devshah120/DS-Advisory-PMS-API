@@ -8,6 +8,7 @@ import {
   IsString,
   MaxLength,
 } from 'class-validator';
+import { IsNotFutureDate } from '../../common/not-future-date.validator';
 
 /**
  * A dividend received on a holding.
@@ -44,6 +45,7 @@ export class CreateDividendDto {
   quantity?: number;
 
   @IsDateString({}, { message: 'A valid payment date is required' })
+  @IsNotFutureDate()
   date: string;
 
   @IsString()

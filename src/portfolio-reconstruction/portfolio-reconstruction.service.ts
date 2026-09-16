@@ -134,8 +134,39 @@ export class PortfolioReconstructionService {
     let cash = baselineRow.openingCash;
     let realizedGain = 0;
 
+    /**
+     * The replay window's upper bound is `asOfDate` for every HISTORICAL date,
+     * and the current book for TODAY.
+     *
+     * Those are the same thing until a row is dated ahead of the day it was
+     * entered. When one is, the two views of the book disagree: the Holdings
+     * screen reads live `Holding` rows and shows the position, while every
+     * valuation replays `date <= asOfDate` and cannot see it. A member holding
+     * GRAPHITE.NS, ANUP.NS and MBEL.NS reported a closing value of 96,583 - the
+     * ANUP row alone - against a holdings sheet plainly showing 4,92,466,
+     * because the other two BUYs were entered on the 15th but dated the 17th.
+     *
+     * A trade that has already been ENTERED has already happened; the date on it
+     * is a statement about settlement, not about whether the shares are held. So
+     * when the caller asks for the book as it stands today, the window extends
+     * to every row already recorded, and the closing value is what the client
+     * actually holds - which is the figure the Holdings screen has been showing
+     * all along.
+     *
+     * Every historical date keeps the strict bound. Asking what the book was
+     * worth on 30 June must never be answered with a trade booked in September,
+     * so this widening applies only to the open end of the timeline.
+     */
+    const today = utcDay(new Date());
+    const isCurrentBook = utcDay(asOfDate).getTime() >= today.getTime();
+
     const ledger = await this.prisma.transaction.findMany({
-      where: { clientId, date: { gt: baselineRow.baselineDate, lte: asOfDate } },
+      where: {
+        clientId,
+        date: isCurrentBook
+          ? { gt: baselineRow.baselineDate }
+          : { gt: baselineRow.baselineDate, lte: asOfDate },
+      },
       orderBy: { date: 'asc' },
     });
 

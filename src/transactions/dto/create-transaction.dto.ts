@@ -1,4 +1,5 @@
 import { IsString, IsNumber, IsOptional, IsEnum, IsDateString } from 'class-validator';
+import { IsNotFutureDate } from '../../common/not-future-date.validator';
 
 enum TransactionType {
   BUY = 'BUY',
@@ -35,6 +36,7 @@ export class CreateTransactionDto {
   amount: number;
 
   @IsDateString()
+  @IsNotFutureDate()
   date: string;
 
   @IsString()
