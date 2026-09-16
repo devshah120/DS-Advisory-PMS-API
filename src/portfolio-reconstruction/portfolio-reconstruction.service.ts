@@ -227,10 +227,17 @@ export class PortfolioReconstructionService {
      *
      * With the import artifacts filtered out above, replayed cash should now track
      * the real maintained balance. A residual negative can still arise from a
-     * genuine data gap — a SELL recorded without its matching BUY, say — and if it
-     * reached the response it would understate `portfolioValue` and inflate every
-     * position weight computed from it, which is the visible symptom this whole
-     * change exists to remove.
+     * genuine data gap, and if it reached the response it would understate
+     * `portfolioValue` and inflate every position weight computed from it, which is
+     * the visible symptom this whole change exists to remove.
+     *
+     * The gap is usually funding the replay never saw, not a sale without a
+     * purchase. A TRANSACTIONAL book has no CASH_DEPOSIT rows by design, so a
+     * client whose opening balance or subsequent deposits were never recorded
+     * replays every BUY against zero and goes progressively further negative —
+     * the shortfall then approximates total capital deployed, not an error of
+     * that size. Duplicate BUYs (the same trade under two spellings of a symbol,
+     * e.g. an SME `-SM` suffix alongside the plain one) deepen it the same way.
      *
      * A negative buying-power balance is not a thing this book models: cash is
      * floored at zero and the shortfall is surfaced on `cashShortfall` so the gap

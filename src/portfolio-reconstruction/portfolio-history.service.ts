@@ -73,7 +73,7 @@ export class PortfolioHistoryService {
    * Has anything been recorded since this snapshot was taken that would change
    * what it says?
    *
-   * Two independent reasons a row cannot be trusted:
+   * Four independent reasons a row cannot be trusted:
    *
    *  1. **The day is not over.** A snapshot for today (or any future date) is a
    *     reading taken mid-session: more trades can still be booked against it,
@@ -87,27 +87,64 @@ export class PortfolioHistoryService {
    *     common case on this desk and silently corrupted every window that
    *     touched the affected date.
    *
-   * `createdAt` is the right comparison on both sides: it is when we LEARNED
-   * the fact, whereas `date` is when the fact happened, and staleness is a
-   * question about knowledge, not about chronology.
+   *  3. **An entry was edited.** `createdAt` never moves when an existing row is
+   *     corrected, so an insert-only check declares a snapshot fresh however
+   *     much the ledger underneath it was rewritten. This is the gap that let a
+   *     member holding three positions keep reporting the single one its
+   *     snapshot was written from - a closing value of 96,583 against a real
+   *     4,92,466 - because the other two trades arrived as edits to existing
+   *     rows rather than as new ones. `updatedAt` is the matching question.
+   *
+   *  4. **An entry was deleted.** Neither timestamp exists to be compared once
+   *     the row is gone, so this one is caught by reconciling the stored
+   *     `ledgerCount` against a live count.
+   *
+   * `createdAt` is the right comparison on both sides of reasons 2 and 3: it is
+   * when we LEARNED the fact, whereas `date` is when the fact happened, and
+   * staleness is a question about knowledge, not about chronology. The
+   * snapshot's own `createdAt` is preserved across upserts, so a re-run of the
+   * daily job does not reset the window it compares against.
    */
   private async isStale(
     clientId: string,
-    snapshot: { date: Date; createdAt: Date },
+    snapshot: { date: Date; createdAt: Date; ledgerCount: number | null },
   ): Promise<boolean> {
     const today = utcDay(new Date());
     if (utcDay(snapshot.date).getTime() >= today.getTime()) return true;
 
+    // Reasons 2 and 3: an entry that appeared, or an existing entry that was
+    // rewritten, after this snapshot was taken. `createdAt` alone answers only
+    // the first question, and an EDIT leaves it untouched - which is how a
+    // member holding GRAPHITE.NS, ANUP.NS and MBEL.NS kept reporting only the
+    // single position its snapshot happened to be written from.
     const newerEntry = await this.prisma.transaction.findFirst({
       where: {
         clientId,
         date: { lte: snapshot.date },
-        createdAt: { gt: snapshot.createdAt },
+        OR: [{ createdAt: { gt: snapshot.createdAt } }, { updatedAt: { gt: snapshot.createdAt } }],
       },
       select: { id: true },
     });
 
-    return newerEntry !== null;
+    if (newerEntry !== null) return true;
+
+    /**
+     * Reason 4: a row was DELETED. A deletion leaves nothing behind to compare
+     * a timestamp against, so neither clause above can see it, and the count is
+     * the only evidence left. `ledgerCount` is recorded at write time for
+     * exactly this comparison; a snapshot whose stored count no longer matches
+     * the ledger it claims to summarise is replayed.
+     *
+     * A row written before that column existed has a null count, which is not
+     * evidence of agreement - it is the absence of evidence. Those are replayed
+     * once and the fresh write records a count, so the cache re-earns its place
+     * rather than being trusted on a field it never stored.
+     */
+    const ledgerCount = await this.prisma.transaction.count({
+      where: { clientId, date: { lte: snapshot.date } },
+    });
+
+    return snapshot.ledgerCount !== ledgerCount;
   }
 
   /**
@@ -125,6 +162,14 @@ export class PortfolioHistoryService {
     const portfolio = await this.reconstruction.reconstruct(clientId, day);
     const benchmarkValue = await this.benchmarkValueFor(clientId, portfolio.baselineDate, day, portfolio);
 
+    // Counted AFTER the replay above, so the stored count can only ever be
+    // conservative: a row inserted between the two reads makes this snapshot
+    // look stale on the next lookup and earns a replay, which is the safe
+    // direction to be wrong in. See isStale.
+    const ledgerCount = await this.prisma.transaction.count({
+      where: { clientId, date: { lte: day } },
+    });
+
     const valuation = await this.prisma.portfolioValuation.upsert({
       where: { clientId_date: { clientId, date: day } },
       create: {
@@ -138,6 +183,7 @@ export class PortfolioHistoryService {
         realizedPnL: portfolio.realizedGain,
         benchmarkValue,
         positionCount: portfolio.positions.length,
+        ledgerCount,
         isQuarterEnd: opts.isQuarterEnd ?? false,
         source: 'snapshot-scheduler',
       },
@@ -150,6 +196,7 @@ export class PortfolioHistoryService {
         realizedPnL: portfolio.realizedGain,
         benchmarkValue,
         positionCount: portfolio.positions.length,
+        ledgerCount,
         // Re-running the daily job must not un-flag a quarter-end snapshot
         // that already ran for the same date; only turn it on, never off.
         isQuarterEnd: opts.isQuarterEnd ? true : undefined,

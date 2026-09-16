@@ -31,9 +31,15 @@ export interface ReconstructedPortfolio {
   cash: number;
   /**
    * How far below zero the replayed cash went before being floored, or 0 when it
-   * never did. Non-zero means the ledger has a genuine gap (proceeds recorded
-   * without their matching purchase); it is surfaced rather than absorbed into
-   * the position weights.
+   * never did. Non-zero means the replay was never given the money the purchases
+   * were funded with. The usual causes are an unrecorded opening balance or
+   * deposits (a transactional book has no CASH_DEPOSIT rows, so a client funded
+   * outside the ledger replays as though it bought from nothing), or a trade
+   * entered twice under two spellings of the same symbol.
+   *
+   * Deliberately NOT attributed to a specific cause here: the replay knows only
+   * the magnitude, not which of the above produced it, and the UI copy must not
+   * claim more than that.
    */
   cashShortfall: number;
   holdingsValue: number;

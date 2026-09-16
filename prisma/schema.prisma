@@ -1015,6 +1015,13 @@ model PortfolioValuation {
   /// flag rather than assuming its row is the first to exist for that date.
   isQuarterEnd   Boolean @default(false)
 
+  /// Number of Transaction rows dated on or before `date` that this snapshot was
+  /// replayed from. A DELETED transaction leaves no row whose timestamp could
+  /// betray it, so this count is the only way the staleness check can notice one
+  /// went missing. Null on rows written before the column existed: those are
+  /// treated as unverifiable and replayed once. See PortfolioHistoryService.isStale.
+  ledgerCount Int?
+
   holdings HoldingSnapshot[]
 
   createdAt DateTime @default(now())

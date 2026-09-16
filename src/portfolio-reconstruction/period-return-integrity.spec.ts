@@ -53,6 +53,7 @@ describe('a snapshot may not outrank a trade booked after it', () => {
       totalCost: 0,
       unrealizedPnL: 0,
       realizedPnL: 0,
+      ledgerCount: 1,
       holdings: [] as Array<Record<string, unknown>>,
     };
 
@@ -60,9 +61,17 @@ describe('a snapshot may not outrank a trade booked after it', () => {
       portfolioValuation: { findUnique: jest.fn().mockResolvedValue(staleSnapshot) },
       transaction: {
         // One BUY, dated inside the window but RECORDED after the snapshot.
-        findFirst: jest.fn(async ({ where }: any) =>
-          TRADE_ENTERED > where.createdAt.gt ? { id: 't1' } : null,
-        ),
+        // The staleness check asks about creation OR revision in one `OR`, so
+        // the mock answers on whichever bound it is handed.
+        findFirst: jest.fn(async ({ where }: any) => {
+          const bounds = (where.OR ?? [where]).map(
+            (c: any) => c.createdAt?.gt ?? c.updatedAt?.gt,
+          );
+          return bounds.some((b: Date) => TRADE_ENTERED > b) ? { id: 't1' } : null;
+        }),
+        // Matches the snapshot's stored count, so the deletion check stays
+        // silent and the assertion isolates the reason under test.
+        count: jest.fn().mockResolvedValue(1),
       },
     } as unknown as PrismaService;
 
@@ -96,6 +105,204 @@ describe('a snapshot may not outrank a trade booked after it', () => {
 
     expect(reconstruction.reconstruct).toHaveBeenCalled();
     expect(r.holdingsValue).toBe(98_353);
+  });
+
+  /**
+   * The Meet Salecha incident, and the half of the rule the insert-only check
+   * missed. The household's "By account" table reported a closing value of
+   * 96,583 - exactly the one position (ANUP.NS) the snapshot happened to be
+   * written from - while the member's own holdings sheet showed all three
+   * positions and 4,92,466, because it reads live rows rather than this cache.
+   *
+   * The two missing trades were BACK-DATED BY EDITING existing rows, so their
+   * `createdAt` never moved and the snapshot was declared fresh forever.
+   */
+  it('replays when an existing entry was edited after the snapshot', async () => {
+    const staleSnapshot = {
+      date: new Date('2026-09-14T00:00:00.000Z'),
+      createdAt: SNAPSHOT_WRITTEN,
+      securitiesValue: 96_583,
+      cashValue: 0,
+      totalValue: 96_583,
+      totalCost: 0,
+      unrealizedPnL: 0,
+      realizedPnL: 0,
+      ledgerCount: 3,
+      holdings: [] as Array<Record<string, unknown>>,
+    };
+
+    const prisma = {
+      portfolioValuation: { findUnique: jest.fn().mockResolvedValue(staleSnapshot) },
+      transaction: {
+        // Nothing was INSERTED after the snapshot; a row was REVISED.
+        findFirst: jest.fn(async ({ where }: any) => {
+          const clauses = where.OR ?? [where];
+          const sawEdit = clauses.some(
+            (c: any) => c.updatedAt?.gt && TRADE_ENTERED > c.updatedAt.gt,
+          );
+          const sawInsert = clauses.some(
+            (c: any) => c.createdAt?.gt && SNAPSHOT_WRITTEN > c.createdAt.gt,
+          );
+          return sawEdit || sawInsert ? { id: 't2' } : null;
+        }),
+        count: jest.fn().mockResolvedValue(3),
+      },
+    } as unknown as PrismaService;
+
+    const reconstruction = {
+      reconstruct: jest.fn().mockResolvedValue({
+        holdingsValue: 492_466,
+        portfolioValue: 492_466,
+        positions: [{ ticker: 'GRAPHITE.NS' }, { ticker: 'ANUP.NS' }, { ticker: 'MBEL.NS' }],
+      }),
+    } as unknown as PortfolioReconstructionService;
+
+    const service = new PortfolioHistoryService(
+      prisma,
+      reconstruction,
+      {} as unknown as BenchmarkHistoryService,
+    );
+    jest.useFakeTimers().setSystemTime(new Date('2026-09-20T09:00:00.000Z'));
+
+    const r = await service.getPortfolioAsOf('c1', new Date('2026-09-14T00:00:00.000Z'));
+
+    expect(reconstruction.reconstruct).toHaveBeenCalled();
+    expect(r.holdingsValue).toBe(492_466);
+  });
+
+  /**
+   * A deletion leaves no row behind whose timestamp could betray it, so it is
+   * caught by reconciling the count the snapshot was replayed from.
+   */
+  it('replays when an entry was deleted after the snapshot', async () => {
+    const staleSnapshot = {
+      date: new Date('2026-09-14T00:00:00.000Z'),
+      createdAt: SNAPSHOT_WRITTEN,
+      securitiesValue: 150_000,
+      cashValue: 0,
+      totalValue: 150_000,
+      totalCost: 0,
+      unrealizedPnL: 0,
+      realizedPnL: 0,
+      ledgerCount: 4,
+      holdings: [] as Array<Record<string, unknown>>,
+    };
+
+    const prisma = {
+      portfolioValuation: { findUnique: jest.fn().mockResolvedValue(staleSnapshot) },
+      transaction: {
+        findFirst: jest.fn().mockResolvedValue(null),
+        // One of the four rows the snapshot was built from is gone.
+        count: jest.fn().mockResolvedValue(3),
+      },
+    } as unknown as PrismaService;
+
+    const reconstruction = {
+      reconstruct: jest.fn().mockResolvedValue({
+        holdingsValue: 90_000,
+        portfolioValue: 90_000,
+        positions: [{ ticker: 'ANUP.NS' }],
+      }),
+    } as unknown as PortfolioReconstructionService;
+
+    const service = new PortfolioHistoryService(
+      prisma,
+      reconstruction,
+      {} as unknown as BenchmarkHistoryService,
+    );
+    jest.useFakeTimers().setSystemTime(new Date('2026-09-20T09:00:00.000Z'));
+
+    const r = await service.getPortfolioAsOf('c1', new Date('2026-09-14T00:00:00.000Z'));
+
+    expect(reconstruction.reconstruct).toHaveBeenCalled();
+    expect(r.holdingsValue).toBe(90_000);
+  });
+
+  /**
+   * A row written before `ledgerCount` existed cannot prove it still agrees
+   * with the ledger, and absence of evidence is not evidence of agreement.
+   */
+  it('replays a snapshot that never recorded a ledger count', async () => {
+    const legacySnapshot = {
+      date: new Date('2026-09-14T00:00:00.000Z'),
+      createdAt: SNAPSHOT_WRITTEN,
+      securitiesValue: 96_583,
+      cashValue: 0,
+      totalValue: 96_583,
+      totalCost: 0,
+      unrealizedPnL: 0,
+      realizedPnL: 0,
+      ledgerCount: null as number | null,
+      holdings: [] as Array<Record<string, unknown>>,
+    };
+
+    const prisma = {
+      portfolioValuation: { findUnique: jest.fn().mockResolvedValue(legacySnapshot) },
+      transaction: {
+        findFirst: jest.fn().mockResolvedValue(null),
+        count: jest.fn().mockResolvedValue(3),
+      },
+    } as unknown as PrismaService;
+
+    const reconstruction = {
+      reconstruct: jest.fn().mockResolvedValue({
+        holdingsValue: 492_466,
+        portfolioValue: 492_466,
+        positions: [{ ticker: 'GRAPHITE.NS' }, { ticker: 'ANUP.NS' }, { ticker: 'MBEL.NS' }],
+      }),
+    } as unknown as PortfolioReconstructionService;
+
+    const service = new PortfolioHistoryService(
+      prisma,
+      reconstruction,
+      {} as unknown as BenchmarkHistoryService,
+    );
+    jest.useFakeTimers().setSystemTime(new Date('2026-09-20T09:00:00.000Z'));
+
+    const r = await service.getPortfolioAsOf('c1', new Date('2026-09-14T00:00:00.000Z'));
+
+    expect(reconstruction.reconstruct).toHaveBeenCalled();
+    expect(r.holdingsValue).toBe(492_466);
+  });
+
+  it('still serves a snapshot the ledger has not moved under', async () => {
+    const settledSnapshot = {
+      date: new Date('2026-09-14T00:00:00.000Z'),
+      createdAt: SNAPSHOT_WRITTEN,
+      securitiesValue: 492_466,
+      cashValue: 0,
+      totalValue: 492_466,
+      totalCost: 498_164.54,
+      unrealizedPnL: -5_698.54,
+      realizedPnL: 0,
+      ledgerCount: 3,
+      holdings: [] as Array<Record<string, unknown>>,
+    };
+
+    const prisma = {
+      portfolioValuation: { findUnique: jest.fn().mockResolvedValue(settledSnapshot) },
+      transaction: {
+        findFirst: jest.fn().mockResolvedValue(null),
+        count: jest.fn().mockResolvedValue(3),
+      },
+    } as unknown as PrismaService;
+
+    const reconstruction = {
+      reconstruct: jest.fn(),
+    } as unknown as PortfolioReconstructionService;
+
+    const service = new PortfolioHistoryService(
+      prisma,
+      reconstruction,
+      {} as unknown as BenchmarkHistoryService,
+    );
+    jest.useFakeTimers().setSystemTime(new Date('2026-09-20T09:00:00.000Z'));
+
+    const r = await service.getPortfolioAsOf('c1', new Date('2026-09-14T00:00:00.000Z'));
+
+    // The cache still earns its keep on a genuinely settled date.
+    expect(reconstruction.reconstruct).not.toHaveBeenCalled();
+    expect(r.holdingsValue).toBe(492_466);
   });
 
   it('never trusts a snapshot for a day that has not closed yet', async () => {
