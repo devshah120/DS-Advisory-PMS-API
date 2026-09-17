@@ -1,8 +1,10 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { CreateTransactionDto } from './dto/create-transaction.dto';
 import { CreateCashFlowDto } from './dto/create-cash-flow.dto';
 import { CreateDividendDto } from './dto/create-dividend.dto';
+import { UpdateTransactionDto } from './dto/update-transaction.dto';
 import {
   Actor,
   assertCanAccessClient,
@@ -176,6 +178,66 @@ export class TransactionsService {
       where: { id, ...relatedClientWhere(actor) },
     });
     return tx ? serialize(tx) : null;
+  }
+
+  /**
+   * Correct an existing ledger row.
+   *
+   * Two things make this different from an ordinary PATCH:
+   *
+   * 1. Ownership is proved by the UPDATE ITSELF, not by a read beforehand.
+   *    `updateMany` takes the same relation filter `remove` uses, so a row in
+   *    another manager's book matches nothing and reports count 0 — the same
+   *    indistinguishable 404. A findFirst-then-update would leave a window
+   *    between the two, and would need the check kept in step by hand.
+   *
+   * 2. Only the keys actually sent are written. An absent key must not be
+   *    confused with a cleared one: `{ ticker: undefined }` would tell Prisma
+   *    to leave the ticker alone, which is right, but spreading the whole DTO
+   *    would also push `undefined` over fields the form never showed. So the
+   *    patch is assembled key by key, and an explicit `null` on a nullable
+   *    field is preserved as a genuine "clear this".
+   *
+   * Nothing recalculates here, deliberately. Holdings and every return figure
+   * are derived by replaying this ledger (see HoldingsService's reconstruction
+   * and analytics/calculators/flows.ts), so the corrected row is picked up on
+   * the next read — exactly as it is after a delete. Writing a Holding patch
+   * from this method would put a second, divergent source of truth next to the
+   * replay.
+   */
+  async update(id: string, dto: UpdateTransactionDto, actor: Actor) {
+    const data: Prisma.TransactionUncheckedUpdateManyInput = {};
+
+    if (dto.type !== undefined) data.type = dto.type;
+    if (dto.amount !== undefined) data.amount = dto.amount;
+    if (dto.date !== undefined) data.date = new Date(dto.date);
+    // The nullable columns: `null` clears, a value sets, absent leaves alone.
+    if (dto.ticker !== undefined) data.ticker = dto.ticker;
+    if (dto.quantity !== undefined) data.quantity = dto.quantity;
+    if (dto.price !== undefined) data.price = dto.price;
+    if (dto.description !== undefined) data.description = dto.description;
+    if (dto.reference !== undefined) data.reference = dto.reference;
+
+    // An empty patch would otherwise bump `updatedAt` and report success for a
+    // save that changed nothing, so it is answered from the read instead.
+    if (Object.keys(data).length === 0) {
+      const current = await this.findOne(id, actor);
+      if (!current) throw new NotFoundException('Transaction not found');
+      return current;
+    }
+
+    const { count } = await this.prisma.transaction.updateMany({
+      where: { id, ...relatedClientWhere(actor) },
+      data,
+    });
+    if (count === 0) throw new NotFoundException('Transaction not found');
+
+    // Re-read rather than trusting the patch: `updateMany` returns a count, not
+    // the row, and the caller needs the whole corrected record to patch its
+    // table with.
+    const updated = await this.prisma.transaction.findUnique({ where: { id } });
+    if (!updated) throw new NotFoundException('Transaction not found');
+    return serialize(updated);
   }
 
   /**

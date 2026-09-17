@@ -4,6 +4,7 @@ import {
   Post,
   Body,
   Param,
+  Patch,
   Delete,
   Query,
   Req,
@@ -14,6 +15,7 @@ import { TransactionsService } from './transactions.service';
 import { CreateTransactionDto } from './dto/create-transaction.dto';
 import { CreateCashFlowDto } from './dto/create-cash-flow.dto';
 import { CreateDividendDto } from './dto/create-dividend.dto';
+import { UpdateTransactionDto } from './dto/update-transaction.dto';
 import { BulkDeleteTransactionsDto } from './dto/bulk-delete-transactions.dto';
 import { Actor } from '../common/ownership-scope';
 
@@ -112,6 +114,22 @@ export class TransactionsController {
   @Get(':id')
   findOne(@Param('id') id: string, @Req() req: AuthedRequest) {
     return this.transactionsService.findOne(id, req.user);
+  }
+
+  /**
+   * Correct a ledger row in place.
+   *
+   * PATCH rather than PUT: the edit form sends only the fields it changed, and
+   * a PUT would mean an omitted key clears the column. The client the row
+   * belongs to is not editable — see UpdateTransactionDto.
+   */
+  @Patch(':id')
+  update(
+    @Param('id') id: string,
+    @Body() dto: UpdateTransactionDto,
+    @Req() req: AuthedRequest
+  ) {
+    return this.transactionsService.update(id, dto, req.user);
   }
 
   @Delete(':id')

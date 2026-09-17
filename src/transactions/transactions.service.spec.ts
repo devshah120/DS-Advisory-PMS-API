@@ -82,3 +82,108 @@ describe('TransactionsService.findLots', () => {
     expect(lots.map((l) => l.type)).toEqual(['buy', 'sell']);
   });
 });
+
+/**
+ * An edit rewrites a row the XIRR engine replays, so the risk here is not that
+ * a save fails loudly - it is that it succeeds and writes MORE than the operator
+ * changed. These pin the patch the service actually sends to Prisma.
+ */
+describe('TransactionsService.update', () => {
+  const ROW: any = {
+    id: 't1',
+    clientId: 'c1',
+    ticker: 'ICICIBANK.NS',
+    type: 'BUY',
+    quantity: 70,
+    price: 1354.4,
+    amount: 94808,
+    date: new Date('2026-09-17T12:00:00Z'),
+    description: null,
+    reference: null,
+  };
+
+  function build(count = 1, row: any = ROW) {
+    const updateMany = jest.fn().mockResolvedValue({ count });
+    const findUnique = jest.fn().mockResolvedValue(row);
+    const findFirst = jest.fn().mockResolvedValue(row);
+    const prisma = {
+      transaction: { updateMany, findUnique, findFirst },
+    } as unknown as PrismaService;
+    return { service: new TransactionsService(prisma), updateMany, findUnique, findFirst };
+  }
+
+  it('writes only the keys the caller sent', async () => {
+    const { service, updateMany } = build();
+
+    await service.update('t1', { amount: 95000 }, SUPER_ADMIN);
+
+    // The whole point of the key-by-key assembly: spreading the DTO would push
+    // `undefined` over ticker, price and quantity as well. Prisma treats an
+    // absent key as "leave it", so the patch must contain nothing else.
+    expect(updateMany.mock.calls[0][0].data).toEqual({ amount: 95000 });
+  });
+
+  it('keeps an explicit null as a clear rather than dropping it', async () => {
+    const { service, updateMany } = build();
+
+    await service.update('t1', { reference: null }, SUPER_ADMIN);
+
+    // `undefined` cannot express "empty this column" - only null can, so the
+    // distinction has to survive the assembly.
+    expect(updateMany.mock.calls[0][0].data).toEqual({ reference: null });
+  });
+
+  it('parses the date into a Date, not the string it arrived as', async () => {
+    const { service, updateMany } = build();
+
+    await service.update('t1', { date: '2026-09-15T12:00:00.000Z' }, SUPER_ADMIN);
+
+    const { date } = updateMany.mock.calls[0][0].data;
+    expect(date).toBeInstanceOf(Date);
+    expect((date as Date).toISOString()).toBe('2026-09-15T12:00:00.000Z');
+  });
+
+  it('proves ownership in the update itself', async () => {
+    const { service, updateMany } = build();
+    const manager: Actor = { id: 'u_m', role: 'FUND_MANAGER' };
+
+    await service.update('t1', { amount: 1 }, manager);
+
+    // Same relation filter `remove` uses. A read-then-write would leave a
+    // window between the check and the update.
+    const where = updateMany.mock.calls[0][0].where;
+    expect(where.id).toBe('t1');
+    expect(where.client).toEqual({ ownerId: 'u_m' });
+  });
+
+  it('404s when the row is absent or in another book', async () => {
+    const { service } = build(0);
+
+    // count 0 is indistinguishable between "gone" and "not yours" on purpose.
+    await expect(service.update('t1', { amount: 1 }, SUPER_ADMIN)).rejects.toThrow(
+      'Transaction not found'
+    );
+  });
+
+  it('does not touch the row when nothing changed', async () => {
+    const { service, updateMany, findFirst } = build();
+
+    await service.update('t1', {}, SUPER_ADMIN);
+
+    // An empty patch would otherwise bump `updatedAt` on a ledger row and
+    // report a save that changed nothing.
+    expect(updateMany).not.toHaveBeenCalled();
+    expect(findFirst).toHaveBeenCalled();
+  });
+
+  it('returns the stored row, lowercased for the frontend union', async () => {
+    const { service } = build();
+
+    const updated = await service.update('t1', { amount: 95000 }, SUPER_ADMIN);
+
+    // Re-read rather than echoing the patch: updateMany returns a count, and
+    // the caller splices this whole record into its table.
+    expect(updated.type).toBe('buy');
+    expect(updated.ticker).toBe('ICICIBANK.NS');
+  });
+});
