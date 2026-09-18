@@ -10,6 +10,7 @@ import { MarketService } from '../market/market.service';
 import { HistoricalPriceService } from '../historical-price/historical-price.service';
 import { CreateHoldingDto } from './dto/create-holding.dto';
 import { UpdateHoldingDto } from './dto/update-holding.dto';
+import { UpdateLotDto } from './dto/update-lot.dto';
 import { BulkImportRowResult, BulkImportSummary } from './dto/bulk-import-result.dto';
 import { Market, marketForSymbol, normalizeSymbol } from '../common/market-scope';
 import {
@@ -537,6 +538,199 @@ export class HoldingsService {
 
     return this.prisma.holding.delete({
       where: { id },
+    });
+  }
+
+  /**
+   * Corrects one fill and rebuilds the position from the corrected ledger.
+   *
+   * A holding in this system is a summary of its BUY/SELL rows, not an
+   * independent record: XIRR, the Performance view and the as-of-date
+   * reconstruction all replay the ledger. Patching quantity or averageCost on
+   * the Holding row alone would therefore fix what the holdings table shows
+   * while leaving every return figure computed off the uncorrected flows — the
+   * two would disagree silently, which is worse than not offering the edit.
+   *
+   * So the write goes to the transaction, and the position is recomputed from
+   * what the ledger now says. The date is editable here for the same reason it
+   * exists on the create path: a back-dated fill booked as "today" misprices
+   * the return, and this is the only place that mistake can be corrected.
+   */
+  async updateLot(holdingId: string, lotId: string, dto: UpdateLotDto, actor: Actor) {
+    const holding = await this.prisma.holding.findFirst({
+      where: { id: holdingId, ...relatedClientWhere(actor) },
+    });
+    if (!holding) throw new NotFoundException(`No holding with id ${holdingId}`);
+
+    // Matched on the position as well as the id, so a lot id that belongs to a
+    // different ticker (or a different client's book) cannot be steered into
+    // this position's recompute.
+    const lot = await this.prisma.transaction.findFirst({
+      where: {
+        id: lotId,
+        clientId: holding.clientId,
+        ticker: holding.ticker,
+        type: { in: ['BUY', 'SELL'] },
+      },
+    });
+    if (!lot) throw new NotFoundException(`No lot with id ${lotId} on this position`);
+
+    const side = dto.side ?? (lot.type as 'BUY' | 'SELL');
+    const quantity = dto.quantity ?? Math.abs(lot.quantity ?? 0);
+    const amount = dto.amount ?? Math.abs(lot.amount ?? 0);
+
+    if (quantity <= 0) {
+      throw new BadRequestException('Quantity must be greater than zero');
+    }
+
+    // Derived, never taken from the caller — the same rule the create path
+    // applies, so price x quantity and amount agree on every row of the blotter.
+    const price = amount / quantity;
+
+    await this.prisma.transaction.update({
+      where: { id: lotId },
+      data: {
+        type: side,
+        quantity,
+        price,
+        amount,
+        date: dto.date ? new Date(dto.date) : lot.date,
+        description: `${side === 'SELL' ? 'Sell' : 'Buy'} ${quantity} ${holding.ticker}`,
+      },
+    });
+
+    return this.recomputeFromLedger(holding.id, holding.clientId, holding.ticker);
+  }
+
+  /**
+   * Removes one fill and rebuilds the position from what is left.
+   *
+   * Deleting the last remaining lot leaves a position with no ledger behind it,
+   * which the recompute resolves to a zero quantity — a closed position, which
+   * is the honest answer. The holding row is kept rather than deleted so the
+   * row's classification and realised history survive; removing the position
+   * outright is what the trash button beside the pencil is for.
+   */
+  async removeLot(holdingId: string, lotId: string, actor: Actor) {
+    const holding = await this.prisma.holding.findFirst({
+      where: { id: holdingId, ...relatedClientWhere(actor) },
+    });
+    if (!holding) throw new NotFoundException(`No holding with id ${holdingId}`);
+
+    const { count } = await this.prisma.transaction.deleteMany({
+      where: {
+        id: lotId,
+        clientId: holding.clientId,
+        ticker: holding.ticker,
+        type: { in: ['BUY', 'SELL'] },
+      },
+    });
+    if (count === 0) throw new NotFoundException(`No lot with id ${lotId} on this position`);
+
+    return this.recomputeFromLedger(holding.id, holding.clientId, holding.ticker);
+  }
+
+  /**
+   * Adds a fill to an existing position and rebuilds it.
+   *
+   * The create path already does this for a trade being booked now; this exists
+   * so a lot that was never recorded can be added from inside the correction
+   * modal, where the user has the position's whole history in front of them.
+   */
+  async addLot(holdingId: string, dto: UpdateLotDto, actor: Actor) {
+    const holding = await this.prisma.holding.findFirst({
+      where: { id: holdingId, ...relatedClientWhere(actor) },
+    });
+    if (!holding) throw new NotFoundException(`No holding with id ${holdingId}`);
+
+    const side = dto.side ?? 'BUY';
+    const quantity = dto.quantity ?? 0;
+    const amount = dto.amount ?? 0;
+
+    if (quantity <= 0) {
+      throw new BadRequestException('Quantity must be greater than zero');
+    }
+
+    await this.prisma.transaction.create({
+      data: {
+        clientId: holding.clientId,
+        ticker: holding.ticker,
+        type: side,
+        quantity,
+        price: amount / quantity,
+        amount,
+        date: dto.date ? new Date(dto.date) : new Date(),
+        description: `${side === 'SELL' ? 'Sell' : 'Buy'} ${quantity} ${holding.ticker}`,
+      },
+    });
+
+    return this.recomputeFromLedger(holding.id, holding.clientId, holding.ticker);
+  }
+
+  /**
+   * Rebuilds a position's quantity, average cost and realised P&L by replaying
+   * its BUY/SELL rows in date order.
+   *
+   * This is the same replay `getPortfolioAsOfDate` performs, with no date
+   * ceiling — which is the point: after a correction the live position and any
+   * back-dated reconstruction are derived from one ledger by one rule, so they
+   * cannot drift. Sells are costed against the running average at the time of
+   * the sale rather than against today's, so re-running the replay over an
+   * unchanged ledger reproduces the same realised figure every time.
+   *
+   * `currentPrice` is left alone: it is a quote, not a fact about the trade,
+   * and the read path overlays a live one anyway.
+   */
+  private async recomputeFromLedger(holdingId: string, clientId: string, ticker: string) {
+    const lots = await this.prisma.transaction.findMany({
+      where: { clientId, ticker, type: { in: ['BUY', 'SELL'] } },
+      orderBy: { date: 'asc' },
+    });
+
+    let quantity = 0;
+    let costBasis = 0;
+    let realizedPnL = 0;
+
+    for (const lot of lots) {
+      const size = Math.abs(lot.quantity ?? 0);
+      const amount = Math.abs(lot.amount ?? 0);
+      if (size === 0) continue;
+
+      if (lot.type === 'BUY') {
+        quantity += size;
+        costBasis += amount;
+      } else {
+        // Sells cannot take out more than is held: a ledger whose sells exceed
+        // its buys is already inconsistent, and clamping keeps the rebuild from
+        // inventing a negative position out of it.
+        const sold = Math.min(size, quantity);
+        const averageCost = quantity > 0 ? costBasis / quantity : 0;
+        realizedPnL += amount - averageCost * sold;
+        quantity -= sold;
+        costBasis -= averageCost * sold;
+      }
+    }
+
+    // Same snap the create path applies: a full exit built from fractional buys
+    // and sells lands on float dust, not a clean zero, and that dust is what
+    // keeps a closed name rendering as an open position worth nothing.
+    if (Math.abs(quantity) < CLOSED_POSITION_EPSILON) {
+      quantity = 0;
+      costBasis = 0;
+    }
+
+    const averageCost = quantity > 0 ? costBasis / quantity : 0;
+    const current = await this.prisma.holding.findUnique({ where: { id: holdingId } });
+    const currentPrice = current?.currentPrice ?? 0;
+
+    return this.prisma.holding.update({
+      where: { id: holdingId },
+      data: {
+        quantity,
+        averageCost,
+        realizedPnL,
+        ...derive(quantity, averageCost, currentPrice),
+      },
     });
   }
 

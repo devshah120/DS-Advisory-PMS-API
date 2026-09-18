@@ -20,6 +20,7 @@ import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { HoldingsService } from './holdings.service';
 import { CreateHoldingDto } from './dto/create-holding.dto';
 import { UpdateHoldingDto } from './dto/update-holding.dto';
+import { UpdateLotDto } from './dto/update-lot.dto';
 import { SetSectorDto } from './dto/set-sector.dto';
 import { ClassificationService } from './classification.service';
 import { parseMarket } from '../common/market-scope';
@@ -148,6 +149,43 @@ export class HoldingsController {
     @Req() req: AuthedRequest,
   ) {
     return this.classification.setSector(symbol, dto.sector, req.user);
+  }
+
+  /**
+   * The lot routes sit above `@Get(':id')` so the literal `lots` segment is
+   * matched as a route rather than swallowed as a holding id, the same reason
+   * `import/template` and `classification/unclassified` are mounted early.
+   *
+   * Every one of these writes to the transaction ledger and then rebuilds the
+   * position from it, because a holding here is a summary of its fills — see
+   * the note on updateLot in the service.
+   */
+  @Post(':id/lots')
+  addLot(
+    @Param('id') id: string,
+    @Body() dto: UpdateLotDto,
+    @Req() req: AuthedRequest,
+  ) {
+    return this.holdingsService.addLot(id, dto, req.user);
+  }
+
+  @Patch(':id/lots/:lotId')
+  updateLot(
+    @Param('id') id: string,
+    @Param('lotId') lotId: string,
+    @Body() dto: UpdateLotDto,
+    @Req() req: AuthedRequest,
+  ) {
+    return this.holdingsService.updateLot(id, lotId, dto, req.user);
+  }
+
+  @Delete(':id/lots/:lotId')
+  removeLot(
+    @Param('id') id: string,
+    @Param('lotId') lotId: string,
+    @Req() req: AuthedRequest,
+  ) {
+    return this.holdingsService.removeLot(id, lotId, req.user);
   }
 
   @Get(':id')
