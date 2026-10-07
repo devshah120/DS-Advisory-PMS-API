@@ -229,7 +229,17 @@ export class MarketService {
 
     const meta = data?.chart?.result?.[0]?.meta;
     const price: unknown = meta?.regularMarketPrice;
-    const prior: unknown = meta?.chartPreviousClose;
+    // For NSE/BSE indices (^NSEI, ^BSESN, ^NSEBANK, ^NSEMDCP50) Yahoo serves a
+    // chartPreviousClose a session stale: on 7-Oct-2026 Nifty's was the 5-Oct
+    // close, so a -0.76% day printed as +0.21%. fulldayChange is measured from
+    // the true prior session for every symbol, and for equities, US indices and
+    // futures it reconciles exactly with chartPreviousClose, so derive the prior
+    // close from it and keep chartPreviousClose only as the fallback.
+    const fullDayChange: unknown = meta?.fulldayChange;
+    const prior: unknown =
+      typeof price === 'number' && typeof fullDayChange === 'number' && Number.isFinite(fullDayChange)
+        ? price - fullDayChange
+        : meta?.chartPreviousClose;
 
     // A zero/negative prior close would make the percentage meaningless, so
     // treat it as missing and let the caller drop the row.

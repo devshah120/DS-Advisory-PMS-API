@@ -41,6 +41,19 @@ describe('MarketService.dayChange', () => {
     expect(change!.changePercent).toBeLessThan(0);
   });
 
+  it('measures an Indian index from fulldayChange, not its stale chartPreviousClose', async () => {
+    // The real ^NSEI quote from 7-Oct-2026: chartPreviousClose was the 5-Oct
+    // close, which turned a -0.76% day into +0.21% on the market strip.
+    const { svc } = serviceReturning(
+      chart({ regularMarketPrice: 22603.05, chartPreviousClose: 22555.8, fulldayChange: -173.049 }),
+    );
+
+    const change = await svc.dayChange('^NSEI');
+
+    expect(change!.priorClose).toBeCloseTo(22776.1, 2);
+    expect(change!.changePercent).toBeCloseTo(-0.76, 2);
+  });
+
   it('retries a delisted .NS symbol on the BSE before giving up', async () => {
     // INDOSMC is BSE-only but stored with the '.NS' suffix the book uses;
     // without the retry it drops off the board entirely.
