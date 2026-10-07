@@ -271,3 +271,84 @@ describe('MarketService.history split un-adjustment', () => {
     expect(bars).toEqual([{ date: '2024-10-01', close: 12.5, rawClose: 12.5 }]);
   });
 });
+
+describe('MarketService.history for NSE Emerge (SME) symbols', () => {
+  /** A Yahoo chart response of IST-session bars, keyed by YYYY-MM-DD. */
+  const chart = (closes: Record<string, number>) => ({
+    chart: {
+      result: [
+        {
+          meta: { gmtoffset: 19800 },
+          // 09:15 IST open, as Yahoo stamps NSE bars.
+          timestamp: Object.keys(closes).map((d) => Date.parse(`${d}T03:45:00Z`) / 1000),
+          indicators: { quote: [{ close: Object.values(closes) }] },
+        },
+      ],
+    },
+  });
+  const none = { chart: { result: null as unknown, error: { code: 'Not Found' } } };
+
+  /** Answers each URL by the first matching substring, so call order does not matter. */
+  function serviceAnswering(routes: Array<[string, unknown]>) {
+    const svc = new MarketService();
+    const urls: string[] = [];
+    (svc as any).fetchJson = jest.fn(async (url: string) => {
+      urls.push(url);
+      return routes.find(([match]) => url.includes(match))?.[1] ?? null;
+    });
+    return { svc, urls };
+  }
+
+  it('takes the archive from the bare symbol when the -SM symbol only holds today', async () => {
+    // AIMTRON on the day of the bug: 'AIMTRON-SM.NS' had one bar, 'AIMTRON.NS' the rest.
+    const { svc, urls } = serviceAnswering([
+      ['AIMTRON-SM.NS', chart({ '2026-10-07': 1835.9 })],
+      ['AIMTRON.NS', chart({ '2026-09-29': 1873.4, '2026-09-30': 1950.25, '2026-10-01': 1898.85, '2026-10-07': 1800 })],
+    ]);
+
+    const bars = await svc.history('AIMTRON-SM.NS', '2026-09-29');
+
+    expect(bars.map((b) => [b.date, b.rawClose])).toEqual([
+      ['2026-09-29', 1873.4],
+      ['2026-09-30', 1950.25],
+      ['2026-10-01', 1898.85],
+      ['2026-10-07', 1835.9], // the -SM symbol's own bar wins a shared date
+    ]);
+    expect(urls.some((u) => u.includes('nseindia'))).toBe(false);
+  });
+
+  it('falls back to the BSE listing, then to NSE, when Yahoo has no bare symbol', async () => {
+    const nse = {
+      data: [
+        { CH_SERIES: 'SM', mTIMESTAMP: '01-Oct-2026', CH_CLOSING_PRICE: 247.25 },
+        { CH_SERIES: 'SM', mTIMESTAMP: '30-Sep-2026', CH_CLOSING_PRICE: 242.6 },
+        { CH_SERIES: 'EQ', mTIMESTAMP: '30-Sep-2026', CH_CLOSING_PRICE: 1 },
+      ],
+    };
+    const { svc, urls } = serviceAnswering([
+      ['SAFEENTP-SM.NS', chart({ '2026-10-07': 260.45 })],
+      ['SAFEENTP.NS', none],
+      ['SAFEENTP.BO', none],
+      ['nseindia', nse],
+    ]);
+
+    const bars = await svc.history('SAFEENTP-SM.NS', '2026-09-28');
+
+    expect(urls.some((u) => u.includes('SAFEENTP.BO'))).toBe(true);
+    expect(bars).toEqual([
+      { date: '2026-09-30', close: 242.6, rawClose: 242.6 },
+      { date: '2026-10-01', close: 247.25, rawClose: 247.25 },
+      { date: '2026-10-07', close: 260.45, rawClose: 260.45 },
+    ]);
+  });
+
+  it('does not reach for the archive once the -SM symbol covers the window itself', async () => {
+    const { svc, urls } = serviceAnswering([
+      ['AIMTRON-SM.NS', chart({ '2026-09-30': 1950.25, '2026-10-01': 1898.85 })],
+    ]);
+
+    await svc.history('AIMTRON-SM.NS', '2026-09-30');
+
+    expect(urls).toHaveLength(1);
+  });
+});

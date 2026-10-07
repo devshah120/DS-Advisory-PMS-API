@@ -50,6 +50,38 @@ const REQUEST_TIMEOUT_MS = 6000;
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36';
 
+const NSE = 'https://www.nseindia.com';
+/** Calendar days per NSE archive request — about 62 sessions, under the ~70 it returns. */
+const NSE_CHUNK_DAYS = 90;
+
+/** An NSE Emerge (SME) symbol as Yahoo quotes it: 'AIMTRON-SM.NS' → base 'AIMTRON'. */
+const EMERGE_SYMBOL = /^(.+)-(SM|ST)\.NS$/;
+/** NSE's series codes for the Emerge platform (regular SME lots, and trade-for-trade). */
+const EMERGE_SERIES = new Set(['SM', 'ST']);
+
+const MONTHS: Record<string, string> = {
+  Jan: '01', Feb: '02', Mar: '03', Apr: '04', May: '05', Jun: '06',
+  Jul: '07', Aug: '08', Sep: '09', Oct: '10', Nov: '11', Dec: '12',
+};
+
+/** NSE's '30-Sep-2026' as '2026-09-30'; null if it is not in that form. */
+function parseNseDate(value: unknown): string | null {
+  const m = typeof value === 'string' ? /^(\d{2})-([A-Za-z]{3})-(\d{4})$/.exec(value) : null;
+  const month = m && MONTHS[m[2]];
+  return month ? `${m![3]}-${month}-${m![1]}` : null;
+}
+
+function sortBars(byDate: Map<string, DailyClose>): DailyClose[] {
+  return [...byDate.values()].sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+}
+
+/** One series from two, oldest first; on a date both hold, `preferred`'s bar wins. */
+function mergeBars(archive: DailyClose[], preferred: DailyClose[]): DailyClose[] {
+  const byDate = new Map(archive.map((b) => [b.date, b]));
+  for (const b of preferred) byDate.set(b.date, b);
+  return sortBars(byDate);
+}
+
 @Injectable()
 export class MarketService {
   private readonly logger = new Logger(MarketService.name);
@@ -136,27 +168,65 @@ export class MarketService {
     const cached = this.historyCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) return cached.value;
 
-    const period1 = Math.floor(new Date(`${fromDate}T00:00:00Z`).getTime() / 1000);
-    const period2 = Math.floor(Date.now() / 1000);
-    const chartUrl = (symbol: string) =>
-      `${YAHOO}/v8/finance/chart/${encodeURIComponent(symbol)}` +
-      `?period1=${period1}&period2=${period2}&interval=1d&events=split`;
+    const emerge = EMERGE_SYMBOL.exec(ticker);
 
-    let data = await this.fetchJson(chartUrl(ticker));
+    let bars = await this.yahooHistory(ticker, fromDate);
 
     // Same BSE retry as `lookup` and `dayChange`. Without it a BSE-only
     // smallcap stored as '.NS' had no history at all, and every back-dated
     // valuation quietly priced it at its last transaction instead.
-    if (!data?.chart?.result?.[0]?.timestamp && ticker.endsWith('.NS')) {
-      data = await this.fetchJson(chartUrl(`${ticker.slice(0, -3)}.BO`));
+    if (!bars && ticker.endsWith('.NS') && !emerge) {
+      bars = await this.yahooHistory(`${ticker.slice(0, -3)}.BO`, fromDate);
     }
+
+    // An NSE Emerge (SME) symbol quotes live on Yahoo as 'AIMTRON-SM.NS', but
+    // that symbol's chart holds only the latest session or two — the history
+    // stayed on the bare 'AIMTRON.NS'. Valuing an SME position on any past date
+    // found no bar, and the statement fell back to whatever stale bar happened
+    // to be stored (AIMTRON on 30-Sep-2026 came out at its 23-Sep close). The
+    // bare symbol supplies the archive; failing that (SAFEENTP has none on
+    // Yahoo at all), NSE's own bhavcopy archive does. The Emerge symbol's own
+    // bars win any date both cover, since it is the one Yahoo keeps current.
+    if (emerge && !this.reachesBack(bars, fromDate)) {
+      const base = emerge[1];
+      const archive =
+        (await this.yahooHistory(`${base}.NS`, fromDate)) ??
+        (await this.yahooHistory(`${base}.BO`, fromDate)) ??
+        (await this.nseHistory(base, fromDate));
+      if (archive) bars = mergeBars(archive, bars ?? []);
+    }
+
+    if (!bars) {
+      throw new NotFoundException(`No price history found for "${ticker}"`);
+    }
+
+    this.historyCache.set(cacheKey, {
+      value: bars,
+      expiresAt: Date.now() + MarketService.HISTORY_CACHE_TTL_MS,
+    });
+    return bars;
+  }
+
+  /** Does `bars` start within a week of `fromDate`, i.e. cover the window asked for? */
+  private reachesBack(bars: DailyClose[] | null, fromDate: string): boolean {
+    if (!bars?.length) return false;
+    const slackMs = 7 * 86_400_000;
+    return Date.parse(`${bars[0].date}T00:00:00Z`) <= Date.parse(`${fromDate}T00:00:00Z`) + slackMs;
+  }
+
+  /** One Yahoo chart series as DailyClose bars, oldest first; null when Yahoo has no history for `symbol`. */
+  private async yahooHistory(symbol: string, fromDate: string): Promise<DailyClose[] | null> {
+    const period1 = Math.floor(new Date(`${fromDate}T00:00:00Z`).getTime() / 1000);
+    const period2 = Math.floor(Date.now() / 1000);
+    const data = await this.fetchJson(
+      `${YAHOO}/v8/finance/chart/${encodeURIComponent(symbol)}` +
+        `?period1=${period1}&period2=${period2}&interval=1d&events=split`
+    );
 
     const result = data?.chart?.result?.[0];
     const timestamps: number[] | undefined = result?.timestamp;
     const closes: Array<number | null> | undefined = result?.indicators?.quote?.[0]?.close;
-    if (!timestamps || !closes) {
-      throw new NotFoundException(`No price history found for "${ticker}"`);
-    }
+    if (!timestamps || !closes) return null;
 
     // Bars and split events are both dated in the exchange's own calendar.
     // Yahoo stamps a daily bar at the session open, so slicing the raw UTC
@@ -186,12 +256,53 @@ export class MarketService {
       const unadjust = splits.reduce((f, s) => (date < s.day ? f * s.factor : f), 1);
       bars.push({ date, close, rawClose: close * unadjust });
     }
-
-    this.historyCache.set(cacheKey, {
-      value: bars,
-      expiresAt: Date.now() + MarketService.HISTORY_CACHE_TTL_MS,
-    });
     return bars;
+  }
+
+  /**
+   * Official NSE closes for `symbol` from `fromDate` through today, oldest
+   * first; null if NSE could not be reached or knows no such symbol.
+   *
+   * The last resort for Emerge stocks Yahoo has no archive for. NSE prints the
+   * actual session close, so `close` and `rawClose` are the same number — this
+   * series is not split-adjusted, which is right for valuing a ledger quantity
+   * and only approximate as a return series across a split.
+   */
+  private async nseHistory(symbol: string, fromDate: string): Promise<DailyClose[] | null> {
+    const DAY_MS = 86_400_000;
+    const nseDate = (ms: number) => {
+      const [y, m, d] = new Date(ms).toISOString().slice(0, 10).split('-');
+      return `${d}-${m}-${y}`;
+    };
+
+    const byDate = new Map<string, DailyClose>();
+    const end = Date.now();
+    let found = false;
+
+    // The endpoint silently truncates to about 70 sessions per request, so a
+    // longer window is walked in chunks that stay under that.
+    for (let start = Date.parse(`${fromDate}T00:00:00Z`); start <= end; start += NSE_CHUNK_DAYS * DAY_MS) {
+      const stop = Math.min(start + (NSE_CHUNK_DAYS - 1) * DAY_MS, end);
+      const data = await this.fetchJson(
+        `${NSE}/api/historicalOR/generateSecurityWiseHistoricalData` +
+          `?from=${nseDate(start)}&to=${nseDate(stop)}&symbol=${encodeURIComponent(symbol)}` +
+          `&type=priceVolumeDeliverable&series=ALL`,
+        { Referer: `${NSE}/` }
+      );
+      const rows: any[] | undefined = data?.data;
+      if (!Array.isArray(rows)) return found ? sortBars(byDate) : null;
+      found = true;
+
+      for (const row of rows) {
+        if (!EMERGE_SERIES.has(row?.CH_SERIES)) continue;
+        const close = Number(row?.CH_CLOSING_PRICE);
+        const date = parseNseDate(row?.mTIMESTAMP);
+        if (!date || !Number.isFinite(close) || close <= 0) continue;
+        byDate.set(date, { date, close, rawClose: close });
+      }
+    }
+
+    return found ? sortBars(byDate) : null;
   }
 
   /**
@@ -395,7 +506,7 @@ export class MarketService {
       if (!response.ok) return null;
       return await response.json();
     } catch (error) {
-      this.logger.warn(`Yahoo request failed (${url}): ${(error as Error).message}`);
+      this.logger.warn(`Market data request failed (${url}): ${(error as Error).message}`);
       return null;
     }
   }
