@@ -8,11 +8,13 @@ import { Prisma } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { MarketService } from '../market/market.service';
+import { HistoricalPriceService } from '../historical-price/historical-price.service';
 import { CreateClientDto } from './dto/create-client.dto';
 import { UpdateClientDto } from './dto/update-client.dto';
 import {
-  appliesHouseRebase,
   buildFlows,
+  isBulkImportClient,
+  jun30Quantities,
   JUN30_REBASE_DATE,
   rebaseLedgerToJun30,
 } from '../analytics/calculators/flows';
@@ -82,6 +84,29 @@ function serialize<T extends { riskProfile: string; status: string; accountingMe
  * XIRR disagree with the Performance page (−38.9% vs −18.1% for Mrugesh) whenever
  * the cache had drifted from the live price. Same terminal value → same XIRR.
  */
+/**
+ * What `rebaseLedgerToJun30` needs to know about a client beyond its ledger:
+ * today's quantities, and whether its 1-July BUYs are bulk-import artifacts.
+ * Shared by `deriveMetrics` and the list's 30-June close fetch, so the closes
+ * fetched are exactly the tickers the rebase will price.
+ *
+ * The earliest transaction is already loaded, so `isBulkImportClient` costs
+ * no extra query.
+ */
+function rebaseInputs(client: {
+  holdings: Array<{ ticker: string; quantity: number }>;
+  transactions: Array<{ date: Date }>;
+}) {
+  const firstTransactionDate = client.transactions.reduce<Date | null>(
+    (earliest, t) => (earliest === null || t.date < earliest ? t.date : earliest),
+    null,
+  );
+  return {
+    currentQuantity: new Map(client.holdings.map((h) => [h.ticker, h.quantity])),
+    bulkImport: isBulkImportClient({ firstTransactionDate }),
+  };
+}
+
 function deriveMetrics(
   client: {
     cashBalance: number;
@@ -106,26 +131,16 @@ function deriveMetrics(
   // list's XIRR matches the Performance page instead of showing the exploded
   // pre-rebase figure. Without this the two pages disagreed: Performance read
   // −16.9% while the list still showed +23,000,000%.
-  const currentQuantity = new Map(client.holdings.map((h) => [h.ticker, h.quantity]));
-
-  /**
-   * ...but ONLY for the clients that rebase actually describes. A client whose
-   * ledger starts before 30-June-2026 has real, priceable history, and rebasing
-   * it would delete those trades and invent a June purchase in their place. The
-   * earliest transaction is the evidence, and it is already loaded here, so the
-   * gate costs no extra query. See `appliesHouseRebase`.
-   */
-  const firstTransactionDate = client.transactions.reduce<Date | null>(
-    (earliest, t) => (earliest === null || t.date < earliest ? t.date : earliest),
-    null,
-  );
-  const houseRebase = appliesHouseRebase({ firstTransactionDate });
+  //
+  // Every client is rebased, including one whose ledger predates 30-June: the
+  // house reports every book from the same 30-June base (see JUN30_REBASE_DATE).
+  const { currentQuantity, bulkImport } = rebaseInputs(client);
 
   const rebased = rebaseLedgerToJun30(
     client.transactions,
     jun30Close,
     currentQuantity,
-    houseRebase,
+    bulkImport,
   );
   const built = buildFlows(rebased, 'TRANSACTIONAL', holdingsValue, new Date());
   let rate = 0;
@@ -142,6 +157,7 @@ export class ClientsService {
   constructor(
     private prisma: PrismaService,
     private market: MarketService,
+    private prices: HistoricalPriceService,
   ) {}
 
   async create(dto: CreateClientDto, actor: Actor) {
@@ -351,11 +367,21 @@ export class ClientsService {
     // terminal value identical to the Performance page's, so the XIRRs agree;
     // MarketService caches per ticker for an hour, so a symbol held by several
     // clients hits Yahoo at most once.
-    const bars = await this.prisma.priceBar.findMany({
-      where: { symbol: { in: tickers }, date: JUN30_REBASE_DATE },
-      select: { symbol: true, adjClose: true },
-    });
-    const jun30Close = new Map(bars.map((b) => [b.symbol, b.adjClose]));
+    //
+    // The closes are for every ticker any client on the page HELD on 30-June
+    // (which may since have been sold), and they are the session's actual
+    // close from the same resolver the Performance page uses — never the
+    // split-adjusted `PriceBar.adjClose`, which undervalues a 30-June share
+    // count for anything that has split or issued a bonus since.
+    const jun30Tickers = [
+      ...new Set(
+        clients.flatMap((c) => {
+          const { currentQuantity, bulkImport } = rebaseInputs(c);
+          return [...jun30Quantities(c.transactions, currentQuantity, bulkImport).keys()];
+        }),
+      ),
+    ];
+    const jun30Close = await this.prices.closesOn(jun30Tickers, JUN30_REBASE_DATE);
 
     // Stored tickers are already fully qualified ('RELIANCE.NS'), so the market
     // is read off the symbol itself rather than the client's — a lookup here

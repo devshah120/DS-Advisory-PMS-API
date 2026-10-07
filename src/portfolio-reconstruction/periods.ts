@@ -17,28 +17,21 @@ import {
 /**
  * The period vocabulary behind the Performance sheet's period selector.
  *
- * One rule governs every entry here: **no window may open before the CLIENT'S
- * OWN inception**. `resolvePeriod`/`availablePeriods` take a `clientInception`
- * — the mandate's own `Client.inceptionDate`, or a household's earliest member
- * — and every window is clamped to it, in BOTH directions.
+ * One rule governs every entry here: **no window may open before the later of
+ * the house baseline (30-June-2026) and the CLIENT'S OWN inception**.
+ * `resolvePeriod`/`availablePeriods` take a `clientInception` — the mandate's
+ * own `Client.inceptionDate`, or a household's earliest member — and every
+ * window is clamped to that floor.
  *
  * A mandate that began 10-Feb-2027 has no priceable history in January, so its
- * "Since inception" opens 10-Feb-2027. A mandate that began 16-Dec-2025 has six
- * months of real, priceable history before the house's own import date, so its
- * "Since inception" opens 16-Dec-2025 — and its December and March quarters are
- * genuine, measurable windows that must appear in the dropdown.
+ * "Since inception" opens 10-Feb-2027. A mandate that began 16-Dec-2025 still
+ * opens on 30-June-2026: the house reports every book from the 30-June base,
+ * and that client's earlier history is rolled up into their opening position
+ * (see JUN30_REBASE_DATE in analytics/calculators/flows.ts).
  *
- * 30-June-2026 is NOT a floor. It is the date the legacy book was bulk-imported
- * on, and it is the opening value for exactly those clients whose history the
- * import destroyed — see INCEPTION_DATE in analytics/calculators/flows.ts, and
- * the `isHouseBaselineDate` gate that decides, per client, whether it applies to
- * them at all. For a client with a real ledger reaching further back, the house
- * date is just another day on the calendar.
- *
- * Where it does apply, the identity the desk expects still falls out for free:
- * that quarter opened 1-July, the day after the import with no trading in
- * between, so QTD and INCEPTION resolve to the same opening value and report the
- * same number.
+ * The identity the desk expects falls out for free: the quarter after the
+ * baseline opened 1-July, with no valuation in between, so QTD and INCEPTION
+ * resolve to the same opening value and report the same number.
  *
  * ── Two calendars ──────────────────────────────────────────────────────────
  * Every window here is resolved against the MARKET's reporting calendar, not
@@ -109,29 +102,28 @@ function utcDay(d: Date): Date {
 }
 
 /**
- * The floor a window may not open before: THE CLIENT'S OWN MANDATE START,
- * whenever the book knows it.
+ * The floor a window may not open before: whichever is LATER of the house
+ * baseline (30-June-2026) and the client's own mandate start.
  *
- * This used to take whichever of the two dates was LATER, which made the
- * 30-June-2026 house date a floor nobody could open before. That was written
- * when it was true that no mandate predated the bulk import — the old comment
- * said so out loud ("every client seeded so far") — and it stopped being true
- * the moment a client with genuine earlier history was onboarded.
+ * The house date is a floor for everyone. Every client's since-inception
+ * series is rebased onto the 30-June close (see JUN30_REBASE_DATE in
+ * analytics/calculators/flows.ts), including a client whose ledger reaches
+ * further back — their pre-July history is rolled up into the opening
+ * position, not reported. A window opening before 30-June would measure
+ * history the since-inception figure has deliberately set aside, so the two
+ * would disagree for the same book.
  *
- * The cost of the old rule was not cosmetic. A mandate that began 16-Dec-2025
- * had its opening date silently dragged forward to 30-June-2026, so "Since
- * inception" measured the last stretch of his holding period and called it his
- * whole record, and every window before that date resolved to zero length and
- * rendered as "Not available". The client's own start date is the fact of the
- * matter; the house date is only a stand-in for when we do not have one.
+ * A mandate that began AFTER the house date still opens on its own start: it
+ * has no history before then to measure.
  *
  * `clientInception` is undefined for the house-wide dropdown listing
  * (`availablePeriods` called with no client in view) and for a family with no
- * members yet. Only then does the house date stand in.
+ * members yet; the house date is the answer then too.
  */
 function effectiveInception(houseInception: Date, clientInception?: Date): Date {
   if (!clientInception) return houseInception;
-  return utcDay(clientInception);
+  const client = utcDay(clientInception);
+  return client > houseInception ? client : houseInception;
 }
 
 /**

@@ -116,10 +116,15 @@ export class ReviewPackAnalysisService {
       { includeDividends: clientRow?.includeDividends, includeFees: clientRow?.includeFees },
       isHouseBaseline,
     );
+    // Securities only at both ends, exactly as PerformanceBaselineService does.
+    // The cash balance is maintained by hand (Set Cash / Deposit / Withdraw write
+    // `Client.cashBalance` and never a ledger row), so it never reaches the flow
+    // series either — leaving it inside the valuations made every cash edit
+    // register as return. See PerformanceBaselineService.openingValue.
     const flows = [
-      { date: resolved.from, amount: -openPortfolio.portfolioValue },
+      { date: resolved.from, amount: -openPortfolio.holdingsValue },
       ...interior,
-      { date: resolved.to, amount: closePortfolio.portfolioValue },
+      { date: resolved.to, amount: closePortfolio.holdingsValue },
     ];
 
     const periodDays = Math.max(1, Math.round((resolved.to.getTime() - resolved.from.getTime()) / 86_400_000));

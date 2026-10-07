@@ -1,6 +1,7 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { SnapshotService } from './snapshot.service';
+import { HistoricalPriceService } from '../../historical-price/historical-price.service';
 import { allocationBy } from '../calculators/weights';
 import { benchmarkXirr, xirr, CashFlow } from '../calculators/xirr';
 import { DEFAULT_MARKET, MARKETS, Market } from '../../common/market-scope';
@@ -8,10 +9,10 @@ import { replayLots, totalRealizedGain } from '../calculators/tax-lots';
 import { Actor, assertCanAccessClient } from '../../common/ownership-scope';
 import {
   AccountingMethod,
-  appliesHouseRebase,
   buildFlows,
   FlowOptions,
-  isImportArtifact,
+  isBulkImportClient,
+  isPreBaseline,
   jun30Quantities,
   JUN30_REBASE_DATE,
   rebaseLedgerToJun30,
@@ -81,6 +82,7 @@ export class PerformanceService {
   constructor(
     private prisma: PrismaService,
     private snapshots: SnapshotService,
+    private prices: HistoricalPriceService,
   ) {}
 
   async forClient(
@@ -145,38 +147,30 @@ export class PerformanceService {
      * +15,611,770% on the Clients list was this, not a math error).
      *
      * We have no true purchase dates or prices, so we adopt a defensible synthetic
-     * basis: value each currently-held position at its 30-June-2026 close (fetched
-     * from Yahoo into PriceBar, source="yahoo") and treat that as a single purchase
-     * on 2026-06-30. The XIRR then measures only the period since 30 June — the one
-     * window we can actually price — instead of years of unrecorded history.
+     * basis: value each position held on 30-June-2026 at that day's close and
+     * treat that as a single purchase on 2026-06-30. The XIRR then measures only
+     * the period since 30 June instead of years of unrecorded history.
      *
-     * This is a CALCULATION-ONLY rebasing: the stored ledger is untouched. The
-     * original BUY rows are dropped from the *flow series* here and replaced by the
-     * synthetic 30-June basis; SELL/DIVIDEND/FEES since then remain real events.
-     * A position without a 30-June bar falls back to its recorded average cost.
-     */
-    /**
-     * ...and it applies ONLY to the clients whose history the import destroyed.
+     * The rebase applies to EVERY client, including one whose ledger reaches
+     * further back (a mandate that began 16-Dec-2025): the house reports every
+     * book from the same 30-June base, so their pre-July trades are rolled up
+     * into the opening position rather than reported. See JUN30_REBASE_DATE.
      *
-     * The paragraph above is the whole justification for this transform, and
-     * every sentence of it is about the bulk import: no true purchase dates, no
-     * trade history, nothing priceable before 30-June. None of that is true of a
-     * client who has a real ledger reaching further back. For them this rebase
-     * deletes genuine trades at genuine prices and substitutes an invented June
-     * purchase — turning a client who joined 16-Dec-2025 into one who joined
-     * 30-Jun-2026, and erasing the six months in between from every figure on
-     * this page.
+     * This is a CALCULATION-ONLY rebasing: the stored ledger is untouched. Every
+     * pre-baseline row is dropped from the *flow series* here and replaced by the
+     * synthetic 30-June basis; rows since then remain real events. A position
+     * without a 30-June close falls back to its pre-baseline average cost.
      *
      * `ledger` is ordered ascending, so its first row IS the earliest
-     * transaction and the gate costs no extra query. See `appliesHouseRebase`.
+     * transaction and `isBulkImportClient` costs no extra query.
      */
-    const houseRebase = appliesHouseRebase({
+    const bulkImport = isBulkImportClient({
       firstTransactionDate: ledger[0]?.date ?? null,
     });
 
     const ledgerForFlows =
-      method === 'TRANSACTIONAL' && houseRebase
-        ? await this.rebaseToJun30(snap, ledger)
+      method === 'TRANSACTIONAL'
+        ? await this.rebaseToJun30(snap, ledger, bulkImport)
         : ledger;
 
     /**
@@ -203,8 +197,8 @@ export class PerformanceService {
      * purchase cost, which is correct: for those, the purchase IS the inception.
      */
     const positionsForGains =
-      method === 'TRANSACTIONAL' && houseRebase
-        ? await this.rebasePositionCosts(snap, ledger)
+      method === 'TRANSACTIONAL'
+        ? await this.rebasePositionCosts(snap, ledger, bulkImport)
         : snap.positions;
 
     // ── Values ────────────────────────────────────────────────────────────────
@@ -766,31 +760,37 @@ export class PerformanceService {
   }
 
   /**
-   * Fetch the 30-June-2026 closes for a set of tickers from PriceBar.
-   * (Bars were loaded from Yahoo, source="yahoo", keyed by ledger ticker.)
+   * The 30-June-2026 session close for each ticker — the ACTUAL close, never
+   * Yahoo's split-adjusted series.
+   *
+   * The synthetic 30-June buy multiplies a 30-June share count by this price,
+   * so a split-adjusted figure would undervalue any position that has split
+   * or issued a bonus since (RELIANCE.NS before a 1:1 bonus at half its
+   * price). This used to read `PriceBar.adjClose` directly; it now goes
+   * through the same resolver the period engine prices its 30-June opening
+   * value with, so the since-inception and period figures stand on the same
+   * base.
    */
   private async jun30Closes(tickers: string[]): Promise<Map<string, number>> {
-    const bars = await this.prisma.priceBar.findMany({
-      where: { symbol: { in: [...new Set(tickers)] }, date: JUN30_REBASE_DATE },
-      select: { symbol: true, adjClose: true },
-    });
-    return new Map(bars.map((b) => [b.symbol, b.adjClose]));
+    return this.prices.closesOn(tickers, JUN30_REBASE_DATE);
   }
 
   /**
    * Rebase a transactional ledger onto a 30-June-2026 cost basis. The actual
    * transform is the shared pure `rebaseLedgerToJun30` (see its comment in
    * flows.ts) so this and the Clients-list `deriveMetrics` cannot drift; this
-   * wrapper only supplies the DB-fetched 30-June closes. `snap.positions.costBasis`
-   * is per-share (= averageCost), which is the fallback unit price the helper wants.
+   * wrapper only supplies the 30-June closes, for every ticker held at the
+   * close — including one sold out since, which has no position left.
    */
   private async rebaseToJun30(
     snap: Awaited<ReturnType<SnapshotService['forClient']>>,
     ledger: LedgerRow[],
+    bulkImport: boolean,
   ): Promise<LedgerRow[]> {
-    const closeOf = await this.jun30Closes(snap.positions.map((p) => p.ticker));
     const currentQuantity = new Map(snap.positions.map((p) => [p.ticker, p.quantity]));
-    return rebaseLedgerToJun30(ledger, closeOf, currentQuantity) as LedgerRow[];
+    const held = jun30Quantities(ledger, currentQuantity, bulkImport);
+    const closeOf = await this.jun30Closes([...held.keys()]);
+    return rebaseLedgerToJun30(ledger, closeOf, currentQuantity, bulkImport) as LedgerRow[];
   }
 
   /**
@@ -808,7 +808,7 @@ export class PerformanceService {
    *     market close (it was already public) without this client having held
    *     it then. Rebasing its cost onto that close restates a purchase that
    *     never happened — this broke Karan Raiyani's reconciliation before
-   *     `jun30Quantities` gated eligibility on a real import BUY.
+   *     `jun30Quantities` gated eligibility on pre-baseline activity.
    *   - A position added to AFTER 30-June (Shubh Laiwala's OKE/VIRT/SNDK/CRWV)
    *     has only PART of its current quantity eligible for the 30-June price;
    *     pricing the FULL current quantity at that close overstated the
@@ -824,11 +824,12 @@ export class PerformanceService {
   private async rebasePositionCosts(
     snap: Awaited<ReturnType<SnapshotService['forClient']>>,
     ledger: LedgerRow[],
+    bulkImport: boolean,
   ): Promise<Awaited<ReturnType<SnapshotService['forClient']>>['positions']> {
-    const closeOf = await this.jun30Closes(snap.positions.map((p) => p.ticker));
     const currentQuantity = new Map(snap.positions.map((p) => [p.ticker, p.quantity]));
-    const jun30 = jun30Quantities(ledger, currentQuantity);
-    const realCostAddedSince = this.realCostAddedSinceJun30(ledger);
+    const jun30 = jun30Quantities(ledger, currentQuantity, bulkImport);
+    const closeOf = await this.jun30Closes([...jun30.keys()]);
+    const realCostAddedSince = this.realCostAddedSinceJun30(ledger, bulkImport);
 
     return snap.positions.map((p) => {
       const rebased = jun30.get(p.ticker);
@@ -868,10 +869,11 @@ export class PerformanceService {
    */
   private realCostAddedSinceJun30(
     ledger: LedgerRow[],
+    bulkImport: boolean,
   ): Map<string, { quantity: number; costBasisTotal: number }> {
     const out = new Map<string, { quantity: number; costBasisTotal: number }>();
     for (const t of ledger) {
-      if (!t.ticker || !t.quantity || isImportArtifact(t, true)) continue;
+      if (!t.ticker || !t.quantity || isPreBaseline(t, bulkImport)) continue;
       const existing = out.get(t.ticker) ?? { quantity: 0, costBasisTotal: 0 };
 
       if (t.type === 'BUY') {

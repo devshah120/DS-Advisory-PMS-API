@@ -3,7 +3,7 @@ import { PrismaService } from '../common/prisma/prisma.service';
 import { PortfolioHistoryService } from './portfolio-history.service';
 import { BenchmarkHistoryService, BenchmarkWindowResult } from './benchmark-history.service';
 import { CashFlow, xirr } from '../analytics/calculators/xirr';
-import { AccountingMethod, appliesHouseRebase, buildWindowFlows } from '../analytics/calculators/flows';
+import { AccountingMethod, buildWindowFlows, isBulkImportClient } from '../analytics/calculators/flows';
 import { ResolvedPeriod } from './periods';
 import { Market } from '../common/market-scope';
 
@@ -300,8 +300,8 @@ export class PerformanceBaselineService {
     // date is proof that it is not, whatever the baseline row says. A client
     // with no baseline row and no earlier history falls back to the synthetic
     // house-dated one (PortfolioReconstructionService), so absence still counts
-    // as "house baseline". See appliesHouseRebase and isImportArtifact.
-    const isHouseBaseline = appliesHouseRebase({
+    // as "house baseline". See isBulkImportClient and isImportArtifact.
+    const isHouseBaseline = isBulkImportClient({
       baselineDate: baseline?.baselineDate,
       firstTransactionDate: firstTransaction?.date ?? null,
     });

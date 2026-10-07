@@ -1,8 +1,8 @@
 import {
-  appliesHouseRebase,
   buildFlows,
   buildWindowFlows,
   INCEPTION_DATE,
+  isBulkImportClient,
   isImportArtifact,
   JUN30_REBASE_DATE,
   rebaseLedgerToJun30,
@@ -444,66 +444,125 @@ describe('buildWindowFlows — period windows respect the accounting method', ()
 });
 
 
-describe('appliesHouseRebase — who the 30-June rebase is actually for', () => {
-  it('applies to a client with no baseline and no history before the house date', () => {
+describe('isBulkImportClient — whose 1-July BUYs are import artifacts', () => {
+  it('is true for a client with no baseline and no history before the house date', () => {
     expect(
-      appliesHouseRebase({ firstTransactionDate: new Date('2026-07-01T00:00:00.000Z') }),
+      isBulkImportClient({ firstTransactionDate: new Date('2026-07-01T00:00:00.000Z') }),
     ).toBe(true);
   });
 
-  it('applies to a client with no ledger at all', () => {
-    expect(appliesHouseRebase({ firstTransactionDate: null })).toBe(true);
+  it('is true for a client with no ledger at all', () => {
+    expect(isBulkImportClient({ firstTransactionDate: null })).toBe(true);
   });
 
-  it('does NOT apply to a client whose ledger predates the house date', () => {
-    // Abhishek Oberoi: real trades from 16-Dec-2025. The ledger is the evidence
-    // that outranks everything — a trade recorded then proves the account was
-    // priceable then, so there is no lost history for the rebase to paper over.
+  it('is false for a client whose ledger predates the house date', () => {
+    // Abhishek Oberoi: real trades from 16-Dec-2025. His history was recorded,
+    // not imported, so a 1-July BUY of his is a real trade.
     expect(
-      appliesHouseRebase({ firstTransactionDate: new Date('2025-12-16T00:00:00.000Z') }),
+      isBulkImportClient({ firstTransactionDate: new Date('2025-12-16T00:00:00.000Z') }),
     ).toBe(false);
   });
 
-  it('does not apply even when a house-dated baseline row says otherwise', () => {
+  it('is false even when a house-dated baseline row says otherwise', () => {
     expect(
-      appliesHouseRebase({
+      isBulkImportClient({
         baselineDate: INCEPTION_DATE,
         firstTransactionDate: new Date('2025-12-16T00:00:00.000Z'),
       }),
     ).toBe(false);
   });
 
-  it('does not apply to a client with their own non-house baseline', () => {
+  it('is false for a client with their own non-house baseline', () => {
     expect(
-      appliesHouseRebase({ baselineDate: new Date('2026-08-10T00:00:00.000Z') }),
+      isBulkImportClient({ baselineDate: new Date('2026-08-10T00:00:00.000Z') }),
     ).toBe(false);
   });
 });
 
-describe('rebaseLedgerToJun30 — gated on the client actually being in the import', () => {
-  const ledger = [
-    { type: 'BUY', amount: 1_400_000, date: d('2025-12-16'), ticker: 'INFY.NS', quantity: 1000 },
-    { type: 'SELL', amount: 200_000, date: d('2026-08-11'), ticker: 'INFY.NS', quantity: 100 },
-  ];
+describe('rebaseLedgerToJun30 — every client opens on the 30-June close', () => {
   const closes = new Map([['INFY.NS', 1600]]);
-  const held = new Map([['INFY.NS', 900]]);
 
-  it('leaves a pre-house-date ledger exactly as recorded', () => {
-    const out = rebaseLedgerToJun30(ledger, closes, held, false);
-    // Identity: the real December BUY survives, at its own date and amount.
-    expect(out).toEqual(ledger);
-    const buy = out.find((r) => r.type === 'BUY')!;
-    expect(buy.date).toEqual(d('2025-12-16'));
-    expect(buy.amount).toBe(1_400_000);
+  it('rolls a pre-house-date ledger up into one 30-June buy', () => {
+    // A mandate that began 16-Dec-2025: everything before 1-July is history the
+    // baseline absorbs — the BUY, the SELL AND the dividend.
+    const ledger = [
+      { type: 'BUY', amount: 1_400_000, date: d('2025-12-16'), ticker: 'INFY.NS', quantity: 1000 },
+      { type: 'SELL', amount: 300_000, date: d('2026-03-10'), ticker: 'INFY.NS', quantity: 200 },
+      { type: 'DIVIDEND', amount: 5_000, date: d('2026-05-20'), ticker: 'INFY.NS', quantity: null },
+      { type: 'SELL', amount: 200_000, date: d('2026-08-11'), ticker: 'INFY.NS', quantity: 100 },
+    ];
+    const out = rebaseLedgerToJun30(ledger, closes, new Map([['INFY.NS', 700]]), false);
+
+    // Held on 30-June: 700 today + the 100 sold in August.
+    expect(out).toEqual([
+      { type: 'BUY', amount: 1600 * 800, date: JUN30_REBASE_DATE },
+      ledger[3],
+    ]);
   });
 
-  it('still rebases a genuine house-baseline client', () => {
+  it('keeps every row after the baseline exactly as recorded', () => {
+    const ledger = [
+      { type: 'BUY', amount: 1_400_000, date: d('2025-12-16'), ticker: 'INFY.NS', quantity: 1000 },
+      { type: 'DIVIDEND', amount: 7_000, date: d('2026-08-01'), ticker: 'INFY.NS', quantity: null },
+      { type: 'BUY', amount: 90_000, date: d('2026-09-02'), ticker: 'TCS.NS', quantity: 25 },
+    ];
+    const out = rebaseLedgerToJun30(
+      ledger,
+      closes,
+      new Map([['INFY.NS', 1000], ['TCS.NS', 25]]),
+      false,
+    );
+    expect(out.slice(1)).toEqual([ledger[1], ledger[2]]);
+    // A ticker first bought after the baseline gets no synthetic buy of its own.
+    expect(out.filter((r) => r.date.getTime() === JUN30_REBASE_DATE.getTime())).toHaveLength(1);
+  });
+
+  it('treats a 1-July BUY as real for a client with recorded history', () => {
+    const ledger = [
+      { type: 'BUY', amount: 1_400_000, date: d('2025-12-16'), ticker: 'INFY.NS', quantity: 1000 },
+      { type: 'BUY', amount: 160_000, date: d('2026-07-01'), ticker: 'INFY.NS', quantity: 100 },
+    ];
+    const out = rebaseLedgerToJun30(ledger, closes, new Map([['INFY.NS', 1100]]), false);
+    expect(out).toEqual([
+      { type: 'BUY', amount: 1600 * 1000, date: JUN30_REBASE_DATE },
+      ledger[1],
+    ]);
+  });
+
+  it('still rolls the 1-July import BUYs into the baseline for a bulk-import client', () => {
     const imported = [
       { type: 'BUY', amount: 1_400_000, date: d('2026-07-01'), ticker: 'INFY.NS', quantity: 1000 },
     ];
     const out = rebaseLedgerToJun30(imported, closes, new Map([['INFY.NS', 1000]]), true);
-    const buy = out.find((r) => r.type === 'BUY')!;
-    expect(buy.date).toEqual(JUN30_REBASE_DATE);
-    expect(buy.amount).toBe(1600 * 1000);
+    expect(out).toEqual([{ type: 'BUY', amount: 1600 * 1000, date: JUN30_REBASE_DATE }]);
+  });
+
+  it('prices the pre-bonus share count after a post-baseline bonus', () => {
+    // 1:1 bonus in October doubles today's holding; the 30-June close is a
+    // pre-bonus price, so it must be multiplied by the pre-bonus count.
+    const ledger = [
+      { type: 'BUY', amount: 140_000, date: d('2026-02-02'), ticker: 'INFY.NS', quantity: 100 },
+      { type: 'BONUS', amount: 0, date: d('2026-10-01'), ticker: 'INFY.NS', quantity: 100 },
+    ];
+    const out = rebaseLedgerToJun30(ledger, closes, new Map([['INFY.NS', 200]]), false);
+    expect(out[0]).toEqual({ type: 'BUY', amount: 1600 * 100, date: JUN30_REBASE_DATE });
+  });
+
+  it('falls back to the pre-baseline average cost when there is no 30-June close', () => {
+    const ledger = [
+      { type: 'BUY', amount: 100_000, date: d('2026-01-05'), ticker: 'XYZ.NS', quantity: 100 },
+      { type: 'BUY', amount: 140_000, date: d('2026-04-05'), ticker: 'XYZ.NS', quantity: 100 },
+    ];
+    const out = rebaseLedgerToJun30(ledger, new Map(), new Map([['XYZ.NS', 200]]), false);
+    expect(out).toEqual([{ type: 'BUY', amount: 1200 * 200, date: JUN30_REBASE_DATE }]);
+  });
+
+  it('drops a position fully exited before the baseline', () => {
+    const ledger = [
+      { type: 'BUY', amount: 100_000, date: d('2026-01-05'), ticker: 'XYZ.NS', quantity: 100 },
+      { type: 'SELL', amount: 120_000, date: d('2026-04-05'), ticker: 'XYZ.NS', quantity: 100 },
+    ];
+    const out = rebaseLedgerToJun30(ledger, new Map(), new Map(), false);
+    expect(out).toEqual([]);
   });
 });

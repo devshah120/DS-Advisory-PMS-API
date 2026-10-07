@@ -36,22 +36,31 @@ export type FlowBuildResult =
 /**
  * 30-June-2026 cost rebasing — the single source of truth for it.
  *
- * The trade ledger was bulk-imported with every BUY stamped 2026-07-01, though the
- * positions were actually accumulated over 2–3 prior years we have no history for.
- * XIRR annualizes, so a real multi-year gain measured over a ~3-week window blew up
- * into thousands/millions of percent. This rebases the flow series onto the one
- * window we can honestly price: value each currently-held position at its
- * 30-June-2026 close and treat that as a single purchase on 2026-06-30.
+ * Every client's reported performance starts on 1-July-2026, opening on the
+ * 30-June-2026 close. This is a house-wide policy, applied to EVERY client:
+ *
+ *   • For the bulk-imported book it is the only option. The trade ledger was
+ *     imported with every BUY stamped 2026-07-01, though the positions were
+ *     accumulated over 2–3 prior years we have no history for, and XIRR on a
+ *     multi-year gain squeezed into a ~3-week window blew up into thousands of
+ *     percent.
+ *   • For a client with genuine earlier history (a mandate that began
+ *     16-Dec-2025, say) it is a deliberate choice: their pre-July record is
+ *     rolled up into an opening position rather than reported, so every book
+ *     in the house is measured over the same window from the same base.
  *
  * It is a PURE transform so the two callers that need it — the Performance service
  * and the Clients-list `deriveMetrics` — go through the identical logic and cannot
  * drift apart (they already drifted once, which is the entire reason this lives in
  * one place). Each caller supplies the 30-June closes it has fetched.
  *
- *   • Every BUY is dropped (its date/price are the corrupted import).
- *   • Each held position becomes ONE synthetic BUY on 2026-06-30 at that day's
- *     close × current quantity; missing close falls back to recorded average cost.
- *   • Non-BUY rows (SELL / DIVIDEND / FEES / …) pass through unchanged.
+ *   • Every pre-baseline row (`isPreBaseline`) is dropped — BUYs, SELLs,
+ *     dividends, fees, corporate actions alike. Their effect survives only as
+ *     the position they left behind on 30-June.
+ *   • Each position held at the 30-June close becomes ONE synthetic BUY on
+ *     2026-06-30 at that day's close × the quantity held then; a missing close
+ *     falls back to the pre-baseline average purchase cost.
+ *   • Every row after the baseline passes through untouched.
  *
  * The result is fed to `buildFlows`, whose existing same-day BUY netting collapses
  * all the synthetic buys into a single inception flow.
@@ -124,31 +133,33 @@ export function isHouseBaselineDate(baselineDate: Date): boolean {
 }
 
 /**
- * Does the 30-June-2026 rebase apply to this client at all?
+ * Was this client swept up in the original bulk import — i.e. are their
+ * 1-July-2026 BUY rows import artifacts rather than real trades?
  *
- * ONE question decides it: is the house baseline actually this client's
- * baseline? Two ways it can be:
+ * This no longer decides WHETHER the 30-June rebase applies: it applies to
+ * every client (see the doc on JUN30_REBASE_DATE). It decides only how
+ * 1-July-2026 itself is read. Rows dated on or before 30-June are pre-baseline
+ * for everyone; a BUY stamped 1-July is pre-baseline only for a bulk-import
+ * client, whose 1-July BUYs are the opening position wearing a transaction's
+ * clothing. For anyone else a 1-July BUY is a real trade made after the
+ * baseline, and it stays in the flow series.
  *
- *   • They have a stored `PortfolioBaseline` dated on the house date — they
- *     were in the bulk import.
+ * A client is bulk-import when the house baseline is actually theirs:
+ *
+ *   • They have a stored `PortfolioBaseline` dated on the house date, or
  *   • They have no stored baseline AND no ledger history predating the house
  *     date, so the synthetic house-dated baseline stands in for them
- *     (PortfolioReconstructionService.syntheticBaselineDate) and nothing is
- *     lost by treating the house date as their opening.
+ *     (PortfolioReconstructionService.syntheticBaselineDate).
  *
  * A client with a stored baseline on their OWN date, or with real transactions
- * before 30-June-2026, is neither — and for them the rebase must not fire. The
- * ledger is the evidence that outranks everything here: a trade recorded in
- * December 2025 is proof the account existed and was priceable in December
- * 2025, whatever any baseline row happens to say.
+ * before 30-June-2026, is neither: their history was recorded, not imported.
  *
  * Centralised because three call sites need the same answer and MUST agree —
  * the Performance page, the Clients-list `deriveMetrics`, and the period
- * engine. They have drifted before, and a client measured as house-baseline on
- * one page and client-baseline on another reports two different returns for the
- * same book.
+ * engine. A 1-July BUY counted as a flow on one page and as part of the opening
+ * position on another reports two different returns for the same book.
  */
-export function appliesHouseRebase(input: {
+export function isBulkImportClient(input: {
   /** The client's stored `PortfolioBaseline.baselineDate`, if they have one. */
   baselineDate?: Date | null;
   /** The client's earliest transaction date, if they have any ledger at all. */
@@ -166,169 +177,146 @@ function utcDayOf(d: Date): Date {
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
 }
 
+/** The first instant after the baseline: midnight UTC on 1-July-2026. */
+const FIRST_POST_BASELINE_DAY = new Date('2026-07-01T00:00:00.000Z');
+
 /**
- * Which tickers actually carry a legacy import BUY, and how many shares that
- * import represents — the only positions (and quantities) the 30-June
- * baseline is entitled to speak for.
+ * Is this ledger row part of the history the 30-June baseline rolls up?
  *
- * A caller's CURRENT holdings are not evidence of what was held on 30-June,
- * in either direction:
+ * Every row dated on or before 30-June-2026 is, for every client, whatever its
+ * type: a December BUY, a March SELL and a May dividend all happened before
+ * the house's reporting window opens, and their only surviving effect is the
+ * position they left behind at the 30-June close.
  *
- *   - A ticker bought fresh after inception is `quantity > 0` today too, and
- *     the market can easily have a real 30-June close for it (it was already
- *     public, just not yet in this client's book) — using current holdings
- *     as the eligibility test priced Karan Raiyani's August purchases of
- *     NLCINDIA.NS/GESHIP.NS/ANUP.NS as if he'd held them since 30-June.
- *   - A ticker that WAS imported but has since been fully sold is
- *     `quantity = 0` today, which is the opposite mistake: using current
- *     holdings as the SIZE (or the eligibility test) drops its synthetic
- *     30-June buy entirely, leaving its later real SELL with no matching
- *     outflow in the flow series and manufacturing a gain out of the full
- *     sale proceeds. This is what turned Nirav Patel's real ₹325.05 gain on
- *     an imported-then-sold LYV lot into an unexplained ₹2,999.95 residual.
- *
- * The import BUY rows themselves are the only reliable record of what was
- * actually imported, so the synthetic quantity is summed from THEM, not from
- * today's `Holding` table — correct whether the position is still fully held,
- * partially sold, added to, or closed out entirely since.
- *
- * Shared by `rebaseLedgerToJun30` (the flow series) and
- * `PerformanceService.rebasePositionCosts` (the cost basis) so the two can
- * never disagree about which tickers are eligible for the 30-June basis —
- * they did once, which is exactly the kind of drift `reconciliation.balanced`
- * exists to catch.
+ * A 1-July BUY is too, but only for a bulk-import client (`isImportArtifact`)
+ * — that is the import date, not a trading date. For any other client a
+ * 1-July row is a real trade after the baseline and stays.
  */
-export interface ImportedPosition {
-  quantity: number;
-  /** Total recorded cost across every import BUY row for this ticker — the fallback basis when no 30-June close exists. */
-  costBasisTotal: number;
-}
-
-export function importedPositions(
-  ledger: Array<{ ticker: string | null; type: string; date: Date; quantity: number | null; amount: number }>,
-  /**
-   * True when this client's baseline IS the shared house baseline — i.e. they
-   * were actually swept up in the bulk import. Passing `false` returns an empty
-   * map, which is the correct answer for a client who has real history of their
-   * own: none of their BUYs are import artifacts, so none are eligible to be
-   * replaced by a synthetic 30-June position. See `isImportArtifact`.
-   */
+export function isPreBaseline(
+  row: { type: string; date: Date },
+  /** True for a bulk-import client. See `isBulkImportClient`. */
   isHouseBaseline = true,
-): Map<string, ImportedPosition> {
-  const out = new Map<string, ImportedPosition>();
-  for (const r of ledger) {
-    if (!r.ticker || !r.quantity || !isImportArtifact(r, isHouseBaseline)) continue;
-    const existing = out.get(r.ticker) ?? { quantity: 0, costBasisTotal: 0 };
-    existing.quantity += r.quantity;
-    existing.costBasisTotal += Math.abs(r.amount);
-    out.set(r.ticker, existing);
-  }
-  return out;
-}
-
-/** Convenience wrapper over `importedPositions` for callers that only need eligibility, not size/cost. */
-export function importedTickers(
-  ledger: Array<{ ticker: string | null; type: string; date: Date; quantity: number | null; amount: number }>,
-  isHouseBaseline = true,
-): Set<string> {
-  return new Set(importedPositions(ledger, isHouseBaseline).keys());
+): boolean {
+  return row.date < FIRST_POST_BASELINE_DAY || isImportArtifact(row, isHouseBaseline);
 }
 
 /**
- * The 30-June-2026 quantity for every ticker eligible for the rebase — the
- * shared arithmetic behind both `rebaseLedgerToJun30` (the flow series) and
- * `PerformanceService.rebasePositionCosts` (the cost basis), so the two can
- * never price a different quantity as "the 30-June position" for the same
- * ticker.
+ * The change in share count a ledger row makes, mirroring
+ * `PortfolioReconstructionService.applyTransaction` — the authority on how a
+ * row moves a position. Corporate-action rows store `quantity` as the signed
+ * DELTA (a reverse split or a merger's outgoing leg is negative), so they pass
+ * through as recorded; a SELL's quantity is stored positive.
+ */
+function shareDelta(row: { type: string; quantity: number | null }): number {
+  if (!row.quantity) return 0;
+  switch (row.type) {
+    case 'BUY':
+    case 'RIGHTS_SUBSCRIPTION':
+      return row.quantity;
+    case 'SELL':
+      return -row.quantity;
+    case 'SPLIT':
+    case 'BONUS':
+    case 'REVERSE_SPLIT':
+    case 'SPINOFF':
+    case 'MERGER':
+    case 'ACQUISITION':
+    case 'DELISTING_SETTLEMENT':
+      return row.quantity;
+    default:
+      return 0;
+  }
+}
+
+/**
+ * The 30-June-2026 quantity for every ticker the client held at the close —
+ * the shared arithmetic behind both `rebaseLedgerToJun30` (the flow series)
+ * and `PerformanceService.rebasePositionCosts` (the cost basis), so the two
+ * can never price a different quantity as "the 30-June position" for the
+ * same ticker.
  *
- * Mirrors `BaselineService.autoSeed`'s `sharesAddedSince` rollback exactly:
- * current quantity, minus every REAL (non-import) BUY/SELL since the
- * cutover. Using current quantity un-rolled-back double-counts any later
- * real purchase — Shubh Laiwala bought more OKE, VIRT, SNDK and CRWV after
- * the import, and pricing their FULL current quantity at the 30-June close
- * counted those later shares once at the (wrong) 30-June price and again at
- * their own real purchase price, which survives unchanged in `nonBuys`.
+ * ── Eligibility: pre-baseline activity, never current holdings ───────────
+ * Only a ticker with at least one share-moving row before the baseline can
+ * have been held on 30-June. A caller's CURRENT holdings are not evidence of
+ * that: a ticker bought fresh in August is `quantity > 0` today, and the
+ * market may well have a 30-June close for it — using current holdings as the
+ * test priced Karan Raiyani's August purchases of NLCINDIA.NS/GESHIP.NS/
+ * ANUP.NS as if he'd held them since 30-June.
  *
- * A ticker ABSENT from `currentQuantity` — fully exited, with no current
- * `Holding` row left — falls back to the ledger's own imported quantity, the
- * only source left once the holding itself is gone (Nirav Patel's LYV:
- * imported, later fully sold, `Holding` row long gone).
+ * ── Quantity: rolled back from today, not summed forward ─────────────────
+ * Current quantity, minus every share-moving row since the baseline. Mirrors
+ * `BaselineService.autoSeed`'s `sharesAddedSince` rollback, and handles every
+ * shape a position can take since:
  *
- * A ticker present in neither `currentQuantity` nor with a later real SELL is
- * inert import noise with nothing downstream that ever needs its cost basis —
- * Radhika Vaidya's ledger carries a duplicate/typo import BUY for
- * `INDOSMC.NS` alongside the real position under `INDOSMC.BO`; `.NS` has no
- * holding and no SELL, so it is excluded rather than synthesized as a second,
- * phantom 152,000-rupee position.
+ *   - Added to after 30-June (Shubh Laiwala bought more OKE, VIRT, SNDK and
+ *     CRWV): the later shares are subtracted, so they are not priced once at
+ *     the 30-June close and again at their own real cost.
+ *   - Fully sold after 30-June (Nirav Patel's LYV, `Holding` row long gone):
+ *     absent counts as zero held, and adding the later SELL back recovers the
+ *     30-June quantity — without it, the SELL's proceeds would have no
+ *     matching outflow and the whole sale would read as gain.
+ *   - Split or bonus after 30-June: the new shares are subtracted, so the
+ *     30-June close (a pre-split price) is multiplied by the pre-split count.
+ *   - Inert import noise (Radhika Vaidya's duplicate `INDOSMC.NS` BUY beside
+ *     the real `INDOSMC.BO` position — no holding, no later activity): rolls
+ *     back to zero and is excluded rather than synthesized as a phantom
+ *     152,000-rupee position.
+ *
+ * `averageCost` is the pre-baseline purchase cost per share — the fallback
+ * unit price when no 30-June close exists.
  */
 export function jun30Quantities<T extends RebaseLedgerEntry>(
   ledger: T[],
-  /**
-   * ticker → CURRENT quantity, for every ticker the book actually recognises
-   * (present in `Holding`, including a zero for one fully exited via a
-   * post-import BUY/SELL round trip that closed it out).
-   */
+  /** ticker → CURRENT quantity. A ticker absent here is held at zero. */
   currentQuantity: ReadonlyMap<string, number>,
-  /** True when this client was part of the bulk import. See `isImportArtifact`. */
+  /** True for a bulk-import client. See `isBulkImportClient`. */
   isHouseBaseline = true,
 ): Map<string, { quantity: number; averageCost: number }> {
-  const imported = importedPositions(ledger, isHouseBaseline);
-  const soldAfterImport = new Set(
-    ledger
-      .filter((r) => r.ticker && r.type === 'SELL' && !isImportArtifact(r, isHouseBaseline))
-      .map((r) => r.ticker as string),
-  );
+  const heldBefore = new Set<string>();
+  const preCost = new Map<string, { quantity: number; cost: number }>();
+  const addedSince = new Map<string, number>();
 
-  const realSharesAddedSince = new Map<string, number>();
   for (const r of ledger) {
-    if (!r.ticker || !r.quantity || isImportArtifact(r, isHouseBaseline)) continue;
-    const delta = r.type === 'BUY' ? r.quantity : r.type === 'SELL' ? -r.quantity : 0;
-    if (delta !== 0) realSharesAddedSince.set(r.ticker, (realSharesAddedSince.get(r.ticker) ?? 0) + delta);
+    const delta = shareDelta(r);
+    if (!r.ticker || delta === 0) continue;
+
+    if (!isPreBaseline(r, isHouseBaseline)) {
+      addedSince.set(r.ticker, (addedSince.get(r.ticker) ?? 0) + delta);
+      continue;
+    }
+
+    heldBefore.add(r.ticker);
+    if (r.type === 'BUY' || r.type === 'RIGHTS_SUBSCRIPTION') {
+      const c = preCost.get(r.ticker) ?? { quantity: 0, cost: 0 };
+      c.quantity += r.quantity!;
+      c.cost += Math.abs(r.amount);
+      preCost.set(r.ticker, c);
+    }
   }
 
   const out = new Map<string, { quantity: number; averageCost: number }>();
-  for (const [ticker, pos] of imported) {
-    if (!currentQuantity.has(ticker) && !soldAfterImport.has(ticker)) continue;
-
-    const quantity = currentQuantity.has(ticker)
-      ? currentQuantity.get(ticker)! - (realSharesAddedSince.get(ticker) ?? 0)
-      : pos.quantity;
+  for (const ticker of heldBefore) {
+    const quantity = (currentQuantity.get(ticker) ?? 0) - (addedSince.get(ticker) ?? 0);
     if (quantity <= 0) continue;
 
-    // Per-share, from the ORIGINAL import quantity/cost — a ratio, so it
-    // stays valid as a fallback unit price even though `quantity` above may
-    // have been rolled back to a different (smaller) number.
-    out.set(ticker, { quantity, averageCost: pos.costBasisTotal / pos.quantity });
+    const c = preCost.get(ticker);
+    out.set(ticker, { quantity, averageCost: c && c.quantity > 0 ? c.cost / c.quantity : 0 });
   }
   return out;
 }
 
 export function rebaseLedgerToJun30<T extends RebaseLedgerEntry>(
   ledger: T[],
-  /** ticker → 30-June-2026 close. */
+  /** ticker → 30-June-2026 close (the session's actual close, not split-adjusted). */
   jun30Close: Map<string, number>,
   currentQuantity: ReadonlyMap<string, number>,
   /**
-   * True when this client's baseline IS the shared house baseline — the only
-   * clients this rebase was ever meant to describe.
-   *
-   * Passing `false` makes this an IDENTITY transform: no synthetic 30-June buys
-   * are generated and no rows are dropped, so the client's real ledger reaches
-   * XIRR exactly as recorded, at the prices and on the dates it actually
-   * happened.
-   *
-   * That distinction is the whole point. This rebase exists to paper over
-   * history the bulk import destroyed — it fabricates a single purchase on
-   * 30-June-2026 because, for those clients, nothing truthful can be said about
-   * any earlier date. Applied to a client who HAS earlier history, it does the
-   * opposite of its purpose: it deletes real December trades at real prices and
-   * replaces them with an invented June one. A mandate that began 16-Dec-2025
-   * had ₹14L of genuine purchases erased exactly this way.
+   * True for a bulk-import client — decides only whether a 1-July BUY is part
+   * of the opening position or a real trade after it. See `isBulkImportClient`.
+   * The rebase itself applies to every client either way.
    */
   isHouseBaseline = true,
 ): LedgerEntry[] {
-  if (!isHouseBaseline) return ledger;
-
   const jun30 = jun30Quantities(ledger, currentQuantity, isHouseBaseline);
 
   const synthetic: LedgerEntry[] = [...jun30.entries()].map(([ticker, pos]) => {
@@ -337,27 +325,16 @@ export function rebaseLedgerToJun30<T extends RebaseLedgerEntry>(
   });
 
   /**
-   * Drop only the bulk-import BUYs the 30-June baseline now represents —
-   * NOT every BUY ever recorded. The doc above only ever justifies dropping
-   * the legacy import rows ("every BUY is dropped" was written when the
-   * ledger's only BUYs WERE those import rows); it was never a license to
-   * drop an ordinary post-inception purchase too.
-   *
-   * A BUY dated after the cutover is a real trade with nothing to do with
-   * the unpriced legacy history this rebase exists to paper over. Blanket-
-   * dropping it is only invisible for a position still held — the position
-   * still shows up (priced off `holdings`, whatever this rebase does to the
-   * ledger) and its SELL just never fires. But for a position bought AND
-   * fully sold after inception, the BUY has no synthetic replacement (it
-   * only exists for tickers in `importedTickers`) — so the SELL's proceeds
-   * survive as pure inflow with no matching outflow, manufacturing a gain
-   * out of a round-trip trade. On Keyur Vaidya (DWS0002) this took a
-   * ₹13,905.95 real gain on a 30-share STYLAMIND.NS round trip and reported
-   * it as ₹111,769.15 — the full sale proceeds, because the ₹97,863.20
-   * purchase that funded it had been silently erased.
+   * Everything after the baseline survives exactly as recorded — including an
+   * ordinary post-inception purchase. Dropping one is only invisible for a
+   * position still held; for a position bought AND fully sold after
+   * inception, the SELL's proceeds would survive as pure inflow with no
+   * matching outflow. On Keyur Vaidya (DWS0002) that took a ₹13,905.95 real
+   * gain on a 30-share STYLAMIND.NS round trip and reported it as
+   * ₹111,769.15 — the full sale proceeds.
    */
-  const nonBuys = ledger.filter((r) => r.type !== 'BUY' || !isImportArtifact(r, isHouseBaseline));
-  return [...synthetic, ...nonBuys];
+  const afterBaseline = ledger.filter((r) => !isPreBaseline(r, isHouseBaseline));
+  return [...synthetic, ...afterBaseline];
 }
 
 /**
