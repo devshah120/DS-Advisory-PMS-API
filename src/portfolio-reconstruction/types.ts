@@ -1,4 +1,5 @@
 import { AllocationResult } from '../analytics/calculators/weights';
+import { PriceStatus } from '../historical-price/historical-price.service';
 
 /** One position's state as of the reconstruction/snapshot date. */
 export interface ReconstructedPosition {
@@ -6,6 +7,14 @@ export interface ReconstructedPosition {
   quantity: number;
   averageCost: number;
   closingPrice: number;
+  /**
+   * The session `closingPrice` is the close of, and how it was resolved —
+   * `missing` when the ticker has no price history and cost stood in. Set by a
+   * live reconstruction; absent on a position read back from a stored snapshot,
+   * which never recorded them.
+   */
+  priceDate?: string | null;
+  priceStatus?: PriceStatus | 'missing';
   marketValue: number;
   costBasisTotal: number;
   unrealizedGain: number;

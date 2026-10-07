@@ -15,6 +15,12 @@ import {
   ownerForCreate,
 } from '../common/ownership-scope';
 import { MarketService } from '../market/market.service';
+import { PortfolioReconstructionService } from '../portfolio-reconstruction/portfolio-reconstruction.service';
+import {
+  HoldingsAsOf,
+  HoldingsAsOfMember,
+  buildHoldingsAsOf,
+} from '../portfolio-reconstruction/holdings-as-of';
 import { CreateFamilyDto } from './dto/create-family.dto';
 import { UpdateFamilyDto } from './dto/update-family.dto';
 import {
@@ -63,6 +69,12 @@ export interface FamilyPosition {
   unrealizedPnLPercent: number;
   /** Share of the family's total market value (positions only, cash excluded). */
   weight: number;
+  /**
+   * Share of the household's PORTFOLIO value, cash included (0–100). This is
+   * the weight a client statement prints: beside a cash line, `weight` above
+   * would make the sheet add up to more than 100%.
+   */
+  portfolioWeight: number;
   /** Realised P&L booked across the household's accounts in this name. */
   realizedPnL: number;
   /** How many of the family's accounts hold it — 3 of 5 is a real signal. */
@@ -125,6 +137,7 @@ export class FamiliesService {
   constructor(
     private prisma: PrismaService,
     private market: MarketService,
+    private reconstruction: PortfolioReconstructionService,
   ) {}
 
   async create(dto: CreateFamilyDto, actor: Actor) {
@@ -362,7 +375,7 @@ export class FamiliesService {
     // --- merge by symbol ---
     const merged = new Map<
       string,
-      Omit<FamilyPosition, 'averageCost' | 'unrealizedPnLPercent' | 'weight'> & {
+      Omit<FamilyPosition, 'averageCost' | 'unrealizedPnLPercent' | 'weight' | 'portfolioWeight'> & {
         /** Σ(qty × avgCost), carried so the blended cost divides once at the end. */
         investedTotal: number;
       }
@@ -413,6 +426,10 @@ export class FamiliesService {
     }
 
     const totalMarketValue = [...merged.values()].reduce((s, p) => s + p.marketValue, 0);
+    // Summed per member, never per position — a client's balance must be
+    // counted once for the household, not once for every lot they own.
+    const cashBalance = family.clients.reduce((s, c) => s + c.cashBalance, 0);
+    const totalPortfolioValue = totalMarketValue + cashBalance;
 
     const positions: FamilyPosition[] = [...merged.values()]
       .map((p) => ({
@@ -430,6 +447,7 @@ export class FamiliesService {
         unrealizedPnL: p.unrealizedPnL,
         unrealizedPnLPercent: p.costBasis !== 0 ? (p.unrealizedPnL / p.costBasis) * 100 : 0,
         weight: totalMarketValue > 0 ? (p.marketValue / totalMarketValue) * 100 : 0,
+        portfolioWeight: totalPortfolioValue > 0 ? (p.marketValue / totalPortfolioValue) * 100 : 0,
         realizedPnL: p.realizedPnL,
         accounts: p.accounts,
         holders: p.holders.sort((a, b) => b.marketValue - a.marketValue),
@@ -473,9 +491,6 @@ export class FamiliesService {
 
     const costBasis = positions.reduce((s, p) => s + p.costBasis, 0);
     const unrealizedPnL = positions.reduce((s, p) => s + p.unrealizedPnL, 0);
-    // Summed per member, never per position — a client's balance must be
-    // counted once for the household, not once for every lot they own.
-    const cashBalance = members.reduce((s, m) => s + m.cashBalance, 0);
 
     return {
       id: family.id,
@@ -497,6 +512,61 @@ export class FamiliesService {
         portfolioValue: totalMarketValue + cashBalance,
       },
     };
+  }
+
+  /**
+   * The household's merged holdings statement as it stood at the close of
+   * `asOfDate` — the historical counterpart of `aggregate`.
+   *
+   * Each member's book is replayed by PortfolioReconstructionService (the same
+   * replay an individual client's as-of statement uses), then merged by symbol
+   * with the cost blended Σ(qty × avgCost) ÷ Σ(qty), never averaged.
+   *
+   * Members are replayed one after another rather than all at once: a name
+   * held across the household is priced by the first replay, and every later
+   * one finds that close already stored instead of racing to fetch it again.
+   */
+  async holdingsAsOf(id: string, asOfDate: Date, actor: Actor): Promise<HoldingsAsOf> {
+    const family = await this.prisma.family.findUnique({
+      where: { id },
+      include: {
+        clients: {
+          select: {
+            id: true,
+            name: true,
+            holdings: { select: { ticker: true, company: true } },
+          },
+          orderBy: { name: 'asc' },
+        },
+      },
+    });
+    assertOwns(actor, family, 'Family');
+    if (!family) throw new NotFoundException(`Family ${id} not found`);
+    if (family.clients.length === 0) {
+      throw new BadRequestException(`${family.name} has no member accounts to report on.`);
+    }
+
+    const members: HoldingsAsOfMember[] = [];
+    for (const c of family.clients) {
+      try {
+        members.push({
+          clientId: c.id,
+          clientName: c.name,
+          portfolio: await this.reconstruction.reconstruct(c.id, asOfDate),
+          companies: new Map(c.holdings.map((h) => [h.ticker, h.company])),
+        });
+      } catch (err) {
+        // A household statement that silently leaves out one member's book
+        // understates the family by that whole account. Refuse instead, and
+        // say which member, since the fix (an earlier date) is theirs.
+        if (err instanceof BadRequestException) {
+          throw new BadRequestException(`${c.name}: ${err.message}`);
+        }
+        throw err;
+      }
+    }
+
+    return buildHoldingsAsOf(asOfDate, currencyForMarket(family.market as Market), members);
   }
 
   /**

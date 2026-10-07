@@ -698,13 +698,17 @@ model PriceBar {
   open     Float?
   high     Float?
   low      Float?
+  /// What the session actually closed at — the price a ledger quantity on this
+  /// date is valued at. On "yahoo-close" rows, Yahoo's split adjustment has been
+  /// undone; legacy "yahoo" rows hold the split-adjusted figure here instead.
   close    Float
   /// Split- and dividend-adjusted. Returns are ALWAYS computed from this, never
   /// from `close` — using close makes every stock that paid a dividend look like
   /// it crashed on the ex-date.
   adjClose Float
   volume   Float?
-  /// "yahoo" | "workbook" | "manual" — provenance stays auditable.
+  /// "yahoo-close" | "yahoo" (legacy, untrusted — see HistoricalPriceService)
+  /// | "workbook" | "manual" — provenance stays auditable.
   source   String
 
   createdAt DateTime @default(now())

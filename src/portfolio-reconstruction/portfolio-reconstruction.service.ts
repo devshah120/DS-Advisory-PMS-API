@@ -156,16 +156,23 @@ export class PortfolioReconstructionService {
      * Every historical date keeps the strict bound. Asking what the book was
      * worth on 30 June must never be answered with a trade booked in September,
      * so this widening applies only to the open end of the timeline.
+     *
+     * The strict bound is the END of the as-of day, not its first instant. A
+     * date-only request arrives as midnight UTC, and `lte` midnight dropped any
+     * trade stamped later that same day — a lot added without a date is
+     * stamped `new Date()`, and an IST morning trade lands at 04:30Z — so a
+     * position bought on 30 June was missing from the book "as of 30 June".
      */
     const today = utcDay(new Date());
     const isCurrentBook = utcDay(asOfDate).getTime() >= today.getTime();
+    const endOfAsOfDay = new Date(utcDay(asOfDate).getTime() + MS_PER_DAY);
 
     const ledger = await this.prisma.transaction.findMany({
       where: {
         clientId,
         date: isCurrentBook
           ? { gt: baselineRow.baselineDate }
-          : { gt: baselineRow.baselineDate, lte: asOfDate },
+          : { gt: baselineRow.baselineDate, lt: endOfAsOfDay },
       },
       orderBy: { date: 'asc' },
     });
@@ -211,7 +218,7 @@ export class PortfolioReconstructionService {
     }
 
     const open = [...positions.values()].filter((p) => p.quantity !== 0);
-    const closes = await this.prices.closesOn(
+    const closes = await this.prices.resolveCloses(
       open.map((p) => p.ticker),
       asOfDate,
     );
@@ -223,7 +230,10 @@ export class PortfolioReconstructionService {
     let unrealizedGain = 0;
 
     for (const p of open) {
-      const price = closes.get(p.ticker) ?? p.costBasisTotal / p.quantity;
+      const resolved = closes.get(p.ticker);
+      // No price history at all leaves cost as the only defensible stand-in.
+      // It is flagged `missing` so no report presents it as a market price.
+      const price = resolved?.price ?? p.costBasisTotal / p.quantity;
       const marketValue = p.quantity * price;
       const averageCost = p.costBasisTotal / p.quantity;
       const gain = marketValue - p.costBasisTotal;
@@ -237,6 +247,8 @@ export class PortfolioReconstructionService {
         quantity: p.quantity,
         averageCost,
         closingPrice: price,
+        priceDate: resolved?.priceDate ?? null,
+        priceStatus: resolved?.status ?? 'missing',
         marketValue,
         costBasisTotal: p.costBasisTotal,
         unrealizedGain: gain,

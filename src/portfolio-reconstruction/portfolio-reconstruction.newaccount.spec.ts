@@ -27,14 +27,15 @@ describe('PortfolioReconstructionService — account opened after the baseline d
         }),
       },
       transaction: {
-        // `lte` is omitted when the caller asks for the CURRENT book, so that an
-        // already-entered trade dated slightly ahead still counts as held. The
-        // stub has to treat a missing upper bound as unbounded, the way Prisma
-        // does, rather than comparing against undefined.
+        // The upper bound (`lt`, the end of the as-of day) is omitted when the
+        // caller asks for the CURRENT book, so that an already-entered trade
+        // dated slightly ahead still counts as held. The stub has to treat a
+        // missing upper bound as unbounded, the way Prisma does, rather than
+        // comparing against undefined.
         findMany: jest.fn(async ({ where }: any) =>
           transactions.filter(
             (t) =>
-              t.date > where.date.gt && (!where.date.lte || t.date <= where.date.lte),
+              t.date > where.date.gt && (!where.date.lt || t.date < where.date.lt),
           ),
         ),
         // The synthetic baseline is anchored to the account's FIRST ledger row,
@@ -56,6 +57,10 @@ describe('PortfolioReconstructionService — account opened after the baseline d
 
     const prices = {
       closesOn: jest.fn(async (tickers: string[]) => new Map(tickers.map((t) => [t, 150]))),
+      resolveCloses: jest.fn(
+        async (tickers: string[]) =>
+          new Map(tickers.map((t) => [t, { price: 150, priceDate: '2026-07-15', status: 'close' }])),
+      ),
       closeOn: jest.fn().mockResolvedValue(150),
     } as unknown as HistoricalPriceService;
 

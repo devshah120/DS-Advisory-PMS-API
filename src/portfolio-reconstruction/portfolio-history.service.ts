@@ -10,6 +10,15 @@ function utcDay(d: Date): Date {
 }
 
 /**
+ * The first instant AFTER `d`'s calendar day — the same exclusive bound the
+ * reconstruction replays to, so a snapshot's ledger checks count exactly the
+ * rows its replay saw, including trades stamped later in the day.
+ */
+function endOfDay(d: Date): Date {
+  return new Date(utcDay(d).getTime() + 86_400_000);
+}
+
+/**
  * Reads and writes the historical snapshot store (PortfolioValuation +
  * HoldingSnapshot). This is the ONLY place that decides "cached row, or
  * reconstruct" (PART 7) — a caller (a future Reports export, a Performance
@@ -120,7 +129,7 @@ export class PortfolioHistoryService {
     const newerEntry = await this.prisma.transaction.findFirst({
       where: {
         clientId,
-        date: { lte: snapshot.date },
+        date: { lt: endOfDay(snapshot.date) },
         OR: [{ createdAt: { gt: snapshot.createdAt } }, { updatedAt: { gt: snapshot.createdAt } }],
       },
       select: { id: true },
@@ -141,7 +150,7 @@ export class PortfolioHistoryService {
      * rather than being trusted on a field it never stored.
      */
     const ledgerCount = await this.prisma.transaction.count({
-      where: { clientId, date: { lte: snapshot.date } },
+      where: { clientId, date: { lt: endOfDay(snapshot.date) } },
     });
 
     return snapshot.ledgerCount !== ledgerCount;
@@ -167,7 +176,7 @@ export class PortfolioHistoryService {
     // look stale on the next lookup and earns a replay, which is the safe
     // direction to be wrong in. See isStale.
     const ledgerCount = await this.prisma.transaction.count({
-      where: { clientId, date: { lte: day } },
+      where: { clientId, date: { lt: endOfDay(day) } },
     });
 
     const valuation = await this.prisma.portfolioValuation.upsert({

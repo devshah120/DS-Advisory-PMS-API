@@ -17,6 +17,7 @@ import { FamiliesService } from './families.service';
 import { CreateFamilyDto } from './dto/create-family.dto';
 import { UpdateFamilyDto } from './dto/update-family.dto';
 import { parseMarket } from '../common/market-scope';
+import { parseAsOfDate } from '../portfolio-reconstruction/holdings-as-of';
 import { Actor } from '../common/ownership-scope';
 
 type AuthedRequest = { user: Actor };
@@ -53,6 +54,19 @@ export class FamiliesController {
   @Get(':id/aggregate')
   aggregate(@Param('id') id: string, @Req() req: AuthedRequest) {
     return this.familiesService.aggregate(id, req.user);
+  }
+
+  /**
+   * The merged household holdings as they stood at the close of `date`
+   * (YYYY-MM-DD) — every member replayed to that day and priced at its close.
+   */
+  @Get(':id/holdings-as-of/:date')
+  holdingsAsOf(
+    @Param('id') id: string,
+    @Param('date') date: string,
+    @Req() req: AuthedRequest,
+  ) {
+    return this.familiesService.holdingsAsOf(id, parseAsOfDate(date), req.user);
   }
 
   @Patch(':id')

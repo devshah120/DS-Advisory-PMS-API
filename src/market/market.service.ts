@@ -21,7 +21,19 @@ export interface LookupResult extends SymbolProfile {
 export interface DailyClose {
   /** ISO date (YYYY-MM-DD), in the exchange's local trading day. */
   date: string;
+  /**
+   * Yahoo's close, adjusted for every split since. Continuous across a split,
+   * so it is the right series for returns and charts — and the wrong number to
+   * multiply a ledger quantity by on any date before that split.
+   */
   close: number;
+  /**
+   * What the stock actually closed at that day, with Yahoo's split adjustment
+   * undone. This is the price a share count from the ledger is valued at:
+   * 100 RELIANCE.NS on 1-Oct-2024 were worth 100 × ~2,930, not 100 × ~1,465,
+   * which is what `close` reports after the 1:1 bonus later that month.
+   */
+  rawClose: number;
 }
 
 /** A security's move over the current session, against the prior session's close. */
@@ -110,6 +122,11 @@ export class MarketService {
    * Used to resolve "closing price on or before date X" for return windows
    * (MTD/QTD/YTD) — the caller walks the array backward from the target date
    * to skip weekends/holidays rather than this method knowing the calendar.
+   *
+   * The window always runs to today, and that is load-bearing for `rawClose`:
+   * Yahoo adjusts every bar for splits that happen AFTER it, but only reports
+   * the split events that fall inside the requested window. A window ending
+   * before a split returns adjusted closes with no event to undo them by.
    */
   async history(rawTicker: string, fromDate: string): Promise<DailyClose[]> {
     const ticker = rawTicker.trim().toUpperCase();
@@ -121,9 +138,18 @@ export class MarketService {
 
     const period1 = Math.floor(new Date(`${fromDate}T00:00:00Z`).getTime() / 1000);
     const period2 = Math.floor(Date.now() / 1000);
-    const data = await this.fetchJson(
-      `${YAHOO}/v8/finance/chart/${encodeURIComponent(ticker)}?period1=${period1}&period2=${period2}&interval=1d`
-    );
+    const chartUrl = (symbol: string) =>
+      `${YAHOO}/v8/finance/chart/${encodeURIComponent(symbol)}` +
+      `?period1=${period1}&period2=${period2}&interval=1d&events=split`;
+
+    let data = await this.fetchJson(chartUrl(ticker));
+
+    // Same BSE retry as `lookup` and `dayChange`. Without it a BSE-only
+    // smallcap stored as '.NS' had no history at all, and every back-dated
+    // valuation quietly priced it at its last transaction instead.
+    if (!data?.chart?.result?.[0]?.timestamp && ticker.endsWith('.NS')) {
+      data = await this.fetchJson(chartUrl(`${ticker.slice(0, -3)}.BO`));
+    }
 
     const result = data?.chart?.result?.[0];
     const timestamps: number[] | undefined = result?.timestamp;
@@ -132,18 +158,33 @@ export class MarketService {
       throw new NotFoundException(`No price history found for "${ticker}"`);
     }
 
+    // Bars and split events are both dated in the exchange's own calendar.
+    // Yahoo stamps a daily bar at the session open, so slicing the raw UTC
+    // instant happens to work for NSE and NYSE, but it is the offset that makes
+    // it true rather than a coincidence of where those sessions open.
+    const gmtOffset: number = typeof result?.meta?.gmtoffset === 'number' ? result.meta.gmtoffset : 0;
+    const localDay = (epochSeconds: number) =>
+      new Date((epochSeconds + gmtOffset) * 1000).toISOString().slice(0, 10);
+
+    const splits = Object.values<{ date: number; numerator: number; denominator: number }>(
+      result?.events?.splits ?? {}
+    )
+      .filter((s) => s.numerator > 0 && s.denominator > 0)
+      .map((s) => ({ day: localDay(s.date), factor: s.numerator / s.denominator }));
+
     const bars: DailyClose[] = [];
     for (let i = 0; i < timestamps.length; i++) {
       const close = closes[i];
       // A null close is usually the still-open current session, but Yahoo also
       // drops whole settled sessions for thinly-traded symbols (common on .NS).
-      // Either way there is no close to record, so the bar is skipped here and
-      // any resulting gap is repaired below.
+      // Either way there is no close to record, so the bar is skipped here.
       if (close == null) continue;
-      bars.push({
-        date: new Date(timestamps[i] * 1000).toISOString().slice(0, 10),
-        close,
-      });
+      const date = localDay(timestamps[i]);
+      // A bar before a split's ex-date was divided by that split's factor;
+      // multiplying it back restores the price the market actually printed.
+      // The ex-date's own bar already trades post-split and is left alone.
+      const unadjust = splits.reduce((f, s) => (date < s.day ? f * s.factor : f), 1);
+      bars.push({ date, close, rawClose: close * unadjust });
     }
 
     this.historyCache.set(cacheKey, {

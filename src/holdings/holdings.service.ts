@@ -7,12 +7,19 @@ import {
 import * as XLSX from 'xlsx';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { MarketService } from '../market/market.service';
-import { HistoricalPriceService } from '../historical-price/historical-price.service';
+import { PortfolioReconstructionService } from '../portfolio-reconstruction/portfolio-reconstruction.service';
+import { HoldingsAsOf, buildHoldingsAsOf } from '../portfolio-reconstruction/holdings-as-of';
 import { CreateHoldingDto } from './dto/create-holding.dto';
 import { UpdateHoldingDto } from './dto/update-holding.dto';
 import { UpdateLotDto } from './dto/update-lot.dto';
 import { BulkImportRowResult, BulkImportSummary } from './dto/bulk-import-result.dto';
-import { Market, marketForSymbol, normalizeSymbol } from '../common/market-scope';
+import {
+  DEFAULT_MARKET,
+  Market,
+  currencyForMarket,
+  marketForSymbol,
+  normalizeSymbol,
+} from '../common/market-scope';
 import {
   Actor,
   assertCanAccessClient,
@@ -213,7 +220,7 @@ export class HoldingsService {
   constructor(
     private prisma: PrismaService,
     private market: MarketService,
-    private historicalPrice: HistoricalPriceService,
+    private reconstruction: PortfolioReconstructionService,
   ) {}
 
   /**
@@ -671,10 +678,10 @@ export class HoldingsService {
    * Rebuilds a position's quantity, average cost and realised P&L by replaying
    * its BUY/SELL rows in date order.
    *
-   * This is the same replay `getPortfolioAsOfDate` performs, with no date
-   * ceiling — which is the point: after a correction the live position and any
-   * back-dated reconstruction are derived from one ledger by one rule, so they
-   * cannot drift. Sells are costed against the running average at the time of
+   * This is the same average-cost rule PortfolioReconstructionService replays
+   * with, with no date ceiling — which is the point: after a correction the
+   * live position and any back-dated reconstruction are derived from one ledger
+   * by one rule, so they cannot drift. Sells are costed against the running average at the time of
    * the sale rather than against today's, so re-running the replay over an
    * unchanged ledger reproduces the same realised figure every time.
    *
@@ -768,140 +775,38 @@ export class HoldingsService {
   }
 
   /**
-   * Reconstructs a client's portfolio as it existed on a specific date by replaying
-   * all BUY and SELL transactions up to (and including) that date.
+   * A client's holdings statement as it stood at the close of `asOfDate`.
    *
-   * Returns holdings with quantities as of that date, priced at each ticker's
-   * closing price on `asOfDate` (resolved via HistoricalPriceService, which
-   * walks back over non-trading days and backfills PriceBar from Yahoo). Only
-   * if a ticker has no history at all does it fall back to the transaction price.
-   *
-   * Only BUY/SELL transactions are replayed. Other transaction types (dividends,
-   * fees, splits) are tracked separately and don't affect quantity reconstruction.
+   * Delegates the replay to PortfolioReconstructionService rather than running
+   * one of its own. The replay this method used to carry read BUY/SELL rows
+   * only, so a split or bonus never changed its share count while the price it
+   * was multiplied by did; it also valued the statement against today's cash
+   * and today's portfolio total. The reconstruction is the one Performance
+   * already trusts: baseline, corporate actions, cash, and each price's session
+   * date and provenance.
    */
-  async getPortfolioAsOfDate(clientId: string, asOfDate: Date, actor: Actor) {
+  async getPortfolioAsOfDate(clientId: string, asOfDate: Date, actor: Actor): Promise<HoldingsAsOf> {
     // Validate the client exists AND belongs to the caller — a historical
     // reconstruction is as disclosive as a live one.
     const client = await this.prisma.client.findUnique({
       where: { id: clientId },
-      select: { id: true, ownerId: true },
+      select: { id: true, ownerId: true, name: true, market: true },
     });
     assertCanAccessClient(actor, client);
 
-    // Get all BUY and SELL transactions up to and including the specified date
-    const transactions = await this.prisma.transaction.findMany({
-      where: {
-        clientId,
-        date: { lte: asOfDate },
-        type: { in: ['BUY', 'SELL'] },
-      },
-      orderBy: { date: 'asc' },
-    });
+    const [portfolio, holdings] = await Promise.all([
+      this.reconstruction.reconstruct(clientId, asOfDate),
+      this.prisma.holding.findMany({ where: { clientId }, select: { ticker: true, company: true } }),
+    ]);
 
-    // Reconstruct positions by replaying transactions
-    const positions = new Map<
-      string,
+    return buildHoldingsAsOf(asOfDate, currencyForMarket((client!.market as Market) ?? DEFAULT_MARKET), [
       {
-        ticker: string;
-        quantity: number;
-        totalCostBasis: number;
-        lastPrice: number;
-        lastTransactionDate: Date;
-      }
-    >();
-
-    for (const tx of transactions) {
-      if (!tx.ticker) continue;
-
-      const pos = positions.get(tx.ticker) || {
-        ticker: tx.ticker,
-        quantity: 0,
-        totalCostBasis: 0,
-        lastPrice: tx.price || 0,
-        lastTransactionDate: tx.date,
-      };
-
-      if (tx.type === 'BUY') {
-        const quantity = tx.quantity || 0;
-        const amount = tx.amount || 0;
-        const price = amount > 0 ? amount / quantity : 0;
-
-        // Weighted average cost
-        const totalInvested = pos.totalCostBasis + amount;
-        const newQuantity = pos.quantity + quantity;
-        pos.totalCostBasis = totalInvested;
-        pos.quantity = newQuantity;
-        pos.lastPrice = price;
-      } else if (tx.type === 'SELL') {
-        const quantity = Math.min(tx.quantity || 0, pos.quantity);
-        pos.quantity -= quantity;
-        pos.lastPrice = tx.price || pos.lastPrice;
-      }
-
-      pos.lastTransactionDate = tx.date;
-      positions.set(tx.ticker, pos);
-    }
-
-    // Same epsilon as the live book: replaying fractional buys and sells that
-    // net to a full exit leaves float dust, not a clean zero, and a position
-    // sold out before the as-of date must not reappear in a back-dated export.
-    const openPositions = [...positions.values()].filter(
-      (p) => p.quantity > CLOSED_POSITION_EPSILON,
-    );
-
-    // Price every position at its close on `asOfDate` — not at the price of the
-    // transaction that happened to be last, which made Current Value identical
-    // to Cost Basis and reported P&L as a flat zero for every row.
-    // HistoricalPriceService walks back over weekends/holidays and backfills
-    // PriceBar from Yahoo on a miss, so a non-trading as-of date still prices.
-    const closes = await this.historicalPrice.closesOn(
-      openPositions.map((p) => p.ticker),
-      asOfDate,
-    );
-
-    // Get current holding details (company, sector, etc.) for each ticker
-    const holdings = await Promise.all(
-      openPositions
-        .map(async (pos) => {
-          const holding = await this.prisma.holding.findUnique({
-            where: { clientId_ticker: { clientId, ticker: pos.ticker } },
-          });
-
-          const averageCost = pos.quantity > 0 ? pos.totalCostBasis / pos.quantity : 0;
-          // No history at all for the ticker (delisted, bad symbol) leaves the
-          // transaction price as the only defensible fallback.
-          const currentPrice = closes.get(pos.ticker) ?? pos.lastPrice;
-
-          return {
-            id: holding?.id || `historical_${pos.ticker}`,
-            clientId,
-            ticker: pos.ticker,
-            company: holding?.company || pos.ticker,
-            sector: holding?.sector || 'Unclassified',
-            industry: holding?.industry || 'Unclassified',
-            country: holding?.country || 'Unknown',
-            exchange: holding?.exchange || 'Unknown',
-            theme: holding?.theme,
-            quantity: pos.quantity,
-            averageCost,
-            currentPrice,
-            marketValue: pos.quantity * currentPrice,
-            unrealizedPnL: pos.quantity * currentPrice - pos.totalCostBasis,
-            realizedPnL: holding?.realizedPnL || 0,
-            allocationPercent: 0,
-            dividend: 0,
-            weight: 0,
-            targetWeight: 0,
-            holdingDays: 0,
-            investmentThesis: holding?.investmentThesis,
-            notes: holding?.notes,
-            createdAt: new Date(),
-            updatedAt: new Date(),
-          };
-        })
-    );
-
-    return holdings;
+        clientId,
+        clientName: client!.name,
+        portfolio,
+        companies: new Map(holdings.map((h) => [h.ticker, h.company])),
+      },
+    ]);
   }
 
   /**

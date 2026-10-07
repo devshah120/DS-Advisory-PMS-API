@@ -24,6 +24,7 @@ import { UpdateLotDto } from './dto/update-lot.dto';
 import { SetSectorDto } from './dto/set-sector.dto';
 import { ClassificationService } from './classification.service';
 import { parseMarket } from '../common/market-scope';
+import { parseAsOfDate } from '../portfolio-reconstruction/holdings-as-of';
 import { Actor } from '../common/ownership-scope';
 
 type AuthedRequest = { user: Actor };
@@ -113,11 +114,7 @@ export class HoldingsController {
     @Param('date') dateStr: string,
     @Req() req: AuthedRequest,
   ) {
-    const asOfDate = new Date(dateStr);
-    if (Number.isNaN(asOfDate.getTime())) {
-      throw new BadRequestException('Invalid date format. Use ISO format (YYYY-MM-DD)');
-    }
-    return this.holdingsService.getPortfolioAsOfDate(clientId, asOfDate, req.user);
+    return this.holdingsService.getPortfolioAsOfDate(clientId, parseAsOfDate(dateStr), req.user);
   }
 
   /**

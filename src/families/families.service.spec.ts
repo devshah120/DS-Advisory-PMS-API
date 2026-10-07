@@ -3,6 +3,7 @@ import { BadRequestException } from '@nestjs/common';
 import { FamiliesService } from './families.service';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { MarketService } from '../market/market.service';
+import { PortfolioReconstructionService } from '../portfolio-reconstruction/portfolio-reconstruction.service';
 import { Actor } from '../common/ownership-scope';
 
 /**
@@ -43,7 +44,7 @@ describe('FamiliesService.aggregate', () => {
       }),
     } as unknown as MarketService;
 
-    return new FamiliesService(prisma, market);
+    return new FamiliesService(prisma, market, {} as PortfolioReconstructionService);
   }
 
   it('sums quantities and blends cost by size across the household', async () => {
@@ -168,7 +169,7 @@ describe('FamiliesService.aggregate', () => {
       },
     } as unknown as PrismaService;
 
-    const service = new FamiliesService(prisma, {} as MarketService);
+    const service = new FamiliesService(prisma, {} as MarketService, {} as PortfolioReconstructionService);
 
     // setMembers is private; reached through the update path it guards.
     // The Super Admin actor makes the ownership filter a no-op so this keeps
