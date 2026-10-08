@@ -269,18 +269,40 @@ export class PerformanceBaselineService {
     closingValue: number,
     method: AccountingMethod,
   ): Promise<CashFlow[]> {
-    const [ledger, baseline, firstTransaction] = await Promise.all([
+    const [ledger, isHouseBaseline] = await Promise.all([
       this.prisma.transaction.findMany({
         where: { clientId, date: { gt: from, lt: to } },
         orderBy: { date: 'asc' },
       }),
+      this.isHouseBaseline(clientId),
+    ]);
+    const interior = buildWindowFlows(ledger, method, from, to, undefined, isHouseBaseline);
+
+    return [
+      { date: from, amount: -openingValue },
+      ...interior,
+      { date: to, amount: closingValue },
+    ];
+  }
+
+  /**
+   * Is this client's baseline the shared house baseline — i.e. are their
+   * 1-July-2026 BUY rows import artifacts rather than real trades?
+   *
+   * Public so the per-symbol watchlist engine (ClientPortfolioWatchlistService)
+   * classifies the same rows the same way: a 1-July BUY counted as a flow on
+   * one screen and as part of the opening position on another reports two
+   * different returns for the same holding.
+   */
+  async isHouseBaseline(clientId: string): Promise<boolean> {
+    const [baseline, firstTransaction] = await Promise.all([
       this.prisma.portfolioBaseline.findUnique({
         where: { clientId },
         select: { baselineDate: true },
       }),
       /**
-       * The client's FIRST transaction ever — deliberately unbounded by the
-       * window, unlike `ledger` above.
+       * The client's FIRST transaction ever — deliberately unbounded by any
+       * window, unlike the window-scoped ledger read in `windowFlows`.
        *
        * The window tells us nothing about whether this client was in the bulk
        * import; only their earliest history does. Querying it separately is
@@ -301,17 +323,10 @@ export class PerformanceBaselineService {
     // with no baseline row and no earlier history falls back to the synthetic
     // house-dated one (PortfolioReconstructionService), so absence still counts
     // as "house baseline". See isBulkImportClient and isImportArtifact.
-    const isHouseBaseline = isBulkImportClient({
+    return isBulkImportClient({
       baselineDate: baseline?.baselineDate,
       firstTransactionDate: firstTransaction?.date ?? null,
     });
-    const interior = buildWindowFlows(ledger, method, from, to, undefined, isHouseBaseline);
-
-    return [
-      { date: from, amount: -openingValue },
-      ...interior,
-      { date: to, amount: closingValue },
-    ];
   }
 
 }

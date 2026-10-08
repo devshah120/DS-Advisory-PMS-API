@@ -11,6 +11,7 @@ import {
 } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { WatchlistService } from './watchlist.service';
+import { ClientPortfolioWatchlistService } from './client-portfolio-watchlist.service';
 import { CreateWatchlistDto, BulkAddWatchlistDto, RenameWatchlistFolderDto } from './dto/create-watchlist.dto';
 import { parseMarket } from '../common/market-scope';
 import { Actor } from '../common/ownership-scope';
@@ -20,7 +21,10 @@ type AuthedRequest = { user: Actor };
 @Controller('watchlist')
 @UseGuards(JwtAuthGuard)
 export class WatchlistController {
-  constructor(private watchlistService: WatchlistService) {}
+  constructor(
+    private watchlistService: WatchlistService,
+    private clientPortfolio: ClientPortfolioWatchlistService,
+  ) {}
 
   @Post()
   create(
@@ -76,6 +80,16 @@ export class WatchlistController {
   @Get('benchmarks')
   benchmarkReturns(@Query('market') market?: string) {
     return this.watchlistService.benchmarkReturns(parseMarket(market));
+  }
+
+  /**
+   * The watchlist generated from a client's book: every position they hold,
+   * with MTD/QTD/YTD for their own holding and the book's indices over the same
+   * windows. Declared above `:id` so the id routes cannot capture it.
+   */
+  @Get('client/:clientId')
+  clientPortfolioWatchlist(@Param('clientId') clientId: string, @Req() req: AuthedRequest) {
+    return this.clientPortfolio.forClient(clientId, req.user);
   }
 
   @Get(':id')

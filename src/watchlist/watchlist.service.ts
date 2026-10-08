@@ -315,8 +315,12 @@ function addDays(d: Date, n: number): Date {
  * (walks backward through holidays/weekends). Last close = the most recent
  * bar available. Returns nulls when there isn't enough history rather than
  * inventing a price.
+ *
+ * Exported for ClientPortfolioWatchlistService, which prices the benchmark rows
+ * over the client's own (fiscal, inception-clamped) windows rather than over the
+ * calendar ones above.
  */
-function computePeriodReturn(bars: DailyClose[], baseDate: string): PeriodReturn {
+export function computePeriodReturn(bars: DailyClose[], baseDate: string): PeriodReturn {
   if (bars.length === 0) {
     return { baseDate: null, baseClose: null, lastDate: null, lastClose: null, returnPct: null };
   }
