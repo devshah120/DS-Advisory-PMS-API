@@ -7,8 +7,8 @@ import { ResolvedPeriod, resolvePeriod } from '../portfolio-reconstruction/perio
 import { ReconstructedPortfolio, ReconstructedPosition } from '../portfolio-reconstruction/types';
 import { LedgerEntry, buildWindowFlows } from '../analytics/calculators/flows';
 import { CashFlow, xirr } from '../analytics/calculators/xirr';
-import { Market, parseMarket } from '../common/market-scope';
-import { Actor, assertCanAccessClient } from '../common/ownership-scope';
+import { Market, currencyForMarket, parseMarket } from '../common/market-scope';
+import { Actor, assertCanAccessClient, assertOwns } from '../common/ownership-scope';
 import { computePeriodReturn, trackedBenchmarks } from './watchlist.service';
 
 const MS_PER_DAY = 86_400_000;
@@ -62,9 +62,21 @@ export interface ClientWatchlistRow {
   /** `missing` means no close was found and cost stood in for the price. */
   priceStatus: string | null;
   marketValue: number;
+  /**
+   * The accounts holding this symbol today, largest first. One entry for a
+   * client; for a family, every member whose position was merged into the row.
+   */
+  holders: WatchlistHolder[];
   mtd: PositionWindowReturn;
   qtd: PositionWindowReturn;
   ytd: PositionWindowReturn;
+}
+
+export interface WatchlistHolder {
+  clientId: string;
+  clientName: string;
+  quantity: number;
+  marketValue: number;
 }
 
 export interface ClientWatchlistBenchmark {
@@ -77,8 +89,12 @@ export interface ClientWatchlistBenchmark {
 }
 
 export interface ClientPortfolioWatchlist {
-  clientId: string;
-  clientName: string;
+  /** A single mandate, or a household measured as one account. */
+  kind: 'client' | 'family';
+  id: string;
+  name: string;
+  /** The household's accounts; empty for a client. */
+  members: Array<{ id: string; name: string }>;
   market: Market;
   currency: string;
   asOf: string;
@@ -140,35 +156,43 @@ export function positionWindowReturn(input: {
   to: Date;
   openingValue: number;
   closingValue: number;
-  /** Every ledger row for this symbol that might fall in the window. */
-  rows: LedgerEntry[];
+  /**
+   * Every ledger row for this symbol that might fall in the window, one entry
+   * per account holding it: a single client passes one, a family one per
+   * member. The rows cannot be pooled first, because whether a 1-July BUY is
+   * an import artifact is decided per account (see `isHouseBaseline`).
+   */
+  ledgers: ReadonlyArray<{ rows: LedgerEntry[]; isHouseBaseline: boolean }>;
   /** Rows before this are inside the opening value; null = all of them are. */
   openedThrough: Date | null;
   /** Rows before this are inside the closing value; null = all of them are. */
   closedThrough: Date | null;
-  isHouseBaseline: boolean;
 }): PositionWindowReturn {
   const { from, to, openingValue, closingValue, openedThrough, closedThrough } = input;
 
-  const interiorRows =
+  const interior =
     openedThrough === null
       ? []
-      : input.rows
-          .filter((r) => r.date >= openedThrough && (closedThrough === null || r.date < closedThrough))
-          // A row the live book already holds but dated after today is priced
-          // into the closing value, so its cash belongs on the closing date.
-          .map((r) => (r.date > to ? { ...r, date: to } : r));
-
-  // Bounds are already applied above; these only keep buildWindowFlows' own
-  // strict filter from re-trimming the rows that sit on the closing date.
-  const interior = buildWindowFlows(
-    interiorRows,
-    'TRANSACTIONAL',
-    new Date(from.getTime() - 1),
-    new Date(to.getTime() + 1),
-    undefined,
-    input.isHouseBaseline,
-  );
+      : input.ledgers
+          .flatMap((ledger) => {
+            const rows = ledger.rows
+              .filter((r) => r.date >= openedThrough && (closedThrough === null || r.date < closedThrough))
+              // A row the live book already holds but dated after today is priced
+              // into the closing value, so its cash belongs on the closing date.
+              .map((r) => (r.date > to ? { ...r, date: to } : r));
+            // Bounds are already applied above; these only keep buildWindowFlows' own
+            // strict filter from re-trimming the rows that sit on the closing date.
+            return buildWindowFlows(
+              rows,
+              'TRANSACTIONAL',
+              new Date(from.getTime() - 1),
+              new Date(to.getTime() + 1),
+              undefined,
+              ledger.isHouseBaseline,
+            );
+          })
+          // Each account's flows arrive in date order, but not the merged list.
+          .sort((a, b) => a.date.getTime() - b.date.getTime());
 
   const flows: CashFlow[] = [
     ...(openingValue > 0 ? [{ date: from, amount: -openingValue }] : []),
@@ -212,15 +236,41 @@ export function positionWindowReturn(input: {
   return { ...base, returnPct: ((1 + solved.rate) ** years - 1) * 100 };
 }
 
+interface BookMember {
+  id: string;
+  name: string;
+  inceptionDate: Date;
+}
+
+/** One account's side of the book, read once and shared by every position. */
+interface AccountBook {
+  member: BookMember;
+  closing: ReconstructedPosition[];
+  /** Opening market value by ticker, per window-open instant; null = could not be valued. */
+  openings: Map<number, Map<string, number> | null>;
+  rowsByTicker: Map<string, LedgerEntry[]>;
+  isHouseBaseline: boolean;
+  companies: Map<string, string | null>;
+}
+
+type BookFigures = Pick<ClientPortfolioWatchlist, 'asOf' | 'windows' | 'rows' | 'benchmarks'>;
+
 /**
- * The watchlist, populated from a client's book instead of typed in: every
- * position they hold today, with MTD / QTD / YTD for THEIR holding of it, and
- * the book's benchmark indices measured over the same windows.
+ * The watchlist, populated from a book instead of typed in: every position
+ * held today, with MTD / QTD / YTD for THAT holding of it, and the book's
+ * benchmark indices measured over the same windows.
  *
- * The book is valued once per distinct window edge, through the same
- * snapshot-or-reconstruct path the Performance sheet uses, and each position is
- * read off those valuations. Valuing per symbol would replay the full ledger
- * N × 4 times for an N-position book.
+ * The book is either one client or a family. A family is measured as one
+ * account, the rule FamilyPerformanceService follows: each symbol's members
+ * are merged and ONE money-weighted return is solved over their combined
+ * opening value, flows and closing value. It is never an average of the
+ * members' per-symbol returns, which would weight a 5-share lot the same as a
+ * 500-share one.
+ *
+ * Each account is valued once per distinct window edge, through the same
+ * snapshot-or-reconstruct path the Performance sheet uses, and each position
+ * is read off those valuations. Valuing per symbol would replay the full
+ * ledger N × 4 times for an N-position book.
  */
 @Injectable()
 export class ClientPortfolioWatchlistService {
@@ -240,12 +290,63 @@ export class ClientPortfolioWatchlistService {
     const client = found!;
 
     const market = parseMarket(client.market);
+    const figures = await this.measureBook([client], market, client.inceptionDate);
+    return {
+      kind: 'client',
+      id: clientId,
+      name: client.name,
+      members: [],
+      market,
+      currency: client.currency,
+      ...figures,
+    };
+  }
+
+  /**
+   * The same watchlist for a household. Its calendar comes from the family's
+   * book, clamped to the earliest member's inception, as on the family's
+   * Performance sheet, so the two screens measure the same windows.
+   */
+  async forFamily(familyId: string, actor: Actor): Promise<ClientPortfolioWatchlist> {
+    const family = await this.prisma.family.findUnique({
+      where: { id: familyId },
+      select: {
+        id: true,
+        ownerId: true,
+        name: true,
+        market: true,
+        clients: { select: { id: true, name: true, inceptionDate: true }, orderBy: { name: 'asc' } },
+      },
+    });
+    // 404 for absent and for someone else's alike: the rows disclose every
+    // member's positions.
+    assertOwns(actor, family, 'Family');
+    const household = family!;
+
+    const market = parseMarket(household.market);
+    const inception = household.clients.length
+      ? new Date(Math.min(...household.clients.map((c) => c.inceptionDate.getTime())))
+      : undefined;
+    const figures = await this.measureBook(household.clients, market, inception);
+    return {
+      kind: 'family',
+      id: household.id,
+      name: household.name,
+      members: household.clients.map((c) => ({ id: c.id, name: c.name })),
+      market,
+      currency: currencyForMarket(market),
+      ...figures,
+    };
+  }
+
+  private async measureBook(
+    members: BookMember[],
+    market: Market,
+    inception: Date | undefined,
+  ): Promise<BookFigures> {
     const now = new Date();
     const resolved = Object.fromEntries(
-      WINDOWS.map(([key, code]) => [
-        key,
-        resolvePeriod(code, { asOf: now, market, clientInception: client.inceptionDate }),
-      ]),
+      WINDOWS.map(([key, code]) => [key, resolvePeriod(code, { asOf: now, market, clientInception: inception })]),
     ) as Record<WatchlistWindow, ResolvedPeriod>;
 
     // Every window here is live, so they share one closing date (today).
@@ -255,88 +356,96 @@ export class ClientPortfolioWatchlistService {
     );
     const earliestFrom = new Date(Math.min(...openDates.map((d) => d.getTime())));
 
-    const [closing, openings, ledger, isHouseBaseline, holdings, benchmarks] = await Promise.all([
-      this.history.getPortfolioAsOf(clientId, to),
-      Promise.all(
-        openDates.map((d) =>
-          // A window whose opening valuation cannot be produced (a date before
-          // this client's baseline, say) is reported as unavailable rather than
-          // taking the other two windows down with it.
-          this.history.getPortfolioAsOf(clientId, d).catch((): ReconstructedPortfolio | null => null),
-        ),
-      ),
-      this.prisma.transaction.findMany({
-        where: { clientId, date: { gte: earliestFrom } },
-        select: { ticker: true, type: true, amount: true, date: true },
-        orderBy: { date: 'asc' },
-      }),
-      this.performanceBaseline.isHouseBaseline(clientId),
-      this.prisma.holding.findMany({ where: { clientId }, select: { ticker: true, company: true } }),
+    const [accounts, benchmarks] = await Promise.all([
+      Promise.all(members.map((m) => this.readAccount(m, to, openDates, earliestFrom))),
       this.benchmarkRows(market, resolved, earliestFrom),
     ]);
 
-    const openingByDate = new Map<number, Map<string, ReconstructedPosition> | null>(
-      openDates.map((d, i) => [
-        d.getTime(),
-        openings[i] ? new Map(openings[i]!.positions.map((p) => [p.ticker, p])) : null,
-      ]),
-    );
-
-    const rowsByTicker = new Map<string, LedgerEntry[]>();
-    for (const t of ledger) {
-      if (!t.ticker) continue; // ticker-less rows (fees, cash) belong to the book, not a position
-      const list = rowsByTicker.get(t.ticker) ?? [];
-      list.push(t);
-      rowsByTicker.set(t.ticker, list);
+    // Merge every account's live positions by symbol. For a client this is a
+    // pass-through; for a family it is where a symbol held in three accounts
+    // becomes one row.
+    const merged = new Map<string, { position: ReconstructedPosition; holders: WatchlistHolder[] }>();
+    for (const account of accounts) {
+      for (const p of account.closing) {
+        if (p.quantity <= 0) continue;
+        const holder: WatchlistHolder = {
+          clientId: account.member.id,
+          clientName: account.member.name,
+          quantity: p.quantity,
+          marketValue: p.marketValue,
+        };
+        const entry = merged.get(p.ticker);
+        if (!entry) {
+          merged.set(p.ticker, { position: p, holders: [holder] });
+          continue;
+        }
+        entry.holders.push(holder);
+        // Same symbol, same close; prefer an account that found one over one
+        // that fell back to cost.
+        if (entry.position.priceStatus === 'missing' && p.priceStatus !== 'missing') entry.position = p;
+      }
     }
 
-    const companies = new Map(holdings.map((h) => [h.ticker, h.company]));
     const closedThrough = valuationCutoff(to, now);
 
-    const rows = closing.positions
-      .filter((p) => p.quantity > 0)
-      .sort((a, b) => b.marketValue - a.marketValue)
-      .map((p): ClientWatchlistRow => {
+    const rows = [...merged.entries()]
+      .map(([ticker, { position: p, holders }]): ClientWatchlistRow => {
+        const quantity = holders.reduce((sum, h) => sum + h.quantity, 0);
+        const marketValue = holders.reduce((sum, h) => sum + h.marketValue, 0);
+
         const measure = (key: WatchlistWindow): PositionWindowReturn => {
           const { from } = resolved[key];
-          const opening = openingByDate.get(from.getTime());
-          if (!opening) {
-            return {
-              returnPct: null,
-              openingValue: 0,
-              closingValue: p.marketValue,
-              netFlows: 0,
-              measuredFrom: iso(from),
-              reason: `The book could not be valued on ${iso(from)}, so this window has no opening value.`,
-            };
+          let openingValue = 0;
+          const ledgers: Array<{ rows: LedgerEntry[]; isHouseBaseline: boolean }> = [];
+          for (const account of accounts) {
+            const rows = account.rowsByTicker.get(ticker) ?? [];
+            const opening = account.openings.get(from.getTime());
+            if (!opening) {
+              // Only an account that touches this symbol can spoil its window.
+              if (rows.length === 0 && !holders.some((h) => h.clientId === account.member.id)) continue;
+              return {
+                returnPct: null,
+                openingValue: 0,
+                closingValue: marketValue,
+                netFlows: 0,
+                measuredFrom: iso(from),
+                reason:
+                  accounts.length > 1
+                    ? `${account.member.name}'s account could not be valued on ${iso(from)}, so this window has no opening value.`
+                    : `The book could not be valued on ${iso(from)}, so this window has no opening value.`,
+              };
+            }
+            openingValue += opening.get(ticker) ?? 0;
+            ledgers.push({ rows, isHouseBaseline: account.isHouseBaseline });
           }
           return positionWindowReturn({
             from,
             to,
-            openingValue: opening.get(p.ticker)?.marketValue ?? 0,
-            closingValue: p.marketValue,
-            rows: rowsByTicker.get(p.ticker) ?? [],
+            openingValue,
+            closingValue: marketValue,
+            ledgers,
             openedThrough: valuationCutoff(from, now),
             closedThrough,
-            isHouseBaseline,
           });
         };
 
         return {
-          symbol: p.ticker,
-          company: companies.get(p.ticker) ?? null,
+          symbol: ticker,
+          company: accounts.map((a) => a.companies.get(ticker)).find((c) => c) ?? null,
           sector: p.sector,
           industry: p.industry,
-          quantity: p.quantity,
+          quantity,
           price: p.closingPrice,
           priceDate: p.priceDate ?? null,
           priceStatus: p.priceStatus ?? null,
-          marketValue: p.marketValue,
+          marketValue,
+          holders: holders.sort((a, b) => b.marketValue - a.marketValue),
           mtd: measure('mtd'),
           qtd: measure('qtd'),
           ytd: measure('ytd'),
         };
-      });
+      })
+      .sort((a, b) => b.marketValue - a.marketValue);
 
     const windows = Object.fromEntries(
       WINDOWS.map(([key]) => {
@@ -354,15 +463,56 @@ export class ClientPortfolioWatchlistService {
       }),
     ) as Record<WatchlistWindow, WatchlistWindowMeta>;
 
+    return { asOf: iso(to), windows, rows, benchmarks };
+  }
+
+  /** Everything one account contributes: its valuations at each edge, its ledger, its names. */
+  private async readAccount(
+    member: BookMember,
+    to: Date,
+    openDates: Date[],
+    earliestFrom: Date,
+  ): Promise<AccountBook> {
+    const [closing, openings, ledger, isHouseBaseline, holdings] = await Promise.all([
+      this.history.getPortfolioAsOf(member.id, to),
+      Promise.all(
+        openDates.map((d) =>
+          this.history
+            .getPortfolioAsOf(member.id, d)
+            .then((book): Map<string, number> | null => new Map(book.positions.map((p) => [p.ticker, p.marketValue])))
+            // A window whose opening valuation cannot be produced (a date before
+            // this client's baseline, say) is reported as unavailable rather
+            // than taking the other windows down with it. The exception is a
+            // family member whose own mandate starts after the household's
+            // window opens: they held nothing then, and their purchases enter
+            // as flows.
+            .catch((): Map<string, number> | null => (member.inceptionDate > d ? new Map() : null)),
+        ),
+      ),
+      this.prisma.transaction.findMany({
+        where: { clientId: member.id, date: { gte: earliestFrom } },
+        select: { ticker: true, type: true, amount: true, date: true },
+        orderBy: { date: 'asc' },
+      }),
+      this.performanceBaseline.isHouseBaseline(member.id),
+      this.prisma.holding.findMany({ where: { clientId: member.id }, select: { ticker: true, company: true } }),
+    ]);
+
+    const rowsByTicker = new Map<string, LedgerEntry[]>();
+    for (const t of ledger) {
+      if (!t.ticker) continue; // ticker-less rows (fees, cash) belong to the book, not a position
+      const list = rowsByTicker.get(t.ticker) ?? [];
+      list.push(t);
+      rowsByTicker.set(t.ticker, list);
+    }
+
     return {
-      clientId,
-      clientName: client.name,
-      market,
-      currency: client.currency,
-      asOf: iso(to),
-      windows,
-      rows,
-      benchmarks,
+      member,
+      closing: closing.positions,
+      openings: new Map(openDates.map((d, i) => [d.getTime(), openings[i]])),
+      rowsByTicker,
+      isHouseBaseline,
+      companies: new Map(holdings.map((h) => [h.ticker, h.company])),
     };
   }
 

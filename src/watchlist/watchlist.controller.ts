@@ -92,6 +92,15 @@ export class WatchlistController {
     return this.clientPortfolio.forClient(clientId, req.user);
   }
 
+  /**
+   * The same watchlist for a household: each symbol merged across the
+   * members' accounts and measured as one holding.
+   */
+  @Get('family/:familyId')
+  familyPortfolioWatchlist(@Param('familyId') familyId: string, @Req() req: AuthedRequest) {
+    return this.clientPortfolio.forFamily(familyId, req.user);
+  }
+
   @Get(':id')
   findOne(@Param('id') id: string, @Req() req: AuthedRequest) {
     return this.watchlistService.findOne(id, req.user);
