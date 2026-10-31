@@ -445,41 +445,21 @@ describe('buildWindowFlows — period windows respect the accounting method', ()
 
 
 describe('isBulkImportClient — whose 1-July BUYs are import artifacts', () => {
-  it('is true for a client with no baseline and no history before the house date', () => {
-    expect(
-      isBulkImportClient({ firstTransactionDate: new Date('2026-07-01T00:00:00.000Z') }),
-    ).toBe(true);
+  it('is false for a client with no stored baseline', () => {
+    // Shashwat Mehta: ten real BUYs on 1-July and no baseline row. He replays
+    // onto an empty baseline, so those rows duplicate nothing; treating them as
+    // artifacts reconstructed his book as empty. Abhishek Oberoi (trades from
+    // Dec-2025, no row) and an account with no ledger at all are the same case.
+    expect(isBulkImportClient({})).toBe(false);
+    expect(isBulkImportClient({ baselineDate: null })).toBe(false);
   });
 
-  it('is true for a client with no ledger at all', () => {
-    expect(isBulkImportClient({ firstTransactionDate: null })).toBe(true);
-  });
-
-  it('is false for a client whose ledger predates the house date', () => {
-    // Abhishek Oberoi: real trades from 16-Dec-2025. His history was recorded,
-    // not imported, so a 1-July BUY of his is a real trade.
-    expect(
-      isBulkImportClient({ firstTransactionDate: new Date('2025-12-16T00:00:00.000Z') }),
-    ).toBe(false);
-  });
-
-  it('is true when a stored house-dated baseline exists, whatever the ledger predates', () => {
+  it('is true for a stored house-dated baseline, whatever the ledger predates', () => {
     // A house-dated baseline was seeded with the 1-July BUYs' shares inside it
-    // (autoSeed skips them on rollback) and the replay drops them on the same
-    // test. Saumya Patel: one IST-midnight row at 29-Jun 18:30Z must not turn
-    // ~$25.6k of import rows into fresh capital.
-    expect(
-      isBulkImportClient({
-        baselineDate: INCEPTION_DATE,
-        firstTransactionDate: new Date('2026-06-29T18:30:00.000Z'),
-      }),
-    ).toBe(true);
-    expect(
-      isBulkImportClient({
-        baselineDate: INCEPTION_DATE,
-        firstTransactionDate: new Date('2025-12-16T00:00:00.000Z'),
-      }),
-    ).toBe(true);
+    // (autoSeed skips them on rollback), and the replay drops them on the same
+    // test. Saumya Patel's one IST-midnight row at 29-Jun 18:30Z once flipped
+    // this and turned ~$25.6k of import rows into fresh capital.
+    expect(isBulkImportClient({ baselineDate: INCEPTION_DATE })).toBe(true);
   });
 
   it('is false for a client with their own non-house baseline', () => {

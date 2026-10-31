@@ -90,26 +90,18 @@ function serialize<T extends { riskProfile: string; status: string; accountingMe
  * Shared by `deriveMetrics` and the list's 30-June close fetch, so the closes
  * fetched are exactly the tickers the rebase will price.
  *
- * The earliest transaction and the stored baseline's date are loaded with the
- * client, so `isBulkImportClient` costs no extra query. The baseline date must
- * be passed: without it the list judged a house-baseline client by its ledger
- * alone and disagreed with the Performance page about the same 1-July rows.
+ * The stored baseline's date is loaded with the client, so
+ * `isBulkImportClient` costs no extra query. It must be passed: judged by its
+ * ledger alone, a house-baseline client disagreed with the Performance page
+ * about the same 1-July rows.
  */
 function rebaseInputs(client: {
   holdings: Array<{ ticker: string; quantity: number }>;
-  transactions: Array<{ date: Date }>;
   baseline?: { baselineDate: Date } | null;
 }) {
-  const firstTransactionDate = client.transactions.reduce<Date | null>(
-    (earliest, t) => (earliest === null || t.date < earliest ? t.date : earliest),
-    null,
-  );
   return {
     currentQuantity: new Map(client.holdings.map((h) => [h.ticker, h.quantity])),
-    bulkImport: isBulkImportClient({
-      baselineDate: client.baseline?.baselineDate,
-      firstTransactionDate,
-    }),
+    bulkImport: isBulkImportClient({ baselineDate: client.baseline?.baselineDate }),
   };
 }
 

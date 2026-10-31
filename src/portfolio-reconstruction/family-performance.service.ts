@@ -3,7 +3,7 @@ import { PrismaService } from '../common/prisma/prisma.service';
 import { PortfolioHistoryService } from './portfolio-history.service';
 import { BenchmarkHistoryService, BenchmarkWindowResult } from './benchmark-history.service';
 import { CashFlow, xirr } from '../analytics/calculators/xirr';
-import { AccountingMethod, buildWindowFlows, isHouseBaselineDate } from '../analytics/calculators/flows';
+import { AccountingMethod, buildWindowFlows, isBulkImportClient } from '../analytics/calculators/flows';
 import { ResolvedPeriod } from './periods';
 import { Market, currencyForMarket } from '../common/market-scope';
 import { Actor, assertOwns } from '../common/ownership-scope';
@@ -374,11 +374,12 @@ export class FamilyPerformanceService {
       }),
     ]);
 
-    // The import-artifact filter only applies when this member's baseline IS
-    // the shared house baseline (absence falls back to the synthetic
-    // house-dated one). See isImportArtifact's doc comment and the matching
-    // gate in PortfolioReconstructionService.reconstruct.
-    const isHouseBaseline = !baseline || isHouseBaselineDate(baseline.baselineDate);
+    // The import-artifact filter only applies when this member has a STORED
+    // baseline on the house date — the same gate the reconstruction that built
+    // this member's opening value uses. A member with no row replays onto an
+    // empty baseline, so none of their rows duplicate anything. See
+    // isBulkImportClient.
+    const isHouseBaseline = isBulkImportClient({ baselineDate: baseline?.baselineDate });
 
     return buildWindowFlows(rows, method, from, to, undefined, isHouseBaseline);
   }

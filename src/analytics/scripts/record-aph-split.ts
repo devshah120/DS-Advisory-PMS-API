@@ -84,15 +84,7 @@ async function planFor(client: { id: string; name: string }): Promise<Plan | nul
     throw new Error(`${client.name} already has an ${SYMBOL} SPLIT row — refusing to write a second.`);
   }
 
-  const first = await prisma.transaction.findFirst({
-    where: { clientId: client.id },
-    orderBy: { date: 'asc' },
-    select: { date: true },
-  });
-  const bulk = isBulkImportClient({
-    baselineDate: baseline?.baselineDate,
-    firstTransactionDate: first?.date ?? null,
-  });
+  const bulk = isBulkImportClient({ baselineDate: baseline?.baselineDate });
 
   const importRows = ledger.filter((t) => isImportArtifact(t, bulk));
   // A row inside the import window that was CREATED after the ex-date is a

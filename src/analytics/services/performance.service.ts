@@ -161,19 +161,15 @@ export class PerformanceService {
      * synthetic 30-June basis; rows since then remain real events. A position
      * without a 30-June close falls back to its pre-baseline average cost.
      *
-     * `ledger` is ordered ascending, so its first row IS the earliest
-     * transaction. The stored baseline's date goes in too: when one exists it
-     * is what decides, exactly as it does for the reconstruction (see
+     * Whether the 1-July rows are import artifacts is decided by the stored
+     * baseline, exactly as it is for the reconstruction (see
      * isBulkImportClient).
      */
     const baseline = await this.prisma.portfolioBaseline.findUnique({
       where: { clientId },
       select: { baselineDate: true },
     });
-    const bulkImport = isBulkImportClient({
-      baselineDate: baseline?.baselineDate,
-      firstTransactionDate: ledger[0]?.date ?? null,
-    });
+    const bulkImport = isBulkImportClient({ baselineDate: baseline?.baselineDate });
 
     const ledgerForFlows =
       method === 'TRANSACTIONAL'

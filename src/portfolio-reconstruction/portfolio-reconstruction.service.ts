@@ -3,7 +3,7 @@ import { PrismaService } from '../common/prisma/prisma.service';
 import { BaselineService } from '../legacy-baseline/baseline.service';
 import { HistoricalPriceService } from '../historical-price/historical-price.service';
 import { allocationBy } from '../analytics/calculators/weights';
-import { JUN30_REBASE_DATE, isImportArtifact, isHouseBaselineDate } from '../analytics/calculators/flows';
+import { JUN30_REBASE_DATE, isBulkImportClient, isImportArtifact } from '../analytics/calculators/flows';
 import { Classification, PortfolioSnapshot, Position } from '../analytics/calculators/types';
 import { ReconstructedPortfolio, ReconstructedPosition } from './types';
 
@@ -208,10 +208,16 @@ export class PortfolioReconstructionService {
      * would have every one of those genuine BUYs misclassified as import
      * artifacts and silently dropped — exactly what left a fully-invested
      * client's reconstructed book empty.
+     *
+     * The gate reads the STORED baseline, never the synthetic one. A synthetic
+     * baseline is empty, so it can hold none of the shares an artifact
+     * supposedly duplicates — yet for an account whose first trade is on or
+     * after the house date it lands ON the house date, and testing its date
+     * dropped every 1-July BUY with nothing standing in for it (Shashwat
+     * Mehta: ten real 1-July trades, an empty book). See isBulkImportClient.
      */
-    const replayable = ledger.filter(
-      (t) => !isImportArtifact(t, isHouseBaselineDate(baselineRow.baselineDate)),
-    );
+    const bulkImport = isBulkImportClient({ baselineDate: stored?.baselineDate });
+    const replayable = ledger.filter((t) => !isImportArtifact(t, bulkImport));
 
     for (const t of replayable) {
       realizedGain += this.applyTransaction(positions, t, (delta) => (cash += delta));

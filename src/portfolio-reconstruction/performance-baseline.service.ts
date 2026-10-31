@@ -295,38 +295,15 @@ export class PerformanceBaselineService {
    * different returns for the same holding.
    */
   async isHouseBaseline(clientId: string): Promise<boolean> {
-    const [baseline, firstTransaction] = await Promise.all([
-      this.prisma.portfolioBaseline.findUnique({
-        where: { clientId },
-        select: { baselineDate: true },
-      }),
-      /**
-       * The client's FIRST transaction ever — deliberately unbounded by any
-       * window, unlike the window-scoped ledger read in `windowFlows`.
-       *
-       * The window tells us nothing about whether this client was in the bulk
-       * import; only their earliest history does. Querying it separately is
-       * what lets a Q3-FY26 window on a December-2025 mandate know that the
-       * house rebase does not apply to it, even though no row inside that
-       * window would reveal it.
-       */
-      this.prisma.transaction.findFirst({
-        where: { clientId },
-        orderBy: { date: 'asc' },
-        select: { date: true },
-      }),
-    ]);
-
-    // The import-artifact filter only applies when this client's baseline IS
-    // the shared house baseline. A stored baseline row decides that on its own
-    // date — the reconstruction that built `openingValue` asked the same
-    // question of the same row. With no row, a ledger reaching back before the
-    // house date means the synthetic baseline is NOT the house one
-    // (PortfolioReconstructionService). See isBulkImportClient.
-    return isBulkImportClient({
-      baselineDate: baseline?.baselineDate,
-      firstTransactionDate: firstTransaction?.date ?? null,
+    const baseline = await this.prisma.portfolioBaseline.findUnique({
+      where: { clientId },
+      select: { baselineDate: true },
     });
+
+    // The import-artifact filter only applies when this client has a STORED
+    // baseline on the house date — the same question the reconstruction that
+    // built `openingValue` asked of the same row. See isBulkImportClient.
+    return isBulkImportClient({ baselineDate: baseline?.baselineDate });
   }
 
 }

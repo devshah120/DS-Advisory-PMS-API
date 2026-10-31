@@ -84,7 +84,7 @@ export class ReviewPackAnalysisService {
     // Reuses the same window-flow construction the client's own Performance
     // page is measured on, so the return quoted here is the return that page
     // shows — never a re-derivation. See analytics/calculators/flows.ts.
-    const { buildWindowFlows, isHouseBaselineDate } = await import('../analytics/calculators/flows');
+    const { buildWindowFlows, isBulkImportClient } = await import('../analytics/calculators/flows');
     const { xirr } = await import('../analytics/calculators/xirr');
     const [txns, clientRow, baseline] = await Promise.all([
       this.prisma.transaction.findMany({
@@ -104,10 +104,10 @@ export class ReviewPackAnalysisService {
     // transactionally regardless of what is stored, matching
     // PerformanceService / PerformanceBaselineService / FamilyPerformanceService.
     //
-    // The import-artifact filter only applies when this client's baseline IS
-    // the shared house baseline (absence falls back to the synthetic
-    // house-dated one). See isImportArtifact's doc comment.
-    const isHouseBaseline = !baseline || isHouseBaselineDate(baseline.baselineDate);
+    // The import-artifact filter only applies when this client has a STORED
+    // baseline on the house date — the same gate the reconstruction uses. See
+    // isBulkImportClient.
+    const isHouseBaseline = isBulkImportClient({ baselineDate: baseline?.baselineDate });
     const interior = buildWindowFlows(
       txns,
       'TRANSACTIONAL',

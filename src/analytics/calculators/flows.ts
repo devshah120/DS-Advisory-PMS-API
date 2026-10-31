@@ -144,45 +144,35 @@ export function isHouseBaselineDate(baselineDate: Date): boolean {
  * clothing. For anyone else a 1-July BUY is a real trade made after the
  * baseline, and it stays in the flow series.
  *
- * The answer is whatever PortfolioReconstructionService assumes when it
- * replays the book, because that replay is what the opening value is built
- * from:
+ * One question decides it: is there a STORED `PortfolioBaseline` on the house
+ * date? An import artifact is a row whose shares a baseline already holds, so
+ * without a stored baseline there is nothing for a row to duplicate.
  *
- *   • A client with a STORED `PortfolioBaseline` is bulk-import exactly when
- *     that baseline sits on the house date. Its ledger history is irrelevant:
+ *   • Stored, on the house date: yes, whatever the ledger predates.
  *     `BaselineService.autoSeed` at the house date skips the 1-July BUYs when it
- *     rolls the book back, so their shares are already inside the baseline,
- *     and the replay drops the rows on that same test (`isHouseBaselineDate`).
- *   • A client with NO stored baseline is bulk-import when their ledger does
- *     not predate the house date — the same rule that dates the synthetic
- *     baseline (PortfolioReconstructionService.syntheticBaselineDate).
- *
- * Letting an early ledger row overrule a stored house baseline is the bug this
- * order fixes. Saumya Patel's book holds one AMRX BUY stamped 29-Jun 18:30Z
- * (IST midnight on 30-June); that single row flipped her to "not bulk-import",
- * so the period engine counted ~$25.6k of 1-July import BUYs as fresh capital
- * on top of an opening value that already contained them, and reported -46.9%
- * on a book that was down about 7%.
+ *     rolls the book back, so their shares are inside the baseline already.
+ *     Letting an early ledger row overrule this flipped Saumya Patel (one AMRX
+ *     BUY stamped 29-Jun 18:30Z, IST midnight on 30-June) to "not bulk-import",
+ *     and the period engine counted ~$25.6k of 1-July import BUYs as fresh
+ *     capital on top of an opening value that already contained them: -46.9%
+ *     on a book down about 7%.
+ *   • Stored on the client's own date, or not stored at all: no. A client with
+ *     no row replays onto an EMPTY synthetic baseline, so treating its 1-July
+ *     BUYs as already-held drops real trades with nothing standing in for
+ *     them. Shashwat Mehta (ten genuine BUYs on 1-July, no baseline row)
+ *     reconstructed to an empty book and reported "Not available".
  *
  * Centralised because every call site needs the same answer and MUST agree —
- * the Performance page, the Clients-list `deriveMetrics`, the period engine and
- * the reconstruction itself. A 1-July BUY counted as a flow on one page and as
- * part of the opening position on another reports two different returns for
- * the same book.
+ * the reconstruction, the period engine, the household and review-pack
+ * engines, PerformanceService and the Clients-list `deriveMetrics`. A 1-July
+ * BUY counted as a flow on one page and as part of the opening position on
+ * another reports two different returns for the same book.
  */
 export function isBulkImportClient(input: {
   /** The client's stored `PortfolioBaseline.baselineDate`, if they have one. */
   baselineDate?: Date | null;
-  /** The client's earliest transaction date, if they have any ledger at all. */
-  firstTransactionDate?: Date | null;
 }): boolean {
-  if (input.baselineDate) return isHouseBaselineDate(input.baselineDate);
-  return !(input.firstTransactionDate && utcDayOf(input.firstTransactionDate) < INCEPTION_DATE);
-}
-
-/** Midnight-UTC truncation, so a same-day comparison is not decided by a timestamp. */
-function utcDayOf(d: Date): Date {
-  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+  return input.baselineDate ? isHouseBaselineDate(input.baselineDate) : false;
 }
 
 /** The first instant after the baseline: midnight UTC on 1-July-2026. */
