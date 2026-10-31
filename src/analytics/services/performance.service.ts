@@ -162,9 +162,16 @@ export class PerformanceService {
      * without a 30-June close falls back to its pre-baseline average cost.
      *
      * `ledger` is ordered ascending, so its first row IS the earliest
-     * transaction and `isBulkImportClient` costs no extra query.
+     * transaction. The stored baseline's date goes in too: when one exists it
+     * is what decides, exactly as it does for the reconstruction (see
+     * isBulkImportClient).
      */
+    const baseline = await this.prisma.portfolioBaseline.findUnique({
+      where: { clientId },
+      select: { baselineDate: true },
+    });
     const bulkImport = isBulkImportClient({
+      baselineDate: baseline?.baselineDate,
       firstTransactionDate: ledger[0]?.date ?? null,
     });
 

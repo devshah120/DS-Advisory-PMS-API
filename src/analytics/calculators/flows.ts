@@ -144,20 +144,31 @@ export function isHouseBaselineDate(baselineDate: Date): boolean {
  * clothing. For anyone else a 1-July BUY is a real trade made after the
  * baseline, and it stays in the flow series.
  *
- * A client is bulk-import when the house baseline is actually theirs:
+ * The answer is whatever PortfolioReconstructionService assumes when it
+ * replays the book, because that replay is what the opening value is built
+ * from:
  *
- *   • They have a stored `PortfolioBaseline` dated on the house date, or
- *   • They have no stored baseline AND no ledger history predating the house
- *     date, so the synthetic house-dated baseline stands in for them
- *     (PortfolioReconstructionService.syntheticBaselineDate).
+ *   • A client with a STORED `PortfolioBaseline` is bulk-import exactly when
+ *     that baseline sits on the house date. Its ledger history is irrelevant:
+ *     `BaselineService.autoSeed` at the house date skips the 1-July BUYs when it
+ *     rolls the book back, so their shares are already inside the baseline,
+ *     and the replay drops the rows on that same test (`isHouseBaselineDate`).
+ *   • A client with NO stored baseline is bulk-import when their ledger does
+ *     not predate the house date — the same rule that dates the synthetic
+ *     baseline (PortfolioReconstructionService.syntheticBaselineDate).
  *
- * A client with a stored baseline on their OWN date, or with real transactions
- * before 30-June-2026, is neither: their history was recorded, not imported.
+ * Letting an early ledger row overrule a stored house baseline is the bug this
+ * order fixes. Saumya Patel's book holds one AMRX BUY stamped 29-Jun 18:30Z
+ * (IST midnight on 30-June); that single row flipped her to "not bulk-import",
+ * so the period engine counted ~$25.6k of 1-July import BUYs as fresh capital
+ * on top of an opening value that already contained them, and reported -46.9%
+ * on a book that was down about 7%.
  *
- * Centralised because three call sites need the same answer and MUST agree —
- * the Performance page, the Clients-list `deriveMetrics`, and the period
- * engine. A 1-July BUY counted as a flow on one page and as part of the opening
- * position on another reports two different returns for the same book.
+ * Centralised because every call site needs the same answer and MUST agree —
+ * the Performance page, the Clients-list `deriveMetrics`, the period engine and
+ * the reconstruction itself. A 1-July BUY counted as a flow on one page and as
+ * part of the opening position on another reports two different returns for
+ * the same book.
  */
 export function isBulkImportClient(input: {
   /** The client's stored `PortfolioBaseline.baselineDate`, if they have one. */
@@ -165,11 +176,8 @@ export function isBulkImportClient(input: {
   /** The client's earliest transaction date, if they have any ledger at all. */
   firstTransactionDate?: Date | null;
 }): boolean {
-  if (input.firstTransactionDate && utcDayOf(input.firstTransactionDate) < INCEPTION_DATE) {
-    return false;
-  }
-  if (!input.baselineDate) return true;
-  return isHouseBaselineDate(input.baselineDate);
+  if (input.baselineDate) return isHouseBaselineDate(input.baselineDate);
+  return !(input.firstTransactionDate && utcDayOf(input.firstTransactionDate) < INCEPTION_DATE);
 }
 
 /** Midnight-UTC truncation, so a same-day comparison is not decided by a timestamp. */

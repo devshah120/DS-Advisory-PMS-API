@@ -318,11 +318,11 @@ export class PerformanceBaselineService {
     ]);
 
     // The import-artifact filter only applies when this client's baseline IS
-    // the shared house baseline — and a ledger reaching back before the house
-    // date is proof that it is not, whatever the baseline row says. A client
-    // with no baseline row and no earlier history falls back to the synthetic
-    // house-dated one (PortfolioReconstructionService), so absence still counts
-    // as "house baseline". See isBulkImportClient and isImportArtifact.
+    // the shared house baseline. A stored baseline row decides that on its own
+    // date — the reconstruction that built `openingValue` asked the same
+    // question of the same row. With no row, a ledger reaching back before the
+    // house date means the synthetic baseline is NOT the house one
+    // (PortfolioReconstructionService). See isBulkImportClient.
     return isBulkImportClient({
       baselineDate: baseline?.baselineDate,
       firstTransactionDate: firstTransaction?.date ?? null,

@@ -463,13 +463,23 @@ describe('isBulkImportClient — whose 1-July BUYs are import artifacts', () => 
     ).toBe(false);
   });
 
-  it('is false even when a house-dated baseline row says otherwise', () => {
+  it('is true when a stored house-dated baseline exists, whatever the ledger predates', () => {
+    // A house-dated baseline was seeded with the 1-July BUYs' shares inside it
+    // (autoSeed skips them on rollback) and the replay drops them on the same
+    // test. Saumya Patel: one IST-midnight row at 29-Jun 18:30Z must not turn
+    // ~$25.6k of import rows into fresh capital.
+    expect(
+      isBulkImportClient({
+        baselineDate: INCEPTION_DATE,
+        firstTransactionDate: new Date('2026-06-29T18:30:00.000Z'),
+      }),
+    ).toBe(true);
     expect(
       isBulkImportClient({
         baselineDate: INCEPTION_DATE,
         firstTransactionDate: new Date('2025-12-16T00:00:00.000Z'),
       }),
-    ).toBe(false);
+    ).toBe(true);
   });
 
   it('is false for a client with their own non-house baseline', () => {

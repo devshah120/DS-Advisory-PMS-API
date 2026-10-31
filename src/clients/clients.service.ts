@@ -90,12 +90,15 @@ function serialize<T extends { riskProfile: string; status: string; accountingMe
  * Shared by `deriveMetrics` and the list's 30-June close fetch, so the closes
  * fetched are exactly the tickers the rebase will price.
  *
- * The earliest transaction is already loaded, so `isBulkImportClient` costs
- * no extra query.
+ * The earliest transaction and the stored baseline's date are loaded with the
+ * client, so `isBulkImportClient` costs no extra query. The baseline date must
+ * be passed: without it the list judged a house-baseline client by its ledger
+ * alone and disagreed with the Performance page about the same 1-July rows.
  */
 function rebaseInputs(client: {
   holdings: Array<{ ticker: string; quantity: number }>;
   transactions: Array<{ date: Date }>;
+  baseline?: { baselineDate: Date } | null;
 }) {
   const firstTransactionDate = client.transactions.reduce<Date | null>(
     (earliest, t) => (earliest === null || t.date < earliest ? t.date : earliest),
@@ -103,7 +106,10 @@ function rebaseInputs(client: {
   );
   return {
     currentQuantity: new Map(client.holdings.map((h) => [h.ticker, h.quantity])),
-    bulkImport: isBulkImportClient({ firstTransactionDate }),
+    bulkImport: isBulkImportClient({
+      baselineDate: client.baseline?.baselineDate,
+      firstTransactionDate,
+    }),
   };
 }
 
@@ -112,6 +118,7 @@ function deriveMetrics(
     cashBalance: number;
     holdings: Array<{ ticker: string; quantity: number; averageCost: number; currentPrice: number }>;
     transactions: Array<{ type: string; amount: number; date: Date; ticker: string | null; quantity: number | null }>;
+    baseline?: { baselineDate: Date } | null;
   },
   jun30Close: Map<string, number>,
   /** ticker → live price; falls back to the holding's stored currentPrice when absent. */
@@ -353,6 +360,8 @@ export class ClientsService {
           // The list shows which household a mandate belongs to, and the
           // family selector is built from the same read.
           family: { select: { id: true, name: true } },
+          // Decides whether the 1-July rows are import artifacts (rebaseInputs).
+          baseline: { select: { baselineDate: true } },
         },
       }),
       this.prisma.client.count({ where }),
@@ -402,7 +411,12 @@ export class ClientsService {
       // Overlay the derived portfolioValue / xirr onto the serialized record so
       // the list stops showing $0.00 / 0.00% for bulk-imported clients whose
       // stored columns were never written. cashBalance stays as stored.
-      data: clients.map((c) => ({ ...serialize(c), ...deriveMetrics(c, jun30Close, livePrice) })),
+      // `baseline` was loaded only to classify the 1-July rows; it is not part
+      // of the list's response shape.
+      data: clients.map(({ baseline, ...c }) => ({
+        ...serialize(c),
+        ...deriveMetrics({ ...c, baseline }, jun30Close, livePrice),
+      })),
       total,
       page: Math.floor(skip / take) + 1,
       limit: take,

@@ -5,6 +5,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import * as XLSX from 'xlsx';
+import { TransactionType } from '@prisma/client';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { MarketService } from '../market/market.service';
 import { PortfolioReconstructionService } from '../portfolio-reconstruction/portfolio-reconstruction.service';
@@ -198,6 +199,22 @@ function derive(quantity: number, averageCost: number, currentPrice: number) {
  * already uses for the same judgement.
  */
 const CLOSED_POSITION_EPSILON = 1e-9;
+
+/**
+ * Ledger rows that change a position's share count without moving money — the
+ * same set PortfolioReconstructionService.applyTransaction replays as a signed
+ * quantity delta. A lot rebuild must apply them too, or it disagrees with every
+ * historical valuation about how many shares a split left behind.
+ */
+const SHARE_COUNT_ACTIONS: TransactionType[] = [
+  'SPLIT',
+  'BONUS',
+  'REVERSE_SPLIT',
+  'SPINOFF',
+  'MERGER',
+  'ACQUISITION',
+  'DELISTING_SETTLEMENT',
+];
 
 /**
  * Open positions only — what the client actually still owns.
@@ -687,10 +704,17 @@ export class HoldingsService {
    *
    * `currentPrice` is left alone: it is a quote, not a fact about the trade,
    * and the read path overlays a live one anyway.
+   *
+   * Share-count corporate-action rows (SPLIT, BONUS, ...) replay too, exactly
+   * as PortfolioReconstructionService applies them: the signed delta moves the
+   * quantity and the cost basis is untouched. Reading BUY/SELL alone meant the
+   * first lot edit after a split rebuilt the position at its PRE-split size —
+   * the engine had written the split straight onto the Holding, and this
+   * rebuild could not see where those shares came from.
    */
   private async recomputeFromLedger(holdingId: string, clientId: string, ticker: string) {
     const lots = await this.prisma.transaction.findMany({
-      where: { clientId, ticker, type: { in: ['BUY', 'SELL'] } },
+      where: { clientId, ticker, type: { in: ['BUY', 'SELL', ...SHARE_COUNT_ACTIONS] } },
       orderBy: { date: 'asc' },
     });
 
@@ -699,6 +723,13 @@ export class HoldingsService {
     let realizedPnL = 0;
 
     for (const lot of lots) {
+      if (SHARE_COUNT_ACTIONS.includes(lot.type)) {
+        // `quantity` is the signed delta here (see applyTransaction), so it is
+        // applied as recorded, never through Math.abs.
+        quantity += lot.quantity ?? 0;
+        continue;
+      }
+
       const size = Math.abs(lot.quantity ?? 0);
       const amount = Math.abs(lot.amount ?? 0);
       if (size === 0) continue;
