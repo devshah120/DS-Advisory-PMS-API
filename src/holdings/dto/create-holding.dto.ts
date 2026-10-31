@@ -1,4 +1,4 @@
-import { IsString, IsNumber, IsOptional, IsDateString } from 'class-validator';
+import { IsString, IsNumber, IsOptional, IsDateString, MaxLength } from 'class-validator';
 
 export class CreateHoldingDto {
   @IsString()
@@ -54,6 +54,13 @@ export class CreateHoldingDto {
   @IsNumber()
   @IsOptional()
   amountInvested?: number;
+
+  // Stamped on the ledger row. A contract-note import sets it to the trade's
+  // identity in the statement so the same statement can't be booked twice.
+  @IsString()
+  @IsOptional()
+  @MaxLength(120)
+  reference?: string;
 
   // Accepted for backwards compatibility but ignored: marketValue and
   // unrealizedPnL are always derived server-side from quantity, averageCost

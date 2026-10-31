@@ -3,8 +3,9 @@ export interface BulkImportRowResult {
   /** 1-based row number as it appears in the spreadsheet (header is row 1). */
   row: number;
   ticker: string | null;
-  status: 'imported' | 'failed';
-  /** Present when status is 'failed'. */
+  /** 'skipped' is a trade already on the ledger — see ContractNoteService. */
+  status: 'imported' | 'failed' | 'skipped';
+  /** Present when status is 'failed' or 'skipped'. */
   error?: string;
 }
 
@@ -12,5 +13,6 @@ export interface BulkImportSummary {
   total: number;
   imported: number;
   failed: number;
+  skipped?: number;
   results: BulkImportRowResult[];
 }

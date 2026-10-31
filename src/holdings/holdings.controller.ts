@@ -23,6 +23,8 @@ import { UpdateHoldingDto } from './dto/update-holding.dto';
 import { UpdateLotDto } from './dto/update-lot.dto';
 import { SetSectorDto } from './dto/set-sector.dto';
 import { ClassificationService } from './classification.service';
+import { ContractNoteService } from './contract-note/contract-note.service';
+import { CommitContractNoteDto } from './dto/commit-contract-note.dto';
 import { parseMarket } from '../common/market-scope';
 import { parseAsOfDate } from '../portfolio-reconstruction/holdings-as-of';
 import { Actor } from '../common/ownership-scope';
@@ -47,6 +49,7 @@ export class HoldingsController {
   constructor(
     private holdingsService: HoldingsService,
     private classification: ClassificationService,
+    private contractNotes: ContractNoteService,
   ) {}
 
   @Post()
@@ -79,6 +82,30 @@ export class HoldingsController {
     // so a blotter naming someone else's client fails that row rather than
     // writing into their book.
     return this.holdingsService.bulkImport(file.buffer, req.user);
+  }
+
+  /**
+   * Reads a broker contract note (PDF) and returns its trades with each ISIN
+   * resolved to a symbol. Writes nothing — the user reviews the rows and picks
+   * the client, then posts them to `import/contract-note`.
+   */
+  @Post('import/contract-note/preview')
+  @UseInterceptors(
+    FileInterceptor('file', { limits: { fileSize: MAX_IMPORT_BYTES } }),
+  )
+  previewContractNote(
+    @Req() req: AuthedRequest,
+    @UploadedFile() file?: UploadedExcel,
+    @Body('password') password?: string,
+  ) {
+    if (!file) throw new BadRequestException('No file uploaded (expected field "file")');
+    return this.contractNotes.preview(file.buffer, file.originalname, password || undefined, req.user);
+  }
+
+  /** Books the reviewed contract-note trades. Already-imported trades are skipped. */
+  @Post('import/contract-note')
+  commitContractNote(@Body() dto: CommitContractNoteDto, @Req() req: AuthedRequest) {
+    return this.contractNotes.commit(dto, req.user);
   }
 
   @Get()

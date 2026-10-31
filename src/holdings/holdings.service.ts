@@ -313,6 +313,7 @@ export class HoldingsService {
       marketValue: _ignored,
       date: tradeDate,
       amountInvested,
+      reference,
       ...data
     } = createHoldingDto;
     const { ticker, quantity, averageCost, currentPrice } = data;
@@ -358,6 +359,7 @@ export class HoldingsService {
         currentPrice,
         tradeDate,
         amountInvested,
+        reference,
       });
     }
 
@@ -420,6 +422,7 @@ export class HoldingsService {
       currentPrice,
       tradeDate,
       amountInvested,
+      reference,
     });
   }
 
@@ -442,6 +445,7 @@ export class HoldingsService {
       currentPrice: number;
       tradeDate?: string;
       amountInvested?: number;
+      reference?: string;
     },
   ): Promise<T> {
     const isSell = trade.quantity < 0;
@@ -469,6 +473,7 @@ export class HoldingsService {
           amount,
           date: trade.tradeDate ? new Date(trade.tradeDate) : new Date(),
           description: `${isSell ? 'Sell' : 'Buy'} ${absQuantity} ${trade.ticker}`,
+          reference: trade.reference,
         },
       });
     } catch (error) {
@@ -1054,10 +1059,44 @@ export class HoldingsService {
     }
     const { id: clientId, market } = matched;
 
+    // The name index this row resolved through was already scoped to the actor,
+    // so ownership is settled by construction; recordTrade() passes the actor
+    // on to create() anyway, so its own check stays meaningful rather than
+    // relying on that invariant holding forever.
+    await this.recordTrade(
+      { clientId, market, symbol: rawTicker, side, quantity, amount: amountInvested, date },
+      actor,
+    );
+  }
+
+  /**
+   * Applies one dated trade to a client's position and writes its ledger row —
+   * the step every importer shares once it has worked out who, what, when and
+   * for how much.
+   *
+   * `amount` is the total consideration; the per-share price is derived from
+   * it, never the other way round, so the ledger books what was actually paid.
+   */
+  async recordTrade(
+    trade: {
+      clientId: string;
+      market: Market;
+      symbol: string;
+      side: 'BUY' | 'SELL';
+      quantity: number;
+      amount: number;
+      date: Date;
+      reference?: string;
+    },
+    actor: Actor,
+  ) {
+    const { clientId, market, side, quantity, date } = trade;
+    const amountInvested = trade.amount;
+
     // Qualify the symbol against the owning client's book, so an Indian
     // blotter's "RELIANCE" becomes "RELIANCE.NS" and prices correctly. A symbol
     // that already carries a suffix is left exactly as typed.
-    const ticker = normalizeSymbol(rawTicker, market);
+    const ticker = normalizeSymbol(trade.symbol.toUpperCase(), market);
 
     // The price the trade actually happened at. For a sell this is what
     // realises the P&L in create(), which is why the file's proceeds are used
@@ -1102,12 +1141,9 @@ export class HoldingsService {
       // recomputed one.
       date: date.toISOString(),
       amountInvested,
+      reference: trade.reference,
     };
 
-    // The name index this row resolved through was already scoped to the actor,
-    // so ownership is settled by construction; passing it on keeps create()'s
-    // own check meaningful rather than relying on that invariant holding
-    // forever.
-    await this.create(dto, actor);
+    return this.create(dto, actor);
   }
 }

@@ -1,6 +1,8 @@
 import { Module } from '@nestjs/common';
 import { HoldingsService } from './holdings.service';
 import { ClassificationService } from './classification.service';
+import { ContractNoteService } from './contract-note/contract-note.service';
+import { IsinResolverService } from './contract-note/isin-resolver.service';
 import { HoldingsController } from './holdings.controller';
 import { PrismaModule } from '../common/prisma/prisma.module';
 import { MarketModule } from '../market/market.module';
@@ -11,7 +13,7 @@ import { PortfolioReconstructionModule } from '../portfolio-reconstruction/portf
   // is built from, so it cannot drift from the one Performance values with.
   imports: [PrismaModule, MarketModule, PortfolioReconstructionModule],
   controllers: [HoldingsController],
-  providers: [HoldingsService, ClassificationService],
+  providers: [HoldingsService, ClassificationService, ContractNoteService, IsinResolverService],
   exports: [HoldingsService, ClassificationService],
 })
 export class HoldingsModule {}
