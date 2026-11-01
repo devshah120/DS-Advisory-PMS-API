@@ -92,6 +92,26 @@ describe('positionWindowReturn', () => {
     expect(r.returnPct).toBeCloseTo(0, 6);
   });
 
+  it('reports the money gained net of capital moved, the numerator of its contribution', () => {
+    const r = positionWindowReturn({
+      ...base,
+      openingValue: 1000,
+      closingValue: 1650, // 100 of price gain on the opening 1000, plus a 500 top-up that rose 50
+      rows: [{ type: 'BUY', amount: 500, date: day('2026-10-04') }],
+    });
+    expect(r.gain).toBeCloseTo(150, 6);
+  });
+
+  it('counts a realised gain from a sale inside the window', () => {
+    const r = positionWindowReturn({
+      ...base,
+      openingValue: 1000,
+      closingValue: 0,
+      rows: [{ type: 'SELL', amount: 1200, date: day('2026-10-05') }],
+    });
+    expect(r.gain).toBeCloseTo(200, 6);
+  });
+
   it('gives the plain gain on cost for a position bought today', () => {
     const r = positionWindowReturn({
       ...base,
@@ -123,6 +143,8 @@ describe('positionWindowReturn', () => {
     });
     expect(r.returnPct).toBeNull();
     expect(r.reason).toMatch(/no opening value/i);
+    // Nor a gain: the whole transferred-in value would otherwise read as one.
+    expect(r.gain).toBeNull();
   });
 
   it('drops a bulk-import 1-July BUY for a house-baseline client but keeps it for anyone else', () => {

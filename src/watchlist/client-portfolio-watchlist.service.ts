@@ -14,13 +14,17 @@ import { computePeriodReturn, trackedBenchmarks } from './watchlist.service';
 const MS_PER_DAY = 86_400_000;
 const DAYS_PER_YEAR = 365;
 
-export type WatchlistWindow = 'mtd' | 'qtd' | 'ytd';
+export type WatchlistWindow = 'mtd' | 'qtd' | 'ytd' | 'inception';
 const WINDOWS: ReadonlyArray<[WatchlistWindow, string]> = [
   ['mtd', 'MTD'],
   ['qtd', 'QTD'],
   // `YTD` resolves on the client's own reporting calendar: April–March for the
   // Indian book (FYTD), January–December for the US one. See periods.ts.
   ['ytd', 'YTD'],
+  // Measured for the export's since-inception contribution column. While the
+  // book is younger than its first reporting year it opens on the same date as
+  // YTD, so it costs no extra valuation.
+  ['inception', 'INCEPTION'],
 ];
 
 export interface PositionWindowReturn {
@@ -34,6 +38,18 @@ export interface PositionWindowReturn {
   closingValue: number;
   /** Net capital put into the position inside the window (buys − sells − income). */
   netFlows: number;
+  /**
+   * What the holding made or lost over the window in money: closing − opening −
+   * net flows, so realised gains and dividends count and fresh capital does
+   * not. Null when there is no priced opening or purchase to measure from.
+   */
+  gain: number | null;
+  /**
+   * The position's contribution to the book's return over the window, in
+   * PERCENT of the book's capital (see WindowAttribution). Null when either
+   * the gain or the book's capital base could not be measured.
+   */
+  contributionPct: number | null;
   /**
    * Where measurement starts: the window's own open, or the first purchase when
    * the position was opened inside the window. A later date here means the
@@ -49,6 +65,37 @@ export interface WatchlistWindowMeta {
   to: string;
   clampedToInception: boolean;
   nominalFrom: string | null;
+  /** Null when some account in the book could not be valued at the window's open. */
+  attribution: WindowAttribution | null;
+}
+
+/**
+ * How the book's return over a window splits across its positions.
+ *
+ * Each position's contribution is its gain over the window divided by the
+ * book's capital base: the holdings value at the open plus every flow inside
+ * the window weighted by the share of the window it was invested for
+ * (Modified Dietz). With no flows that is exactly opening weight × return, so
+ * a 10% position that rises 10% contributes 1%; with flows, fresh capital
+ * widens the base instead of being read as performance. The base is capital
+ * at work, the same holdings-value, transactional basis the Performance sheet
+ * measures the book on.
+ *
+ * Because every position shares one base, the contributions add up: the rows
+ * held today plus `otherPct` equal `totalPct`. `totalPct` is the book's
+ * Modified Dietz return, a close approximation to the money-weighted (XIRR)
+ * figure on the Performance sheet, not that figure itself.
+ */
+export interface WindowAttribution {
+  capitalBase: number;
+  /** The book's return over the window, in PERCENT. */
+  totalPct: number;
+  /**
+   * What the positions listed do not account for, in PERCENT: names sold out
+   * inside the window, fees and income booked without a symbol, and any
+   * holding whose own gain could not be measured.
+   */
+  otherPct: number;
 }
 
 export interface ClientWatchlistRow {
@@ -70,6 +117,7 @@ export interface ClientWatchlistRow {
   mtd: PositionWindowReturn;
   qtd: PositionWindowReturn;
   ytd: PositionWindowReturn;
+  inception: PositionWindowReturn;
 }
 
 export interface WatchlistHolder {
@@ -86,6 +134,7 @@ export interface ClientWatchlistBenchmark {
   mtd: number | null;
   qtd: number | null;
   ytd: number | null;
+  inception: number | null;
 }
 
 export interface ClientPortfolioWatchlist {
@@ -127,6 +176,48 @@ export function valuationCutoff(date: Date, now: Date = new Date()): Date | null
   return new Date(day.getTime() + MS_PER_DAY);
 }
 
+/** One account's ledger rows, with how its 1-July BUY rows are to be read. */
+type AccountLedger = { rows: LedgerEntry[]; isHouseBaseline: boolean };
+
+/**
+ * The flows strictly inside a window, across one or more accounts, in date
+ * order. Bounded by the valuation cutoffs rather than by the window's midnight
+ * instants, so every row lands in exactly one of opening value, flows and
+ * closing value. Shared by the per-position return and the book's capital
+ * base so the two can never disagree about which trades a window contained.
+ */
+function interiorFlows(
+  ledgers: ReadonlyArray<AccountLedger>,
+  from: Date,
+  to: Date,
+  openedThrough: Date | null,
+  closedThrough: Date | null,
+): CashFlow[] {
+  if (openedThrough === null) return [];
+  return (
+    ledgers
+      .flatMap((ledger) => {
+        const rows = ledger.rows
+          .filter((r) => r.date >= openedThrough && (closedThrough === null || r.date < closedThrough))
+          // A row the live book already holds but dated after today is priced
+          // into the closing value, so its cash belongs on the closing date.
+          .map((r) => (r.date > to ? { ...r, date: to } : r));
+        // Bounds are already applied above; these only keep buildWindowFlows' own
+        // strict filter from re-trimming the rows that sit on the closing date.
+        return buildWindowFlows(
+          rows,
+          'TRANSACTIONAL',
+          new Date(from.getTime() - 1),
+          new Date(to.getTime() + 1),
+          undefined,
+          ledger.isHouseBaseline,
+        );
+      })
+      // Each account's flows arrive in date order, but not the merged list.
+      .sort((a, b) => a.date.getTime() - b.date.getTime())
+  );
+}
+
 /**
  * One position's money-weighted return over one window.
  *
@@ -162,37 +253,15 @@ export function positionWindowReturn(input: {
    * member. The rows cannot be pooled first, because whether a 1-July BUY is
    * an import artifact is decided per account (see `isHouseBaseline`).
    */
-  ledgers: ReadonlyArray<{ rows: LedgerEntry[]; isHouseBaseline: boolean }>;
+  ledgers: ReadonlyArray<AccountLedger>;
   /** Rows before this are inside the opening value; null = all of them are. */
   openedThrough: Date | null;
   /** Rows before this are inside the closing value; null = all of them are. */
   closedThrough: Date | null;
-}): PositionWindowReturn {
+}): Omit<PositionWindowReturn, 'contributionPct'> {
   const { from, to, openingValue, closingValue, openedThrough, closedThrough } = input;
 
-  const interior =
-    openedThrough === null
-      ? []
-      : input.ledgers
-          .flatMap((ledger) => {
-            const rows = ledger.rows
-              .filter((r) => r.date >= openedThrough && (closedThrough === null || r.date < closedThrough))
-              // A row the live book already holds but dated after today is priced
-              // into the closing value, so its cash belongs on the closing date.
-              .map((r) => (r.date > to ? { ...r, date: to } : r));
-            // Bounds are already applied above; these only keep buildWindowFlows' own
-            // strict filter from re-trimming the rows that sit on the closing date.
-            return buildWindowFlows(
-              rows,
-              'TRANSACTIONAL',
-              new Date(from.getTime() - 1),
-              new Date(to.getTime() + 1),
-              undefined,
-              ledger.isHouseBaseline,
-            );
-          })
-          // Each account's flows arrive in date order, but not the merged list.
-          .sort((a, b) => a.date.getTime() - b.date.getTime());
+  const interior = interiorFlows(input.ledgers, from, to, openedThrough, closedThrough);
 
   const flows: CashFlow[] = [
     ...(openingValue > 0 ? [{ date: from, amount: -openingValue }] : []),
@@ -201,10 +270,12 @@ export function positionWindowReturn(input: {
   ];
 
   const measuredFrom = flows[0].date;
+  const netFlows = interior.reduce((sum, f) => sum - f.amount, 0);
   const base = {
     openingValue,
     closingValue,
-    netFlows: interior.reduce((sum, f) => sum - f.amount, 0),
+    netFlows,
+    gain: closingValue - openingValue - netFlows,
     measuredFrom: iso(measuredFrom),
   };
 
@@ -212,6 +283,8 @@ export function positionWindowReturn(input: {
   if (invested === 0) {
     return {
       ...base,
+      // Nothing priced went in, so the whole closing value would read as gain.
+      gain: null,
       returnPct: null,
       reason:
         'No opening value or purchase in this window to measure from — the position arrived ' +
@@ -242,12 +315,21 @@ interface BookMember {
   inceptionDate: Date;
 }
 
+/** One account's valuation at a window's open. */
+interface AccountOpening {
+  byTicker: Map<string, number>;
+  holdingsValue: number;
+}
+
 /** One account's side of the book, read once and shared by every position. */
 interface AccountBook {
   member: BookMember;
   closing: ReconstructedPosition[];
-  /** Opening market value by ticker, per window-open instant; null = could not be valued. */
-  openings: Map<number, Map<string, number> | null>;
+  closingHoldingsValue: number;
+  /** Opening valuation per window-open instant; null = could not be valued. */
+  openings: Map<number, AccountOpening | null>;
+  /** Every ledger row from the earliest window open, ticker-less ones included. */
+  ledger: LedgerEntry[];
   rowsByTicker: Map<string, LedgerEntry[]>;
   isHouseBaseline: boolean;
   companies: Map<string, string | null>;
@@ -396,7 +478,7 @@ export class ClientPortfolioWatchlistService {
         const measure = (key: WatchlistWindow): PositionWindowReturn => {
           const { from } = resolved[key];
           let openingValue = 0;
-          const ledgers: Array<{ rows: LedgerEntry[]; isHouseBaseline: boolean }> = [];
+          const ledgers: AccountLedger[] = [];
           for (const account of accounts) {
             const rows = account.rowsByTicker.get(ticker) ?? [];
             const opening = account.openings.get(from.getTime());
@@ -408,6 +490,8 @@ export class ClientPortfolioWatchlistService {
                 openingValue: 0,
                 closingValue: marketValue,
                 netFlows: 0,
+                gain: null,
+                contributionPct: null,
                 measuredFrom: iso(from),
                 reason:
                   accounts.length > 1
@@ -415,18 +499,22 @@ export class ClientPortfolioWatchlistService {
                     : `The book could not be valued on ${iso(from)}, so this window has no opening value.`,
               };
             }
-            openingValue += opening.get(ticker) ?? 0;
+            openingValue += opening.byTicker.get(ticker) ?? 0;
             ledgers.push({ rows, isHouseBaseline: account.isHouseBaseline });
           }
-          return positionWindowReturn({
-            from,
-            to,
-            openingValue,
-            closingValue: marketValue,
-            ledgers,
-            openedThrough: valuationCutoff(from, now),
-            closedThrough,
-          });
+          // Contribution needs the book's capital base, so `attribute` fills it in below.
+          return {
+            ...positionWindowReturn({
+              from,
+              to,
+              openingValue,
+              closingValue: marketValue,
+              ledgers,
+              openedThrough: valuationCutoff(from, now),
+              closedThrough,
+            }),
+            contributionPct: null,
+          };
         };
 
         return {
@@ -443,6 +531,7 @@ export class ClientPortfolioWatchlistService {
           mtd: measure('mtd'),
           qtd: measure('qtd'),
           ytd: measure('ytd'),
+          inception: measure('inception'),
         };
       })
       .sort((a, b) => b.marketValue - a.marketValue);
@@ -458,12 +547,63 @@ export class ClientPortfolioWatchlistService {
             to: iso(w.to),
             clampedToInception: w.clampedToInception,
             nominalFrom: w.nominalFrom ? iso(w.nominalFrom) : null,
+            attribution: this.attribute(key, rows, accounts, w.from, to, valuationCutoff(w.from, now), closedThrough),
           },
         ];
       }),
     ) as Record<WatchlistWindow, WatchlistWindowMeta>;
 
     return { asOf: iso(to), windows, rows, benchmarks };
+  }
+
+  /**
+   * The book's capital base over one window, and each row's share of the
+   * return measured on it. Writes `contributionPct` onto the rows' window and
+   * returns the book-level figures; see WindowAttribution for the method.
+   */
+  private attribute(
+    key: WatchlistWindow,
+    rows: ClientWatchlistRow[],
+    accounts: AccountBook[],
+    from: Date,
+    to: Date,
+    openedThrough: Date | null,
+    closedThrough: Date | null,
+  ): WindowAttribution | null {
+    let openingValue = 0;
+    let closingValue = 0;
+    for (const account of accounts) {
+      const opening = account.openings.get(from.getTime());
+      if (!opening) return null;
+      openingValue += opening.holdingsValue;
+      closingValue += account.closingHoldingsValue;
+    }
+
+    const flows = interiorFlows(
+      accounts.map((a) => ({ rows: a.ledger, isHouseBaseline: a.isHouseBaseline })),
+      from,
+      to,
+      openedThrough,
+      closedThrough,
+    );
+    // Each flow counts for the share of the window it was invested; on a window
+    // with no span (it opens today) any flow counts in full.
+    const span = to.getTime() - from.getTime();
+    const invested = (f: CashFlow) => (span > 0 ? (to.getTime() - f.date.getTime()) / span : 1);
+    const capitalBase = openingValue - flows.reduce((sum, f) => sum + f.amount * invested(f), 0);
+    if (capitalBase <= 0) return null;
+
+    const netFlows = flows.reduce((sum, f) => sum - f.amount, 0);
+    const totalPct = ((closingValue - openingValue - netFlows) / capitalBase) * 100;
+
+    let attributed = 0;
+    for (const row of rows) {
+      const w = row[key];
+      if (w.gain === null) continue;
+      w.contributionPct = (w.gain / capitalBase) * 100;
+      attributed += w.contributionPct;
+    }
+    return { capitalBase, totalPct, otherPct: totalPct - attributed };
   }
 
   /** Everything one account contributes: its valuations at each edge, its ledger, its names. */
@@ -479,14 +619,22 @@ export class ClientPortfolioWatchlistService {
         openDates.map((d) =>
           this.history
             .getPortfolioAsOf(member.id, d)
-            .then((book): Map<string, number> | null => new Map(book.positions.map((p) => [p.ticker, p.marketValue])))
+            .then(
+              (book): AccountOpening | null => ({
+                byTicker: new Map(book.positions.map((p) => [p.ticker, p.marketValue])),
+                holdingsValue: book.holdingsValue,
+              }),
+            )
             // A window whose opening valuation cannot be produced (a date before
             // this client's baseline, say) is reported as unavailable rather
             // than taking the other windows down with it. The exception is a
             // family member whose own mandate starts after the household's
             // window opens: they held nothing then, and their purchases enter
             // as flows.
-            .catch((): Map<string, number> | null => (member.inceptionDate > d ? new Map() : null)),
+            .catch(
+              (): AccountOpening | null =>
+                member.inceptionDate > d ? { byTicker: new Map(), holdingsValue: 0 } : null,
+            ),
         ),
       ),
       this.prisma.transaction.findMany({
@@ -509,7 +657,9 @@ export class ClientPortfolioWatchlistService {
     return {
       member,
       closing: closing.positions,
+      closingHoldingsValue: closing.holdingsValue,
       openings: new Map(openDates.map((d, i) => [d.getTime(), openings[i]])),
+      ledger,
       rowsByTicker,
       isHouseBaseline,
       companies: new Map(holdings.map((h) => [h.ticker, h.company])),
@@ -537,9 +687,9 @@ export class ClientPortfolioWatchlistService {
         try {
           const bars = await this.market.history(b.symbol, historyFrom);
           const pct = (key: WatchlistWindow) => computePeriodReturn(bars, iso(resolved[key].from)).returnPct;
-          return { ...b, mtd: pct('mtd'), qtd: pct('qtd'), ytd: pct('ytd') };
+          return { ...b, mtd: pct('mtd'), qtd: pct('qtd'), ytd: pct('ytd'), inception: pct('inception') };
         } catch {
-          return { ...b, mtd: null, qtd: null, ytd: null };
+          return { ...b, mtd: null, qtd: null, ytd: null, inception: null };
         }
       }),
     );
