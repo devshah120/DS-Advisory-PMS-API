@@ -5,7 +5,6 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import * as XLSX from 'xlsx';
-import { TransactionType } from '@prisma/client';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { MarketService } from '../market/market.service';
 import { PortfolioReconstructionService } from '../portfolio-reconstruction/portfolio-reconstruction.service';
@@ -14,6 +13,13 @@ import { CreateHoldingDto } from './dto/create-holding.dto';
 import { UpdateHoldingDto } from './dto/update-holding.dto';
 import { UpdateLotDto } from './dto/update-lot.dto';
 import { BulkImportRowResult, BulkImportSummary } from './dto/bulk-import-result.dto';
+import {
+  CLOSED_POSITION_EPSILON,
+  POSITION_MOVING_TYPES,
+  derive,
+  istDay,
+  replayLots,
+} from './ledger-replay';
 import {
   DEFAULT_MARKET,
   Market,
@@ -182,40 +188,6 @@ function toDate(value: unknown): Date {
   return parsed;
 }
 
-/** Derived position figures. Cost basis is always averageCost * quantity. */
-function derive(quantity: number, averageCost: number, currentPrice: number) {
-  const marketValue = quantity * currentPrice;
-  const costBasis = quantity * averageCost;
-  return { marketValue, unrealizedPnL: marketValue - costBasis };
-}
-
-/**
- * Below this, a position is closed rather than merely small.
- *
- * Quantities are fractional (46.414 shares), so selling a lot out in full
- * rarely lands on a clean 0 — the subtraction leaves float dust like 7e-15.
- * Comparing against zero would let a fully-exited position keep showing up as
- * an open holding worth $0.00. Matches the threshold the analytics layer
- * already uses for the same judgement.
- */
-const CLOSED_POSITION_EPSILON = 1e-9;
-
-/**
- * Ledger rows that change a position's share count without moving money — the
- * same set PortfolioReconstructionService.applyTransaction replays as a signed
- * quantity delta. A lot rebuild must apply them too, or it disagrees with every
- * historical valuation about how many shares a split left behind.
- */
-const SHARE_COUNT_ACTIONS: TransactionType[] = [
-  'SPLIT',
-  'BONUS',
-  'REVERSE_SPLIT',
-  'SPINOFF',
-  'MERGER',
-  'ACQUISITION',
-  'DELISTING_SETTLEMENT',
-];
-
 /**
  * Open positions only — what the client actually still owns.
  *
@@ -229,6 +201,9 @@ const SHARE_COUNT_ACTIONS: TransactionType[] = [
 function openOnly<T extends { quantity: number }>(holdings: T[]): T[] {
   return holdings.filter((h) => Math.abs(h.quantity) > CLOSED_POSITION_EPSILON);
 }
+
+/** What the bulk import compares a blotter row against to spot a re-upload. */
+type LedgerTrade = { ticker: string | null; type: string; quantity: number | null; date: Date };
 
 @Injectable()
 export class HoldingsService {
@@ -719,48 +694,11 @@ export class HoldingsService {
    */
   private async recomputeFromLedger(holdingId: string, clientId: string, ticker: string) {
     const lots = await this.prisma.transaction.findMany({
-      where: { clientId, ticker, type: { in: ['BUY', 'SELL', ...SHARE_COUNT_ACTIONS] } },
+      where: { clientId, ticker, type: { in: POSITION_MOVING_TYPES } },
       orderBy: { date: 'asc' },
     });
 
-    let quantity = 0;
-    let costBasis = 0;
-    let realizedPnL = 0;
-
-    for (const lot of lots) {
-      if (SHARE_COUNT_ACTIONS.includes(lot.type)) {
-        // `quantity` is the signed delta here (see applyTransaction), so it is
-        // applied as recorded, never through Math.abs.
-        quantity += lot.quantity ?? 0;
-        continue;
-      }
-
-      const size = Math.abs(lot.quantity ?? 0);
-      const amount = Math.abs(lot.amount ?? 0);
-      if (size === 0) continue;
-
-      if (lot.type === 'BUY') {
-        quantity += size;
-        costBasis += amount;
-      } else {
-        // Sells cannot take out more than is held: a ledger whose sells exceed
-        // its buys is already inconsistent, and clamping keeps the rebuild from
-        // inventing a negative position out of it.
-        const sold = Math.min(size, quantity);
-        const averageCost = quantity > 0 ? costBasis / quantity : 0;
-        realizedPnL += amount - averageCost * sold;
-        quantity -= sold;
-        costBasis -= averageCost * sold;
-      }
-    }
-
-    // Same snap the create path applies: a full exit built from fractional buys
-    // and sells lands on float dust, not a clean zero, and that dust is what
-    // keeps a closed name rendering as an open position worth nothing.
-    if (Math.abs(quantity) < CLOSED_POSITION_EPSILON) {
-      quantity = 0;
-      costBasis = 0;
-    }
+    const { quantity, costBasis, realizedPnL } = replayLots(lots);
 
     const averageCost = quantity > 0 ? costBasis / quantity : 0;
     const current = await this.prisma.holding.findUnique({ where: { id: holdingId } });
@@ -903,6 +841,7 @@ export class HoldingsService {
       ['', '', 'Repeat buys in the same symbol fold into the existing position at weighted-average cost.'],
       ['', '', 'Each row also records a dated Buy/Sell transaction, so performance and XIRR pick it up.'],
       ['', '', 'A bad row never stops the file — every row is reported back with its result.'],
+      ['', '', 'A trade already on the ledger (same day, side, symbol and quantity) is skipped, so re-uploading a file never doubles it.'],
     ];
     const notesSheet = XLSX.utils.aoa_to_sheet(notes);
     notesSheet['!cols'] = [{ wch: 20 }, { wch: 10 }, { wch: 78 }];
@@ -961,6 +900,11 @@ export class HoldingsService {
     // would otherwise make before doing any work.
     const clientsByName = await this.clientNameIndex(actor);
 
+    // Each client's trades as they stood BEFORE this file, read on first use.
+    // Rows this run books are deliberately not added, so a file listing two
+    // identical fills still books both; only an earlier upload's copy blocks.
+    const ledgers = new Map<string, LedgerTrade[]>();
+
     const results: BulkImportRowResult[] = [];
 
     for (let i = 0; i < rows.length; i++) {
@@ -970,8 +914,12 @@ export class HoldingsService {
       const ticker = toText(raw.symbol)?.toUpperCase() ?? null;
 
       try {
-        await this.importRow(raw, clientsByName, actor);
-        results.push({ row: rowNumber, ticker, status: 'imported' });
+        const skipped = await this.importRow(raw, clientsByName, ledgers, actor);
+        results.push(
+          skipped
+            ? { row: rowNumber, ticker, status: 'skipped', error: skipped }
+            : { row: rowNumber, ticker, status: 'imported' },
+        );
       } catch (error) {
         results.push({
           row: rowNumber,
@@ -982,11 +930,12 @@ export class HoldingsService {
       }
     }
 
-    const imported = results.filter((r) => r.status === 'imported').length;
+    const count = (s: BulkImportRowResult['status']) => results.filter((r) => r.status === s).length;
     return {
       total: results.length,
-      imported,
-      failed: results.length - imported,
+      imported: count('imported'),
+      failed: count('failed'),
+      skipped: count('skipped'),
       results,
     };
   }
@@ -1026,12 +975,18 @@ export class HoldingsService {
    * Validates one blotter row, applies it to the position, and records the
    * matching dated transaction. Throws with a message aimed at the person who
    * wrote the spreadsheet — it is shown against their row in the UI.
+   *
+   * Returns the reason when the row is skipped as a trade already on the
+   * ledger, or null once it is booked. Uploading the same file twice used to
+   * book every trade twice — the position doubled, and deleting the extra
+   * ledger rows afterwards left the doubled position behind.
    */
   private async importRow(
     raw: Record<string, unknown>,
     clientsByName: Map<string, { id: string; market: Market } | null>,
+    ledgers: Map<string, LedgerTrade[]>,
     actor: Actor,
-  ): Promise<void> {
+  ): Promise<string | null> {
     const side = toSide(raw.action);
     const date = toDate(raw.date);
     const clientName = toText(raw.clientName);
@@ -1059,6 +1014,33 @@ export class HoldingsService {
     }
     const { id: clientId, market } = matched;
 
+    // Matched on day, side, symbol and size — not amount, the same rule the
+    // contract-note import uses. A re-upload with a corrected amount is still
+    // the same trade, and booking it again would double the position.
+    let ledger = ledgers.get(clientId);
+    if (!ledger) {
+      ledger = await this.prisma.transaction.findMany({
+        where: { clientId, type: { in: ['BUY', 'SELL'] } },
+        select: { ticker: true, type: true, quantity: true, date: true },
+      });
+      ledgers.set(clientId, ledger);
+    }
+    const ticker = normalizeSymbol(rawTicker, market);
+    const day = istDay(date);
+    const twin = ledger.findIndex(
+      (t) =>
+        t.type === side &&
+        t.ticker?.toUpperCase() === ticker &&
+        Math.abs(Math.abs(t.quantity ?? 0) - quantity) < 1e-9 &&
+        istDay(t.date) === day,
+    );
+    if (twin >= 0) {
+      // Consumed, so a file with two identical fills against one existing
+      // trade still books the second.
+      ledger.splice(twin, 1);
+      return `Already on the ledger (${day}) — skipped. Edit that trade to change its amount.`;
+    }
+
     // The name index this row resolved through was already scoped to the actor,
     // so ownership is settled by construction; recordTrade() passes the actor
     // on to create() anyway, so its own check stays meaningful rather than
@@ -1067,6 +1049,7 @@ export class HoldingsService {
       { clientId, market, symbol: rawTicker, side, quantity, amount: amountInvested, date },
       actor,
     );
+    return null;
   }
 
   /**

@@ -10,6 +10,15 @@ import {
   assertCanAccessClient,
   relatedClientWhere,
 } from '../common/ownership-scope';
+import {
+  CLOSED_POSITION_EPSILON,
+  POSITION_MOVING_TYPES,
+  ReplayedPosition,
+  derive,
+  replayLots,
+} from '../holdings/ledger-replay';
+
+type PositionKey = { clientId: string; ticker: string | null };
 
 /**
  * Prisma stores SCREAMING_CASE enums; the HTTP contract is lowercase — the same
@@ -198,12 +207,9 @@ export class TransactionsService {
    *    patch is assembled key by key, and an explicit `null` on a nullable
    *    field is preserved as a genuine "clear this".
    *
-   * Nothing recalculates here, deliberately. Holdings and every return figure
-   * are derived by replaying this ledger (see HoldingsService's reconstruction
-   * and analytics/calculators/flows.ts), so the corrected row is picked up on
-   * the next read — exactly as it is after a delete. Writing a Holding patch
-   * from this method would put a second, divergent source of truth next to the
-   * replay.
+   * Return figures replay this ledger on every read, but the Holdings page
+   * reads the stored Holding row, so the edit is carried onto it through
+   * syncHoldings() — as a delete is.
    */
   async update(id: string, dto: UpdateTransactionDto, actor: Actor) {
     const data: Prisma.TransactionUncheckedUpdateManyInput = {};
@@ -226,10 +232,24 @@ export class TransactionsService {
       return current;
     }
 
-    const { count } = await this.prisma.transaction.updateMany({
+    const existing = await this.prisma.transaction.findFirst({
       where: { id, ...relatedClientWhere(actor) },
-      data,
+      select: { clientId: true, ticker: true },
     });
+    if (!existing) throw new NotFoundException('Transaction not found');
+
+    // A changed ticker moves the trade between two positions; both are synced.
+    const positions: PositionKey[] = [existing];
+    if (typeof dto.ticker === 'string') {
+      positions.push({ clientId: existing.clientId, ticker: dto.ticker });
+    }
+
+    const { count } = await this.syncHoldings(positions, () =>
+      this.prisma.transaction.updateMany({
+        where: { id, ...relatedClientWhere(actor) },
+        data,
+      }),
+    );
     if (count === 0) throw new NotFoundException('Transaction not found');
 
     // Re-read rather than trusting the patch: `updateMany` returns a count, not
@@ -249,9 +269,16 @@ export class TransactionsService {
    * indistinguishable 404 the rest of the codebase gives.
    */
   async remove(id: string, actor: Actor) {
-    const { count } = await this.prisma.transaction.deleteMany({
-      where: { id, ...relatedClientWhere(actor) },
+    const where = { id, ...relatedClientWhere(actor) };
+    const existing = await this.prisma.transaction.findFirst({
+      where,
+      select: { clientId: true, ticker: true },
     });
+    if (!existing) throw new NotFoundException('Transaction not found');
+
+    const { count } = await this.syncHoldings([existing], () =>
+      this.prisma.transaction.deleteMany({ where }),
+    );
     if (count === 0) throw new NotFoundException('Transaction not found');
     return { success: true, id };
   }
@@ -271,14 +298,98 @@ export class TransactionsService {
     // Duplicate ids in the payload would inflate nothing (deleteMany counts
     // rows, not ids), but they do bloat the IN list for no gain.
     const unique = [...new Set(ids)];
+    const where = { id: { in: unique }, ...relatedClientWhere(actor) };
 
-    const { count } = await this.prisma.transaction.deleteMany({
-      where: { id: { in: unique }, ...relatedClientWhere(actor) },
+    const positions = await this.prisma.transaction.findMany({
+      where,
+      select: { clientId: true, ticker: true },
     });
+
+    const { count } = await this.syncHoldings(positions, () =>
+      this.prisma.transaction.deleteMany({ where }),
+    );
 
     if (count === 0) throw new NotFoundException('No matching transactions found');
 
     return { success: true, requested: unique.length, deleted: count };
+  }
+
+  /**
+   * Runs a ledger write, then moves each affected stored Holding by exactly
+   * what that write changed.
+   *
+   * The Holdings page reads the stored Holding row, not a replay. Before this,
+   * deleting a duplicate trade here cleaned the ledger but left the position
+   * doubled. That is how Prashant Salecha HUF's 2-Sep blotter stayed at
+   * 2x on the Holdings page after its duplicate rows were deleted.
+   *
+   * Only the DIFFERENCE is applied: the position's ledger is replayed before
+   * and after the write, and the change goes onto the stored row. A full
+   * rebuild (HoldingsService.recomputeFromLedger) would be simpler, but some
+   * positions' ledgers do not sum to their Holding yet — e.g. US books
+   * opened from a baseline with no matching trades — and a rebuild would
+   * overwrite those positions' quantity with the ledger's. A difference
+   * leaves that gap as it was and still undoes exactly the trade removed.
+   */
+  private async syncHoldings<T>(positions: PositionKey[], write: () => Promise<T>): Promise<T> {
+    const keys = new Map<string, { clientId: string; ticker: string }>();
+    for (const p of positions) {
+      if (p.ticker) keys.set(`${p.clientId}|${p.ticker}`, { clientId: p.clientId, ticker: p.ticker });
+    }
+
+    const targets = [...keys.values()];
+    const before = await Promise.all(targets.map((k) => this.replayPosition(k)));
+    const result = await write();
+    for (let i = 0; i < targets.length; i++) {
+      await this.applyLedgerChange(targets[i], before[i], await this.replayPosition(targets[i]));
+    }
+    return result;
+  }
+
+  private async replayPosition({ clientId, ticker }: { clientId: string; ticker: string }) {
+    const lots = await this.prisma.transaction.findMany({
+      where: { clientId, ticker, type: { in: POSITION_MOVING_TYPES } },
+      orderBy: { date: 'asc' },
+    });
+    return replayLots(lots);
+  }
+
+  private async applyLedgerChange(
+    { clientId, ticker }: { clientId: string; ticker: string },
+    before: ReplayedPosition,
+    after: ReplayedPosition,
+  ) {
+    const dq = after.quantity - before.quantity;
+    const dc = after.costBasis - before.costBasis;
+    const dr = after.realizedPnL - before.realizedPnL;
+    // A dividend or fee row moves no position; don't bump the row's updatedAt.
+    if (Math.abs(dq) < CLOSED_POSITION_EPSILON && Math.abs(dc) < 1e-6 && Math.abs(dr) < 1e-6) {
+      return;
+    }
+
+    // A position deleted on the Holdings page has nothing left to correct.
+    const holding = await this.prisma.holding.findFirst({ where: { clientId, ticker } });
+    if (!holding) return;
+
+    let quantity = holding.quantity + dq;
+    let costBasis = holding.quantity * holding.averageCost + dc;
+    // Also catches a stored row smaller than the trade removed from it, which
+    // would otherwise go negative.
+    if (quantity < CLOSED_POSITION_EPSILON) {
+      quantity = 0;
+      costBasis = 0;
+    }
+    const averageCost = quantity > 0 ? costBasis / quantity : 0;
+
+    await this.prisma.holding.update({
+      where: { id: holding.id },
+      data: {
+        quantity,
+        averageCost,
+        realizedPnL: holding.realizedPnL + dr,
+        ...derive(quantity, averageCost, holding.currentPrice),
+      },
+    });
   }
 
   async getClientCashFlow(clientId: string, actor: Actor) {

@@ -107,7 +107,8 @@ describe('TransactionsService.update', () => {
     const findUnique = jest.fn().mockResolvedValue(row);
     const findFirst = jest.fn().mockResolvedValue(row);
     const prisma = {
-      transaction: { updateMany, findUnique, findFirst },
+      // An empty ledger replays to nothing, so no Holding sync is attempted.
+      transaction: { updateMany, findUnique, findFirst, findMany: jest.fn().mockResolvedValue([]) },
     } as unknown as PrismaService;
     return { service: new TransactionsService(prisma), updateMany, findUnique, findFirst };
   }
@@ -185,5 +186,108 @@ describe('TransactionsService.update', () => {
     // the caller splices this whole record into its table.
     expect(updated.type).toBe('buy');
     expect(updated.ticker).toBe('ICICIBANK.NS');
+  });
+});
+
+/**
+ * The Holdings page reads the stored Holding row, so a Transactions-page delete
+ * or edit has to carry onto it. Deleting a duplicate import used to clean the
+ * ledger and leave the position doubled.
+ */
+describe('TransactionsService — Holding sync', () => {
+  type Row = { id: string; clientId: string; ticker: string; type: string; quantity: number; amount: number; date: Date };
+
+  function build(rows: Row[], holding: any) {
+    let ledger = [...rows];
+    const holdingUpdate = jest.fn(async ({ data }) => Object.assign(holding, data));
+    const ids = (where: any): string[] => (where.id?.in ?? [where.id]);
+    const prisma = {
+      transaction: {
+        findFirst: jest.fn(async ({ where }) => ledger.find((r) => r.id === where.id) ?? null),
+        findMany: jest.fn(async ({ where }) =>
+          where.id
+            ? ledger.filter((r) => ids(where).includes(r.id))
+            : ledger
+                .filter((r) => r.clientId === where.clientId && r.ticker === where.ticker && where.type.in.includes(r.type))
+                .sort((a, b) => a.date.getTime() - b.date.getTime()),
+        ),
+        deleteMany: jest.fn(async ({ where }) => {
+          const before = ledger.length;
+          ledger = ledger.filter((r) => !ids(where).includes(r.id));
+          return { count: before - ledger.length };
+        }),
+        updateMany: jest.fn(async ({ where, data }) => {
+          const r = ledger.find((x) => x.id === where.id);
+          if (r) Object.assign(r, data);
+          return { count: r ? 1 : 0 };
+        }),
+        findUnique: jest.fn(async ({ where }) => ledger.find((r) => r.id === where.id) ?? null),
+      },
+      holding: {
+        findFirst: jest.fn(async ({ where }) =>
+          holding && holding.clientId === where.clientId && holding.ticker === where.ticker ? holding : null,
+        ),
+        update: holdingUpdate,
+      },
+    } as unknown as PrismaService;
+    return { service: new TransactionsService(prisma), holdingUpdate };
+  }
+
+  const buy = (id: string, quantity: number, amount: number, date: string): Row => ({
+    id, clientId: 'c1', ticker: 'AXISBANK.NS', type: 'BUY', quantity, amount, date: new Date(date),
+  });
+
+  it('takes a deleted duplicate buy back out of the stored position', async () => {
+    // Prashant Salecha HUF: the 2-Sep blotter imported twice, 142 shares held.
+    const holding = { id: 'h1', clientId: 'c1', ticker: 'AXISBANK.NS', quantity: 142, averageCost: 1265, currentPrice: 1217, realizedPnL: 0 };
+    const { service } = build([buy('a', 71, 89815, '2026-09-02'), buy('b', 71, 89815, '2026-09-02')], holding);
+
+    await service.removeMany(['b'], SUPER_ADMIN);
+
+    expect(holding.quantity).toBeCloseTo(71, 9);
+    expect(holding.averageCost).toBeCloseTo(1265, 9);
+    expect((holding as any).marketValue).toBeCloseTo(71 * 1217, 6);
+  });
+
+  it('moves a drifted position by the change only, never rebuilding it', async () => {
+    // Stored 200 against a ledger of 150: a 50-share gap the ledger cannot
+    // explain. Deleting a 50-share buy must leave 150, not the ledger's 100.
+    const holding = { id: 'h1', clientId: 'c1', ticker: 'AXISBANK.NS', quantity: 200, averageCost: 100, currentPrice: 100, realizedPnL: 0 };
+    const { service } = build([buy('a', 100, 10_000, '2026-07-01'), buy('b', 50, 5_000, '2026-08-01')], holding);
+
+    await service.remove('b', SUPER_ADMIN);
+
+    expect(holding.quantity).toBeCloseTo(150, 9);
+    expect(holding.averageCost).toBeCloseTo(100, 9);
+  });
+
+  it('carries an edited quantity onto the position', async () => {
+    const holding = { id: 'h1', clientId: 'c1', ticker: 'AXISBANK.NS', quantity: 71, averageCost: 1265, currentPrice: 1265, realizedPnL: 0 };
+    const { service } = build([buy('a', 71, 89815, '2026-09-02')], holding);
+
+    await service.update('a', { quantity: 70, amount: 88550 }, SUPER_ADMIN);
+
+    expect(holding.quantity).toBeCloseTo(70, 9);
+    expect(holding.averageCost).toBeCloseTo(1265, 9);
+  });
+
+  it('leaves the position alone when the deleted row moved no shares', async () => {
+    const holding = { id: 'h1', clientId: 'c1', ticker: 'AXISBANK.NS', quantity: 71, averageCost: 1265, currentPrice: 1265, realizedPnL: 0 };
+    const div: Row = { id: 'd', clientId: 'c1', ticker: 'AXISBANK.NS', type: 'DIVIDEND', quantity: 0, amount: 50, date: new Date('2026-10-01') };
+    const { service, holdingUpdate } = build([buy('a', 71, 89815, '2026-09-02'), div], holding);
+
+    await service.remove('d', SUPER_ADMIN);
+
+    expect(holdingUpdate).not.toHaveBeenCalled();
+  });
+
+  it('closes, rather than inverts, a position smaller than the trade removed', async () => {
+    const holding = { id: 'h1', clientId: 'c1', ticker: 'AXISBANK.NS', quantity: 30, averageCost: 1265, currentPrice: 1265, realizedPnL: 0 };
+    const { service } = build([buy('a', 71, 89815, '2026-09-02')], holding);
+
+    await service.remove('a', SUPER_ADMIN);
+
+    expect(holding.quantity).toBe(0);
+    expect(holding.averageCost).toBe(0);
   });
 });

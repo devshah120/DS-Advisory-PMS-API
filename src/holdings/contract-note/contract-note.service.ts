@@ -3,6 +3,7 @@ import { PrismaService } from '../../common/prisma/prisma.service';
 import { Actor, assertCanAccessClient, clientWhere } from '../../common/ownership-scope';
 import { normalizeSymbol } from '../../common/market-scope';
 import { HoldingsService } from '../holdings.service';
+import { istDay } from '../ledger-replay';
 import { BulkImportRowResult, BulkImportSummary } from '../dto/bulk-import-result.dto';
 import { CommitContractNoteDto } from '../dto/commit-contract-note.dto';
 import { PdfPasswordError, extractPositionedText } from './pdf-text';
@@ -19,19 +20,6 @@ export interface ContractNotePreview extends Omit<ParsedContractNote, 'trades'> 
   /** Set only when exactly one of the caller's Indian clients claims the code. */
   suggestedClientId: string | null;
 }
-
-/** IST is UTC+5:30 with no DST — see istDay(). */
-const IST_OFFSET_MS = 330 * 60 * 1000;
-
-/**
- * The Indian calendar day a ledger date falls on.
- *
- * Manual entries are stored two ways — UTC midnight of the trade date, and IST
- * midnight (18:30 UTC the evening before) — so comparing raw UTC days would
- * miss every row of the second kind. Shifted into IST, both land on the trade
- * date.
- */
-const istDay = (d: Date) => new Date(d.getTime() + IST_OFFSET_MS).toISOString().slice(0, 10);
 
 /**
  * Turns a broker's contract note into ledger trades, in two steps.
