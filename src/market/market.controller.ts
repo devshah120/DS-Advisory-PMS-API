@@ -30,6 +30,16 @@ export class MarketController {
     return this.marketService.lookup(ticker, market ? parseMarket(market) : undefined);
   }
 
+  /**
+   * Market capitalisation (INR) per symbol, for the small/mid/large-cap table
+   * on the holdings export. `symbols` is comma-separated, fully-qualified
+   * Yahoo tickers ('RELIANCE.NS,AIMTRON-SM.NS,AAPL').
+   */
+  @Get('market-caps')
+  marketCaps(@Query('symbols') symbols = '') {
+    return this.marketService.marketCaps(symbols.split(','));
+  }
+
   @Get('history/:ticker')
   history(@Param('ticker') ticker: string, @Query('from') from: string) {
     return this.marketService.history(ticker, from);

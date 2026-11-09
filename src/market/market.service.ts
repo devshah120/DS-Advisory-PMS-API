@@ -1,4 +1,4 @@
-import { Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException, ServiceUnavailableException } from '@nestjs/common';
 import { FALLBACK_SYMBOLS, SymbolProfile, deriveTheme } from './symbol-fallback';
 import {
   Market,
@@ -43,8 +43,47 @@ export interface DayChange {
   changePercent: number;
 }
 
+/** A security's market capitalisation, for the size-band (small/mid/large cap) split. */
+export interface MarketCapQuote {
+  /**
+   * Market capitalisation in INR (the firm's bands are set in crore), converted
+   * from the listing's own currency where that isn't INR. Null when Yahoo
+   * reports none: ETFs and funds, and symbols it doesn't know.
+   */
+  marketCapInr: number | null;
+  /** The currency Yahoo reported the cap in before conversion; null with no cap. */
+  currency: string | null;
+  /** Yahoo's quoteType for the symbol as held ('EQUITY', 'ETF', 'MUTUALFUND'…). */
+  quoteType: string | null;
+}
+
+/** One row of Yahoo's v7 batch quote, reduced to what the size bands need. */
+interface YahooQuote {
+  marketCap: number | null;
+  currency: string | null;
+  quoteType: string | null;
+  price: number | null;
+}
+
 const YAHOO = 'https://query2.finance.yahoo.com';
 const REQUEST_TIMEOUT_MS = 6000;
+/** Symbols per v7 quote request; Yahoo accepts more, but long URLs start failing. */
+const QUOTE_BATCH_SIZE = 50;
+/** Upper bound on one market-caps call, comfortably above the largest household. */
+const MAX_MARKET_CAP_SYMBOLS = 300;
+
+/**
+ * Where else to look when the held symbol carries no market cap. Yahoo quotes
+ * an NSE Emerge listing live as 'AIMTRON-SM.NS' but reports its market cap only
+ * on the bare 'AIMTRON.NS'; a BSE-only smallcap stored under '.NS' has its
+ * figures on '.BO' (the same retry `lookup` and `history` apply).
+ */
+function marketCapAlternates(symbol: string): string[] {
+  const emerge = EMERGE_SYMBOL.exec(symbol);
+  if (emerge) return [`${emerge[1]}.NS`, `${emerge[1]}.BO`];
+  if (symbol.endsWith('.NS')) return [`${symbol.slice(0, -3)}.BO`];
+  return [];
+}
 
 // Yahoo rejects requests that don't look like a browser.
 const UA =
@@ -105,6 +144,12 @@ export class MarketService {
   // one dashboard load fires, short enough that the board stays current.
   private readonly dayChangeCache = new Map<string, { value: DayChange; expiresAt: number }>();
   private static readonly DAY_CHANGE_CACHE_TTL_MS = 60 * 1000;
+
+  // A market cap moves with the price, but the size bands it feeds are an
+  // order of magnitude wide — hours-old figures classify the same stock the
+  // same way, and an export of a 60-name household shouldn't refetch them all.
+  private readonly marketCapCache = new Map<string, { value: MarketCapQuote; expiresAt: number }>();
+  private static readonly MARKET_CAP_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 
   // `quoteSummary` requires a cookie+crumb pair; both are reusable for a while.
   private session: { cookie: string; crumb: string; expiresAt: number } | null = null;
@@ -371,6 +416,142 @@ export class MarketService {
       expiresAt: Date.now() + MarketService.DAY_CHANGE_CACHE_TTL_MS,
     });
     return value;
+  }
+
+  /**
+   * Market capitalisation in INR for each symbol, keyed by the symbol as asked.
+   *
+   * Every symbol in the request gets an entry; one Yahoo has no cap for comes
+   * back with `marketCapInr: null` rather than being dropped, so the caller can
+   * tell "no figure" (an ETF) from "not asked". Throws only when Yahoo could
+   * not be reached at all, so an outage never reads as a book of ETFs.
+   */
+  async marketCaps(rawSymbols: string[]): Promise<Record<string, MarketCapQuote>> {
+    const symbols = [
+      ...new Set(rawSymbols.map((s) => s.trim().toUpperCase()).filter(Boolean)),
+    ].slice(0, MAX_MARKET_CAP_SYMBOLS);
+
+    const out: Record<string, MarketCapQuote> = {};
+    const pending: string[] = [];
+    for (const symbol of symbols) {
+      const cached = this.marketCapCache.get(symbol);
+      if (cached && cached.expiresAt > Date.now()) out[symbol] = cached.value;
+      else pending.push(symbol);
+    }
+    if (pending.length === 0) return out;
+
+    const primary = await this.yahooQuotes(pending);
+    if (!primary) {
+      throw new ServiceUnavailableException('Market capitalisation data is unavailable right now');
+    }
+
+    const alternates = new Map<string, string[]>();
+    for (const symbol of pending) {
+      if (primary.get(symbol)?.marketCap) continue;
+      const alts = marketCapAlternates(symbol);
+      if (alts.length) alternates.set(symbol, alts);
+    }
+    const secondary =
+      alternates.size > 0
+        ? ((await this.yahooQuotes([...new Set([...alternates.values()].flat())])) ?? new Map())
+        : new Map<string, YahooQuote>();
+
+    const resolved = pending.map((symbol) => {
+      const own = primary.get(symbol);
+      const source = own?.marketCap
+        ? own
+        : (alternates.get(symbol) ?? []).map((a) => secondary.get(a)).find((q) => q?.marketCap);
+      return { symbol, own, source };
+    });
+
+    const foreign = new Set(
+      resolved
+        .map((r) => r.source?.currency)
+        .filter((c): c is string => !!c && c !== 'INR'),
+    );
+    const toInr = await this.inrRates(foreign);
+
+    for (const { symbol, own, source } of resolved) {
+      const rate = source?.currency === 'INR' ? 1 : source?.currency ? toInr.get(source.currency) : undefined;
+      const value: MarketCapQuote = {
+        marketCapInr: source?.marketCap && rate ? source.marketCap * rate : null,
+        currency: source?.marketCap ? source.currency : null,
+        // The held symbol's own type — an alternate can disagree (Yahoo types
+        // the bare 'AIMTRON.NS' as MUTUALFUND while its Emerge line is EQUITY).
+        quoteType: own?.quoteType ?? source?.quoteType ?? null,
+      };
+      out[symbol] = value;
+      // Only an answer is cached. A symbol Yahoo didn't return this time may
+      // well resolve on the next export, and caching its absence would pin it
+      // as unclassified for hours.
+      if (own || value.marketCapInr != null) {
+        this.marketCapCache.set(symbol, {
+          value,
+          expiresAt: Date.now() + MarketService.MARKET_CAP_CACHE_TTL_MS,
+        });
+      }
+    }
+    return out;
+  }
+
+  /** INR per unit of each currency, from Yahoo's '<CCY>INR=X' pairs; missing pairs are omitted. */
+  private async inrRates(currencies: Set<string>): Promise<Map<string, number>> {
+    const rates = new Map<string, number>();
+    if (currencies.size === 0) return rates;
+    const quotes = await this.yahooQuotes([...currencies].map((c) => `${c}INR=X`));
+    for (const currency of currencies) {
+      const price = quotes?.get(`${currency}INR=X`)?.price;
+      if (price && price > 0) rates.set(currency, price);
+    }
+    return rates;
+  }
+
+  /**
+   * Yahoo's v7 batch quote for `symbols`, keyed by upper-cased symbol. Symbols
+   * Yahoo doesn't know are simply absent. Null only when no batch could be
+   * fetched at all — the session couldn't be minted or every request failed.
+   */
+  private async yahooQuotes(symbols: string[]): Promise<Map<string, YahooQuote> | null> {
+    const quotes = new Map<string, YahooQuote>();
+    let answered = false;
+
+    for (let i = 0; i < symbols.length; i += QUOTE_BATCH_SIZE) {
+      const batch = symbols.slice(i, i + QUOTE_BATCH_SIZE);
+      // The crumb is cached for half an hour, and Yahoo can retire it sooner.
+      // A rejected crumb looks like any other failure, so mint a fresh session
+      // and retry the batch once before giving up on it.
+      let data = await this.fetchQuoteBatch(batch);
+      if (!data) {
+        this.session = null;
+        data = await this.fetchQuoteBatch(batch);
+      }
+      const rows: any[] | undefined = data?.quoteResponse?.result;
+      if (!Array.isArray(rows)) continue;
+      answered = true;
+
+      for (const q of rows) {
+        if (typeof q?.symbol !== 'string') continue;
+        const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : null);
+        quotes.set(q.symbol.toUpperCase(), {
+          marketCap: num(q.marketCap),
+          currency: typeof q.currency === 'string' ? q.currency : null,
+          quoteType: typeof q.quoteType === 'string' ? q.quoteType : null,
+          price: num(q.regularMarketPrice),
+        });
+      }
+    }
+    return answered ? quotes : null;
+  }
+
+  private async fetchQuoteBatch(symbols: string[]): Promise<any | null> {
+    const session = await this.getSession();
+    if (!session) return null;
+    return this.fetchJson(
+      `${YAHOO}/v7/finance/quote?symbols=${encodeURIComponent(symbols.join(','))}` +
+        `&fields=marketCap,currency,quoteType,regularMarketPrice` +
+        `&crumb=${encodeURIComponent(session.crumb)}`,
+      { Cookie: session.cookie },
+    );
   }
 
   private fromFallback(ticker: string): LookupResult | null {
