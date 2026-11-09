@@ -18,6 +18,23 @@ export type Market = 'US' | 'INDIA';
 
 export const DEFAULT_MARKET: Market = 'US';
 
+/**
+ * One index a client can be benchmarked against.
+ *
+ * `fxSymbol` re-expresses a foreign index in this book's currency: the
+ * benchmark's close on a date is `symbol`'s close × `fxSymbol`'s close. An
+ * Indian mandate measured against the S&P 500 is a rupee portfolio, so the
+ * honest comparison is what a rupee invested in the S&P became — index move
+ * AND the rupee's move against the dollar. Comparing against the dollar index
+ * would fold a 2–4% a year currency drift into "alpha".
+ */
+export interface BenchmarkDefinition {
+  code: string;
+  label: string;
+  symbol: string;
+  fxSymbol?: string;
+}
+
 export interface MarketDefinition {
   code: Market;
   label: string;
@@ -34,6 +51,12 @@ export interface MarketDefinition {
   suffixes: string[];
   /** Indices shown on the dashboard's market strip for this book. */
   indices: ReadonlyArray<{ code: string; label: string; symbol: string }>;
+  /**
+   * Benchmarks a client in this book can be measured against beyond the strip's
+   * `indices` — kept apart so adding a benchmark doesn't add a tile to the
+   * dashboard or the watchlist. See `benchmarksFor`.
+   */
+  extraBenchmarks: ReadonlyArray<BenchmarkDefinition>;
   /**
    * Commodities are quoted in USD globally. The Indian book still shows them —
    * a PM watches gold regardless of book — but they are flagged so the UI can
@@ -84,6 +107,7 @@ export const MARKETS: Record<Market, MarketDefinition> = {
       { code: 'DOWJONES', label: 'Dow Jones', symbol: '^DJI' },
       { code: 'RUSSELL2000', label: 'Russell 2000', symbol: '^RUT' },
     ],
+    extraBenchmarks: [],
     commodities: COMMODITIES,
     defaultBenchmark: { code: 'SP500', name: 'S&P 500', symbol: '^GSPC' },
     // Calendar year: opens 1 January, named for the year it runs in.
@@ -100,6 +124,14 @@ export const MARKETS: Record<Market, MarketDefinition> = {
       { code: 'SENSEX', label: 'Sensex', symbol: '^BSESN' },
       { code: 'BANKNIFTY', label: 'Nifty Bank', symbol: '^NSEBANK' },
       { code: 'NIFTYMIDCAP', label: 'Nifty Midcap 50', symbol: '^NSEMDCP50' },
+    ],
+    extraBenchmarks: [
+      // The broad market — the fairer yardstick for a book that runs well
+      // into mid and small caps, which the 50 large caps of the Nifty miss.
+      { code: 'NIFTY500', label: 'Nifty 500', symbol: '^CRSLDX' },
+      // For mandates with US exposure. A distinct code from the US book's
+      // 'SP500' because it is a different series: the index in rupees.
+      { code: 'SP500_INR', label: 'S&P 500 (INR)', symbol: '^GSPC', fxSymbol: 'USDINR=X' },
     ],
     commodities: COMMODITIES,
     defaultBenchmark: { code: 'NIFTY50', name: 'Nifty 50', symbol: '^NSEI' },
@@ -137,8 +169,21 @@ export function marketForSymbol(symbol: string): Market {
   return MARKETS.INDIA.suffixes.some((suffix) => s.endsWith(suffix)) ? 'INDIA' : 'US';
 }
 
+/**
+ * Every benchmark a client in `market` may be measured against: the strip's
+ * indices plus the book's extra benchmarks. This — not `indices` — is the list
+ * the client form offers and the clients service validates against.
+ */
+export function benchmarksFor(market: Market): BenchmarkDefinition[] {
+  return [...MARKETS[market].indices, ...MARKETS[market].extraBenchmarks];
+}
+
+// A converted benchmark (fxSymbol set) borrows another market's index symbol —
+// '^GSPC' stays a US symbol even though an Indian book benchmarks against it.
 const INDIAN_INDEX_SYMBOLS = new Set(
-  MARKETS.INDIA.indices.map((i) => i.symbol.toUpperCase()),
+  benchmarksFor('INDIA')
+    .filter((b) => !b.fxSymbol)
+    .map((i) => i.symbol.toUpperCase()),
 );
 
 /**

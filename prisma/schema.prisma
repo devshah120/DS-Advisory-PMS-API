@@ -727,6 +727,11 @@ model Benchmark {
   name      String
   /// Join key into PriceBar.symbol.
   symbol    String
+  /// Set when the index is quoted in another book's currency (S&P 500 for an
+  /// Indian mandate): the benchmark's close on a date is symbol's close ×
+  /// fxSymbol's close ('USDINR=X'), so a rupee portfolio is measured against
+  /// the index in rupees. Null for an index in the book's own currency.
+  fxSymbol  String?
   /// Which book this benchmark belongs to, so the client form offers Nifty/Sensex
   /// for an Indian mandate and the S&P/Nasdaq for a US one. `isDefault` is scoped
   /// by market too — each book has its own default (S&P 500 / Nifty 50).

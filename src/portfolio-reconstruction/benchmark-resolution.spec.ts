@@ -15,24 +15,26 @@
  * The resolver is private to two services, so these tests exercise the rule
  * itself against a fake benchmark table. Pure logic, no database.
  */
-import { ALL_MARKETS, MARKETS, Market } from '../common/market-scope';
+import { ALL_MARKETS, MARKETS, Market, benchmarksFor } from '../common/market-scope';
 
 interface FakeBenchmark {
   id: string;
   code: string;
   symbol: string;
+  fxSymbol: string | null;
   market: Market;
   isDefault: boolean;
 }
 
 /** The seeded table, as `npm run seed:market-benchmarks` produces it. */
 const SEEDED: FakeBenchmark[] = ALL_MARKETS.flatMap((market) =>
-  MARKETS[market].indices.map((index) => ({
+  benchmarksFor(market).map((index) => ({
     id: `id-${index.code}`,
     code: index.code,
     symbol: index.symbol,
+    fxSymbol: index.fxSymbol ?? null,
     market,
-    isDefault: index.symbol === MARKETS[market].defaultBenchmark.symbol,
+    isDefault: index.code === MARKETS[market].defaultBenchmark.code,
   })),
 );
 
@@ -104,6 +106,29 @@ describe('benchmark resolution is scoped to the client’s market', () => {
     const sensex = SEEDED.find((b) => b.code === 'SENSEX')!;
     const bm = resolveBenchmark(SEEDED, undefined, sensex.id, 'INDIA');
     expect(bm?.code).toBe('SENSEX');
+  });
+
+  it('offers an Indian mandate the Nifty 500', () => {
+    const nifty500 = SEEDED.find((b) => b.code === 'NIFTY500')!;
+    const bm = resolveBenchmark(SEEDED, undefined, nifty500.id, 'INDIA');
+    expect(bm).toMatchObject({ code: 'NIFTY500', symbol: '^CRSLDX', market: 'INDIA', fxSymbol: null });
+  });
+
+  /**
+   * The S&P 500 for an Indian mandate is the INDIAN book's own row, converted
+   * to rupees — not the US book's dollar 'SP500'. Choosing it keeps the
+   * resolved benchmark in the client's market, the invariant above.
+   */
+  it('gives an Indian mandate that chose the S&P 500 the rupee series', () => {
+    const spInr = SEEDED.find((b) => b.code === 'SP500_INR')!;
+    const bm = resolveBenchmark(SEEDED, undefined, spInr.id, 'INDIA');
+    expect(bm).toMatchObject({ symbol: '^GSPC', fxSymbol: 'USDINR=X', market: 'INDIA' });
+  });
+
+  /** Sharing '^GSPC' with the US default must not make the rupee S&P a default. */
+  it('keeps the Nifty 50 as the Indian default alongside the rupee S&P 500', () => {
+    expect(SEEDED.find((b) => b.code === 'SP500_INR')?.isDefault).toBe(false);
+    expect(resolveBenchmark(SEEDED, undefined, null, 'INDIA')?.code).toBe('NIFTY50');
   });
 
   it('honours an explicit code argument above everything else', () => {

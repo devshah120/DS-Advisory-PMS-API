@@ -22,6 +22,7 @@ import { xirr } from '../analytics/calculators/xirr';
 import {
   DEFAULT_MARKET,
   Market,
+  benchmarksFor,
   currencyForMarket,
   marketForSymbol,
 } from '../common/market-scope';
@@ -219,11 +220,14 @@ export class ClientsService {
 
     // A household holds accounts from one book only — see FamiliesService.
     await this.assertFamilyInMarket(dto.familyId, market);
+    const benchmark = await this.benchmarkFor(dto.benchmark, market);
 
     try {
       const client = await this.prisma.client.create({
         data: {
           ...clientData,
+          benchmark: benchmark.code,
+          benchmarkId: benchmark.id,
           ownerId,
           market,
           currency: dto.currency ?? currencyForMarket(market),
@@ -301,6 +305,43 @@ export class ClientsService {
    * means neither entry point — the client form or the family editor — can
    * create the mismatch.
    */
+  /**
+   * The Benchmark row a client's chosen code points at, as the `benchmarkId`
+   * every performance engine joins on.
+   *
+   * The form has always saved only the `benchmark` code, and nothing turned it
+   * into a `benchmarkId` — so once `repair:client-benchmarks` had stamped an id
+   * on a client, choosing a different index in the form changed the label and
+   * nothing else. Resolving it on every save is what makes the dropdown real.
+   *
+   * A code from the other book is refused rather than stored: a USD mandate
+   * measured against the Nifty is the cross-market mismatch
+   * resolveBenchmark's market scoping exists to prevent.
+   */
+  private async benchmarkFor(code: string, market: Market): Promise<{ id: string; code: string }> {
+    const row = await this.prisma.benchmark.findUnique({
+      where: { code },
+      select: { id: true, code: true, name: true, market: true },
+    });
+    if (!row) {
+      throw new BadRequestException({
+        message: 'Please correct the highlighted fields.',
+        errors: {
+          benchmark: benchmarksFor(market).some((b) => b.code === code)
+            ? `"${code}" hasn't been set up on the server yet — run npm run seed:market-benchmarks`
+            : `"${code}" is not a recognised benchmark`,
+        },
+      });
+    }
+    if (row.market !== market) {
+      throw new BadRequestException({
+        message: 'Please correct the highlighted fields.',
+        errors: { benchmark: `${row.name} is a ${row.market} benchmark — this mandate is in the ${market} book` },
+      });
+    }
+    return { id: row.id, code: row.code };
+  }
+
   private async assertFamilyInMarket(familyId: string | null | undefined, market: Market) {
     if (!familyId) return;
 
@@ -459,6 +500,12 @@ export class ClientsService {
     if (dto.familyId !== undefined) {
       await this.assertFamilyInMarket(dto.familyId, current.market as Market);
     }
+    // Same book rule as the family check: validated against the mandate's own
+    // market. Omitted from the payload, the stored benchmark is left alone.
+    const benchmark =
+      dto.benchmark !== undefined
+        ? await this.benchmarkFor(dto.benchmark, current.market as Market)
+        : null;
 
     // Password is edit-optional: a blank/absent value leaves the login unchanged.
     // Never persist it on the client row — hash it into the linked User instead.
@@ -524,6 +571,7 @@ export class ClientsService {
       where: { id },
       data: {
         ...clientData,
+        ...(benchmark ? { benchmark: benchmark.code, benchmarkId: benchmark.id } : {}),
         // Only a Super Admin reaches here with a changed value — the guard at
         // the top of this method already threw for anyone else.
         ...(isFirmWide(actor) && requestedOwnerId !== undefined

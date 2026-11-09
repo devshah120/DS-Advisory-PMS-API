@@ -124,23 +124,33 @@ async function main() {
       return;
     }
 
+    // Every series a benchmark reads: the index itself and, for a converted
+    // benchmark (S&P 500 in INR), its exchange rate — without those FX bars the
+    // benchmark has no close to multiply by. Deduplicated because 'SP500' and
+    // 'SP500_INR' share '^GSPC', and fetching it twice only doubles the writes.
+    const series = new Map<string, string>(); // symbol -> label for the log
     for (const bm of benchmarks) {
-      const before = await prisma.priceBar.count({ where: { symbol: bm.symbol } });
+      if (!series.has(bm.symbol)) series.set(bm.symbol, bm.code);
+      if (bm.fxSymbol && !series.has(bm.fxSymbol)) series.set(bm.fxSymbol, `${bm.code} FX`);
+    }
+
+    for (const [symbol, label] of series) {
+      const before = await prisma.priceBar.count({ where: { symbol } });
       let bars: Bar[];
 
       try {
-        bars = await fetchBars(bm.symbol, from);
+        bars = await fetchBars(symbol, from);
       } catch (err) {
         // One bad symbol must not abort the rest — a half-filled series is still
         // better than none, and the log says exactly which one to chase.
-        console.error(`  ✗ ${bm.code} (${bm.symbol}): ${(err as Error).message}`);
+        console.error(`  ✗ ${label} (${symbol}): ${(err as Error).message}`);
         continue;
       }
 
       for (const bar of bars) {
         await prisma.priceBar.upsert({
-          where: { symbol_date: { symbol: bm.symbol, date: bar.date } },
-          create: { symbol: bm.symbol, source: 'yahoo', ...bar },
+          where: { symbol_date: { symbol, date: bar.date } },
+          create: { symbol, source: 'yahoo', ...bar },
           // Overwrite workbook-sourced rows: Yahoo is the authority for an index
           // close, and leaving a stale hand-entered value next to fresh bars is
           // how a series starts disagreeing with itself.
@@ -148,10 +158,10 @@ async function main() {
         });
       }
 
-      const after = await prisma.priceBar.count({ where: { symbol: bm.symbol } });
+      const after = await prisma.priceBar.count({ where: { symbol } });
       const newest = bars[bars.length - 1];
       console.log(
-        `  ✓ ${bm.code} (${bm.symbol}): ${bars.length} bars from ${from} → ` +
+        `  ✓ ${label} (${symbol}): ${bars.length} bars from ${from} → ` +
           `${before} rows became ${after}. Latest ${newest.date.toISOString().slice(0, 10)} = ${newest.adjClose.toFixed(2)}`,
       );
     }

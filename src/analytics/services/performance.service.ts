@@ -576,8 +576,9 @@ export class PerformanceService {
     const bm = await this.resolveBenchmark(code, benchmarkId, market);
     if (!bm) return null;
 
-    const closes = await this.closesOn(bm.symbol, flows.map((f) => f.date));
-    const terminal = await this.latestBar(bm.symbol);
+    const closes = await this.benchmarkCloses(bm, flows.map((f) => f.date));
+    const terminal = await this.benchmarkLatest(bm);
+    const series = bm.fxSymbol ? `${bm.symbol} or ${bm.fxSymbol}` : bm.symbol;
 
     if (closes.some((c) => c === null) || terminal === null) {
       return {
@@ -587,7 +588,7 @@ export class PerformanceService {
         interim: null,
         units: null,
         value: null,
-        reason: `No price history for ${bm.symbol} covering the flow dates. Load the index series before comparing against it.`,
+        reason: `No price history for ${series} covering the flow dates. Load the index series before comparing against it.`,
       };
     }
 
@@ -629,7 +630,7 @@ export class PerformanceService {
         units: null,
         value: null,
         reason:
-          `${bm.symbol} price history ends ${iso(terminal.date)}, before the last cash flow on ` +
+          `${series} price history ends ${iso(terminal.date)}, before the last cash flow on ` +
           `${iso(lastFlowDate)}. Valuing the benchmark on a stale bar would report a 0% return and ` +
           `turn Alpha into the portfolio return. Run \`npm run backfill:benchmark-bars\` to refresh the index series.`,
       };
@@ -929,5 +930,40 @@ export class PerformanceService {
       select: { date: true, adjClose: true },
     });
     return bar ?? null;
+  }
+
+  /**
+   * A benchmark's level on each date, in the client's currency: the index
+   * close, times the exchange rate's close for a converted benchmark (S&P 500
+   * in INR = ^GSPC × USDINR=X). Kept identical to BenchmarkHistoryService's
+   * `closeOn` so the Current and Historical tabs price the benchmark the same.
+   */
+  private async benchmarkCloses(
+    bm: { symbol: string; fxSymbol: string | null },
+    dates: Date[],
+  ): Promise<Array<number | null>> {
+    const index = await this.closesOn(bm.symbol, dates);
+    if (!bm.fxSymbol) return index;
+    const fx = await this.closesOn(bm.fxSymbol, dates);
+    return index.map((c, i) => (c !== null && fx[i] !== null ? c * (fx[i] as number) : null));
+  }
+
+  /**
+   * The benchmark's newest valuable level. For a converted benchmark both
+   * series must reach the date, so it is the OLDER of the two latest bars —
+   * otherwise a stale FX series would be silently carried forward, and the
+   * staleness guard in `benchmark` (which reads this date) could not see it.
+   */
+  private async benchmarkLatest(
+    bm: { symbol: string; fxSymbol: string | null },
+  ): Promise<{ date: Date; adjClose: number } | null> {
+    const index = await this.latestBar(bm.symbol);
+    if (!index || !bm.fxSymbol) return index;
+    const fx = await this.latestBar(bm.fxSymbol);
+    if (!fx) return null;
+
+    const date = index.date < fx.date ? index.date : fx.date;
+    const [close] = await this.benchmarkCloses(bm, [date]);
+    return close === null ? null : { date, adjClose: close };
   }
 }

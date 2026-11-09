@@ -14,17 +14,20 @@
  *   npm run seed:market-benchmarks
  */
 import { PrismaClient } from '@prisma/client';
-import { ALL_MARKETS, MARKETS } from '../../common/market-scope';
+import { ALL_MARKETS, MARKETS, benchmarksFor } from '../../common/market-scope';
 
 async function main() {
   const prisma = new PrismaClient();
   try {
     for (const market of ALL_MARKETS) {
       const def = MARKETS[market];
-      for (const index of def.indices) {
+      for (const index of benchmarksFor(market)) {
         // isDefault is scoped per market: each book has exactly one default
         // (S&P 500 / Nifty 50), so both can be true without conflicting.
-        const isDefault = index.symbol === def.defaultBenchmark.symbol;
+        // Matched on code, not symbol: the Indian book's 'SP500_INR' shares
+        // '^GSPC' with the US default and must not become a second default.
+        const isDefault = index.code === def.defaultBenchmark.code;
+        const fxSymbol = index.fxSymbol ?? null;
 
         await prisma.benchmark.upsert({
           where: { code: index.code },
@@ -32,12 +35,14 @@ async function main() {
             code: index.code,
             name: index.label,
             symbol: index.symbol,
+            fxSymbol,
             market,
             isDefault,
           },
           update: {
             name: index.label,
             symbol: index.symbol,
+            fxSymbol,
             market,
             isDefault,
           },
@@ -45,8 +50,8 @@ async function main() {
 
         console.log(
           `  · ${market.padEnd(5)} ${index.code.padEnd(12)} ${index.symbol.padEnd(12)} ${
-            isDefault ? '(default)' : ''
-          }`,
+            fxSymbol ? `× ${fxSymbol} ` : ''
+          }${isDefault ? '(default)' : ''}`,
         );
       }
     }

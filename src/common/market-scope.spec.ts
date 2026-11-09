@@ -1,5 +1,7 @@
 import {
+  ALL_MARKETS,
   MARKETS,
+  benchmarksFor,
   currencyForMarket,
   displaySymbol,
   marketForSymbol,
@@ -102,6 +104,29 @@ describe('market definitions', () => {
     for (const def of Object.values(MARKETS)) {
       expect(def.indices.map((i) => i.symbol)).toContain(def.defaultBenchmark.symbol);
     }
+  });
+
+  // Benchmark.code is unique across the whole table, so two books can't both
+  // use 'SP500' — the Indian rupee series needs a code of its own.
+  it('gives every benchmark a code unique across all books', () => {
+    const codes = ALL_MARKETS.flatMap((m) => benchmarksFor(m).map((b) => b.code));
+    expect(new Set(codes).size).toBe(codes.length);
+  });
+
+  // A converted benchmark must land in the book's currency, or the "in INR"
+  // series would be the index times some other rate.
+  it('converts a foreign benchmark into its own book’s currency', () => {
+    for (const def of Object.values(MARKETS)) {
+      for (const b of benchmarksFor(def.code).filter((x) => x.fxSymbol)) {
+        expect(b.fxSymbol).toMatch(new RegExp(`${def.currency}=X$`));
+      }
+    }
+  });
+
+  // Borrowing '^GSPC' for the rupee S&P must not reclassify it as Indian.
+  it('keeps a borrowed foreign index in its home market', () => {
+    expect(marketForSymbol('^GSPC')).toBe('US');
+    expect(marketForSymbol('^CRSLDX')).toBe('INDIA');
   });
 
   it('classifies every index under the market that declares it', () => {

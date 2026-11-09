@@ -46,8 +46,8 @@ export class BenchmarkHistoryService {
     const bm = await this.resolveBenchmark(code, benchmarkId, market);
     if (!bm) return null;
 
-    const closes = await Promise.all(flows.map((f) => this.prices.closeOn(bm.symbol, f.date)));
-    const terminalClose = await this.prices.closeOn(bm.symbol, asOf);
+    const closes = await Promise.all(flows.map((f) => this.closeOn(bm, f.date)));
+    const terminalClose = await this.closeOn(bm, asOf);
 
     if (closes.some((c) => c === null) || terminalClose === null) {
       return {
@@ -55,7 +55,7 @@ export class BenchmarkHistoryService {
         name: bm.name,
         xirr: null,
         interim: null,
-        reason: `No price history for ${bm.symbol} covering this window.`,
+        reason: `No price history for ${bm.fxSymbol ? `${bm.symbol} or ${bm.fxSymbol}` : bm.symbol} covering this window.`,
       };
     }
 
@@ -92,12 +92,32 @@ export class BenchmarkHistoryService {
     const bm = await this.resolveBenchmark(code, benchmarkId, market);
     if (!bm) return null;
 
-    const openClose = await this.prices.closeOn(bm.symbol, from);
-    const closeAtTo = await this.prices.closeOn(bm.symbol, to);
+    const openClose = await this.closeOn(bm, from);
+    const closeAtTo = await this.closeOn(bm, to);
     if (!openClose || !closeAtTo) return null;
 
     const units = openingValue / openClose;
     return units * closeAtTo;
+  }
+
+  /**
+   * The benchmark's level on `date`, in the client's currency: the index close,
+   * times the exchange rate's close on the same date for a converted benchmark
+   * (S&P 500 in INR = ^GSPC × USDINR=X). Null if either series has no close.
+   *
+   * Both legs go through the same on-or-before lookup, so a date that is a
+   * holiday on one exchange but not the other uses each series' own last close
+   * — what a rupee holding of the index would actually have been worth.
+   */
+  private async closeOn(
+    bm: { symbol: string; fxSymbol: string | null },
+    date: Date,
+  ): Promise<number | null> {
+    const [index, fx] = await Promise.all([
+      this.prices.closeOn(bm.symbol, date),
+      bm.fxSymbol ? this.prices.closeOn(bm.fxSymbol, date) : Promise.resolve(1),
+    ]);
+    return index && fx ? index * fx : null;
   }
 
   /**
