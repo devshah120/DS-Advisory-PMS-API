@@ -7,7 +7,7 @@
   "license": "UNLICENSED",
   "scripts": {
     "postinstall": "prisma generate",
-    "prebuild": "rimraf dist tsconfig.tsbuildinfo",
+    "prebuild": "rimraf dist tsconfig.tsbuildinfo && prisma generate",
     "build": "nest build",
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
     "start": "nest start",
@@ -29,6 +29,7 @@
     "inspect:duplicate-families": "ts-node -r tsconfig-paths/register src/analytics/scripts/inspect-duplicate-families.ts",
     "seed:market-benchmarks": "ts-node -r tsconfig-paths/register src/analytics/scripts/seed-market-benchmarks.ts",
     "repair:client-benchmarks": "ts-node -r tsconfig-paths/register src/analytics/scripts/repair-client-benchmarks.ts",
+    "repair:price-bar-ids": "ts-node -r tsconfig-paths/register src/analytics/scripts/repair-price-bar-ids.ts",
     "reconcile:ledger": "ts-node -T --project scripts/tsconfig.json scripts/reconcile-ledger.ts"
   },
   "dependencies": {

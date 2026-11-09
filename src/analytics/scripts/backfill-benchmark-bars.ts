@@ -134,6 +134,7 @@ async function main() {
       if (bm.fxSymbol && !series.has(bm.fxSymbol)) series.set(bm.fxSymbol, `${bm.code} FX`);
     }
 
+    const failed: string[] = [];
     for (const [symbol, label] of series) {
       const before = await prisma.priceBar.count({ where: { symbol } });
       let bars: Bar[];
@@ -143,19 +144,30 @@ async function main() {
       } catch (err) {
         // One bad symbol must not abort the rest — a half-filled series is still
         // better than none, and the log says exactly which one to chase.
+        failed.push(label);
         console.error(`  ✗ ${label} (${symbol}): ${(err as Error).message}`);
         continue;
       }
 
-      for (const bar of bars) {
-        await prisma.priceBar.upsert({
-          where: { symbol_date: { symbol, date: bar.date } },
-          create: { symbol, source: 'yahoo', ...bar },
-          // Overwrite workbook-sourced rows: Yahoo is the authority for an index
-          // close, and leaving a stale hand-entered value next to fresh bars is
-          // how a series starts disagreeing with itself.
-          update: { source: 'yahoo', ...bar },
-        });
+      try {
+        for (const bar of bars) {
+          await prisma.priceBar.upsert({
+            where: { symbol_date: { symbol, date: bar.date } },
+            create: { symbol, source: 'yahoo', ...bar },
+            // Overwrite workbook-sourced rows: Yahoo is the authority for an index
+            // close, and leaving a stale hand-entered value next to fresh bars is
+            // how a series starts disagreeing with itself.
+            update: { source: 'yahoo', ...bar },
+          });
+        }
+      } catch (err) {
+        // A write failure is as local as a fetch failure. Before this, one bad
+        // row in ^DJI (an ObjectId-keyed bar Prisma can't update — see
+        // repair-price-bar-ids.ts) aborted the run, and every series after it,
+        // the Nifty 50 included, silently stopped refreshing for months.
+        failed.push(label);
+        console.error(`  ✗ ${label} (${symbol}): write failed — ${(err as Error).message.split('\n').pop()}`);
+        continue;
       }
 
       const after = await prisma.priceBar.count({ where: { symbol } });
@@ -164,6 +176,13 @@ async function main() {
         `  ✓ ${label} (${symbol}): ${bars.length} bars from ${from} → ` +
           `${before} rows became ${after}. Latest ${newest.date.toISOString().slice(0, 10)} = ${newest.adjClose.toFixed(2)}`,
       );
+    }
+
+    // Continuing past a failure must not read as success: a scheduled run
+    // that exits 0 with a dead series is how the last one went unnoticed.
+    if (failed.length) {
+      console.error(`\n${failed.length} series failed: ${failed.join(', ')}`);
+      process.exitCode = 1;
     }
   } finally {
     await prisma.$disconnect();
