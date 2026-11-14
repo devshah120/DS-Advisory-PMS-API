@@ -137,6 +137,12 @@ export class BenchmarkHistoryService {
    * not been run — a missing benchmark is reported as such rather than being
    * quietly substituted with the other book's index.
    */
+  /** The code the client's stored benchmark (or the book default) resolves to. */
+  async resolveCode(benchmarkId: string | null, market: Market): Promise<string | null> {
+    const bm = await this.resolveBenchmark(undefined, benchmarkId, market);
+    return bm?.code ?? null;
+  }
+
   private async resolveBenchmark(
     code: string | undefined,
     benchmarkId: string | null,

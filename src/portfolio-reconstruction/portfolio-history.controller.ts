@@ -131,6 +131,8 @@ export class PortfolioHistoryController {
     @Query('from') from?: string,
     @Query('to') to?: string,
     @Query('market') market?: string,
+    /** Optional: compare against another benchmark in the client's book (not saved). */
+    @Query('benchmark') benchmark?: string,
   ) {
     await this.assertAccess(clientId, req.user);
 
@@ -151,7 +153,7 @@ export class PortfolioHistoryController {
       market: resolvedMarket,
       clientInception,
     });
-    return this.performanceBaseline.periodReturn(clientId, resolved);
+    return this.performanceBaseline.periodReturn(clientId, resolved, benchmark);
   }
 
   private parseDate(raw: string): Date {

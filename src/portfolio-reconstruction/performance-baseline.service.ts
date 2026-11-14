@@ -1,11 +1,11 @@
-import { Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable } from '@nestjs/common';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { PortfolioHistoryService } from './portfolio-history.service';
 import { BenchmarkHistoryService, BenchmarkWindowResult } from './benchmark-history.service';
 import { CashFlow, xirr } from '../analytics/calculators/xirr';
 import { AccountingMethod, buildWindowFlows, isBulkImportClient } from '../analytics/calculators/flows';
 import { ResolvedPeriod } from './periods';
-import { Market } from '../common/market-scope';
+import { Market, benchmarksFor } from '../common/market-scope';
 
 /**
  * Widened from the original four-value union to any code `resolvePeriod`
@@ -71,6 +71,13 @@ export interface PeriodReturn {
   benchmark: BenchmarkWindowResult | null;
   /** Portfolio − benchmark over this window. Both money-weighted, same flows. */
   alpha: number | null;
+  /**
+   * The benchmark stored on the client (or the book default when none is
+   * stored). Differs from `benchmark.code` when the caller asked to compare
+   * against another index in the same book — the UI uses it to say which one
+   * is the mandate's own and to offer making the comparison the default.
+   */
+  assignedBenchmarkCode: string | null;
 }
 
 /**
@@ -145,7 +152,16 @@ export class PerformanceBaselineService {
    * inception clamp and the open-quarter clamp are applied in exactly one place
    * and this service never has to re-derive a calendar boundary.
    */
-  async periodReturn(clientId: string, resolved: ResolvedPeriod): Promise<PeriodReturn> {
+  async periodReturn(
+    clientId: string,
+    resolved: ResolvedPeriod,
+    /**
+     * Compare against this benchmark code instead of the client's stored one,
+     * for this request only (nothing is saved). Must belong to the client's
+     * own book — an INR mandate cannot be measured against a dollar index.
+     */
+    benchmarkOverride?: string,
+  ): Promise<PeriodReturn> {
     const { from, to } = resolved;
 
     const [client, openingValue, closingPortfolio] = await Promise.all([
@@ -153,6 +169,16 @@ export class PerformanceBaselineService {
       this.openingValue(clientId, from),
       this.history.getPortfolioAsOf(clientId, to),
     ]);
+
+    const market = (client?.market ?? 'US') as Market;
+    const override = benchmarkOverride?.trim().toUpperCase() || undefined;
+    if (override && !benchmarksFor(market).some((b) => b.code === override)) {
+      throw new BadRequestException(
+        `${override} is not a benchmark in the ${market} book. Choose one of: ${benchmarksFor(market)
+          .map((b) => b.code)
+          .join(', ')}`,
+      );
+    }
 
     const closingValue = closingPortfolio.holdingsValue;
     const simpleReturnPct =
@@ -171,15 +197,15 @@ export class PerformanceBaselineService {
     // The client's own book decides the benchmark: an Indian mandate is measured
     // against the Nifty 50, not the S&P 500. Passing market here is what makes
     // the unset-benchmarkId case (every client seeded so far) resolve correctly.
-    const benchmark = client
-      ? await this.benchmarkHistory.windowReturn(
-          undefined,
-          client.benchmarkId,
-          flows,
-          to,
-          client.market as Market,
-        )
-      : null;
+    const [benchmark, assigned] = client
+      ? await Promise.all([
+          this.benchmarkHistory.windowReturn(override, client.benchmarkId, flows, to, market),
+          override
+            ? this.benchmarkHistory.resolveCode(client.benchmarkId, market)
+            : Promise.resolve(null),
+        ])
+      : [null, null];
+    const assignedBenchmarkCode = override ? assigned : benchmark?.code ?? null;
 
     /**
      * The money-weighted return over this window — the headline figure.
@@ -243,6 +269,7 @@ export class PerformanceBaselineService {
         returnPct !== null && benchmark?.interim != null
           ? returnPct - benchmark.interim
           : null,
+      assignedBenchmarkCode,
     };
   }
 
