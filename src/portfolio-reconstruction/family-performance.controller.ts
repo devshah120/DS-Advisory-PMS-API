@@ -105,6 +105,8 @@ export class FamilyPerformanceController {
     @Query('from') from?: string,
     @Query('to') to?: string,
     @Query('market') market?: string,
+    /** Optional: compare against another benchmark in the family's book (not saved). */
+    @Query('benchmark') benchmark?: string,
   ) {
     const [resolvedMarket, householdInception] = await Promise.all([
       this.marketFor(familyId, req.user, market),
@@ -123,7 +125,7 @@ export class FamilyPerformanceController {
       market: resolvedMarket,
       clientInception: householdInception,
     });
-    return this.familyPerformance.periodReturn(familyId, resolved, req.user);
+    return this.familyPerformance.periodReturn(familyId, resolved, req.user, benchmark);
   }
 
   private parseDate(raw: string): Date {

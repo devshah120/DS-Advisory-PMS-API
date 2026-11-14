@@ -1,11 +1,11 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { PortfolioHistoryService } from './portfolio-history.service';
 import { BenchmarkHistoryService, BenchmarkWindowResult } from './benchmark-history.service';
 import { CashFlow, xirr } from '../analytics/calculators/xirr';
 import { AccountingMethod, buildWindowFlows, isBulkImportClient } from '../analytics/calculators/flows';
 import { ResolvedPeriod } from './periods';
-import { Market, currencyForMarket } from '../common/market-scope';
+import { Market, benchmarksFor, currencyForMarket } from '../common/market-scope';
 import { Actor, assertOwns } from '../common/ownership-scope';
 
 /**
@@ -90,6 +90,11 @@ export interface FamilyPeriodReturn {
   /** The household's index over the same window, priced on the same flows. */
   benchmark: BenchmarkWindowResult | null;
   alpha: number | null;
+  /**
+   * The household's own index (the members' shared benchmark, else the book
+   * default). Differs from `benchmark.code` while comparing against another.
+   */
+  assignedBenchmarkCode: string | null;
 
   memberCount: number;
   members: FamilyMemberPerformance[];
@@ -148,6 +153,8 @@ export class FamilyPerformanceService {
     familyId: string,
     resolved: ResolvedPeriod,
     actor: Actor,
+    /** Compare against this code for this request only. Must be in the family's book. */
+    benchmarkOverride?: string,
   ): Promise<FamilyPeriodReturn> {
     const family = await this.prisma.family.findUnique({
       where: { id: familyId },
@@ -175,6 +182,15 @@ export class FamilyPerformanceService {
     const { from, to } = resolved;
     const market = family.market as Market;
     const periodDays = Math.max(1, Math.round((to.getTime() - from.getTime()) / 86_400_000));
+
+    const override = benchmarkOverride?.trim().toUpperCase() || undefined;
+    if (override && !benchmarksFor(market).some((b) => b.code === override)) {
+      throw new BadRequestException(
+        `${override} is not a benchmark in the ${market} book. Choose one of: ${benchmarksFor(market)
+          .map((b) => b.code)
+          .join(', ')}`,
+      );
+    }
 
     if (family.clients.length === 0) {
       return this.emptyHousehold(family, resolved, periodDays, market);
@@ -253,13 +269,14 @@ export class FamilyPerformanceService {
      * NIFTY 50) this is the same index each is measured against on its own
      * page, which keeps a member row and the household row comparable.
      */
-    const benchmark = await this.benchmarkHistory.windowReturn(
-      undefined,
-      this.householdBenchmarkId(family.clients),
-      flows,
-      to,
-      market,
-    );
+    const householdId = this.householdBenchmarkId(family.clients);
+    const [benchmark, assigned] = await Promise.all([
+      this.benchmarkHistory.windowReturn(override, householdId, flows, to, market),
+      override
+        ? this.benchmarkHistory.resolveCode(householdId, market)
+        : Promise.resolve(null),
+    ]);
+    const assignedBenchmarkCode = override ? assigned : benchmark?.code ?? null;
 
     const solved = xirr(flows);
     const annualized = solved.status === 'ok' ? solved.rate : null;
@@ -295,6 +312,7 @@ export class FamilyPerformanceService {
       benchmark,
       alpha:
         returnPct !== null && benchmark?.interim != null ? returnPct - benchmark.interim : null,
+      assignedBenchmarkCode,
       memberCount: family.clients.length,
       members: this.memberRows(measured, lateEntrants, from, to, closingValue),
       lateEntrants,
@@ -496,6 +514,7 @@ export class FamilyPerformanceService {
       simpleReturnPct: null,
       benchmark: null,
       alpha: null,
+      assignedBenchmarkCode: null,
       memberCount: 0,
       members: [],
       lateEntrants: [],
