@@ -2,7 +2,13 @@ import { BadRequestException, Injectable } from '@nestjs/common';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { PortfolioHistoryService } from './portfolio-history.service';
 import { BenchmarkHistoryService, BenchmarkWindowResult } from './benchmark-history.service';
-import { CashFlow, xirr } from '../analytics/calculators/xirr';
+import {
+  CashFlow,
+  capitalStartDate,
+  periodMwrr,
+  wholeDays,
+  xirr,
+} from '../analytics/calculators/xirr';
 import { AccountingMethod, buildWindowFlows, isBulkImportClient } from '../analytics/calculators/flows';
 import { ResolvedPeriod } from './periods';
 import { Market, benchmarksFor } from '../common/market-scope';
@@ -71,6 +77,12 @@ export interface PeriodReturn {
   benchmark: BenchmarkWindowResult | null;
   /** Portfolio − benchmark over this window. Both money-weighted, same flows. */
   alpha: number | null;
+  /**
+   * The same spread on an annualized basis (XIRR p.a. − benchmark XIRR p.a.).
+   * The headline alpha for windows of a year or more, where returns are quoted
+   * per annum; null when either side is not annualizable.
+   */
+  annualizedAlpha: number | null;
   /**
    * The benchmark stored on the client (or the book default when none is
    * stored). Differs from `benchmark.code` when the caller asked to compare
@@ -232,16 +244,19 @@ export class PerformanceBaselineService {
     /**
      * De-annualization mirrors PerformanceService exactly — same formula, same
      * 365-day basis — so the two engines cannot report different numbers for the
-     * same window.
+     * same window. The exponent runs from the day capital first arrived: the
+     * window's start for a book with an opening value, the first purchase for
+     * one funded mid-window (see capitalStartDate).
      */
-    const returnPct =
-      annualized !== null ? (1 + annualized) ** (periodDays / 365) - 1 : null;
+    const capitalFrom = capitalStartDate(flows) ?? from;
+    const returnPct = annualized !== null ? periodMwrr(annualized, capitalFrom, to) : null;
 
     /**
      * Annualizing a short window extrapolates noise: a 2% move over 11 days is
-     * "+95% a year". The same 30-day floor PerformanceService applies.
+     * "+95% a year". The same 30-day floor PerformanceService applies, counted
+     * over the days capital was actually invested.
      */
-    const annualizedReturnPct = periodDays >= 30 ? annualized : null;
+    const annualizedReturnPct = wholeDays(capitalFrom, to) >= 30 ? annualized : null;
 
     const netFlows = flows
       .slice(1, -1)
@@ -268,6 +283,10 @@ export class PerformanceBaselineService {
       alpha:
         returnPct !== null && benchmark?.interim != null
           ? returnPct - benchmark.interim
+          : null,
+      annualizedAlpha:
+        annualizedReturnPct !== null && benchmark?.xirr != null
+          ? annualizedReturnPct - benchmark.xirr
           : null,
       assignedBenchmarkCode,
     };

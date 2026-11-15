@@ -164,6 +164,36 @@ export function interimReturn(flows: CashFlow[]): number {
 }
 
 /**
+ * The date a window's capital actually started earning: the first flow that
+ * moves money. On a book with an opening balance this is the window's own
+ * start; on a book that opened at zero and was funded mid-window it is the
+ * first purchase.
+ *
+ * The distinction decides the de-annualization exponent. An XIRR solved on
+ * money that arrived on day 15 of a 45-day window is a rate earned over 30
+ * days; compounding it back over all 45 overstates the period return (a 8.19%
+ * gain held 30 days reads as ~12.5%). Measuring from here makes a single-deposit
+ * account's period MWRR equal its gain ÷ capital, exactly.
+ */
+export function capitalStartDate(flows: CashFlow[]): Date | null {
+  const sorted = [...flows].sort((a, b) => a.date.getTime() - b.date.getTime());
+  return sorted.find((f) => f.amount !== 0)?.date ?? null;
+}
+
+/** Whole days between two dates, floored at one — the engine's period-length convention. */
+export function wholeDays(from: Date, to: Date): number {
+  return Math.max(1, Math.round((to.getTime() - from.getTime()) / 86_400_000));
+}
+
+/**
+ * An annualized XIRR rate restated as the money-weighted return over the days
+ * capital was actually invested in [start, end]. 365-day basis.
+ */
+export function periodMwrr(annualRate: number, start: Date, end: Date): number {
+  return (1 + annualRate) ** (wholeDays(start, end) / DAYS_PER_YEAR) - 1;
+}
+
+/**
  * Benchmark XIRR by the **unit-purchase** method — the workbook's approach, and
  * the correct one.
  *

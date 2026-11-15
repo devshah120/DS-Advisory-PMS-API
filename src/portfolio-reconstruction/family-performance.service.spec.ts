@@ -33,7 +33,7 @@ interface MemberSpec {
   closing: number;
   createdAt?: Date;
   /** Real cash flows inside the window, as [date, type, amount]. */
-  flows?: Array<[Date, 'CASH_DEPOSIT' | 'CASH_WITHDRAWAL', number]>;
+  flows?: Array<[Date, 'CASH_DEPOSIT' | 'CASH_WITHDRAWAL' | 'BUY' | 'SELL', number]>;
 }
 
 function build(members: MemberSpec[]) {
@@ -218,6 +218,57 @@ describe('FamilyPerformanceService.periodReturn', () => {
     // Still present, and still counted in the household's closing value.
     expect(r.memberCount).toBe(2);
     expect(r.closingValue).toBe(1_600_000);
+  });
+
+  /**
+   * A member with nothing at the window's open whose first purchase falls
+   * inside it. Previously rendered "—" because the solve required an opening
+   * value; it must instead be measured from the day its capital arrived, which
+   * for a single purchase is exactly gain ÷ capital.
+   */
+  it('measures a member funded mid-window from its first purchase', async () => {
+    const firstBuy = new Date('2026-08-31T00:00:00.000Z');
+    const { service } = build([
+      { id: 'c1', name: 'Existing', opening: 1_000_000, closing: 1_050_000 },
+      {
+        id: 'c2',
+        name: 'Preet',
+        opening: 0,
+        closing: 216_138.35,
+        flows: [[firstBuy, 'BUY', 199_770]],
+      },
+    ]);
+
+    const r = await service.periodReturn('fam1', PERIOD, SUPER_ADMIN);
+    const preet = r.members.find((m) => m.clientId === 'c2')!;
+
+    expect(preet.netFlows).toBeCloseTo(199_770, 6);
+    expect(preet.gain).toBeCloseTo(16_368.35, 6);
+    expect(preet.returnPct).toBeCloseTo(16_368.35 / 199_770, 6);
+    expect(preet.sinceDate).toEqual(firstBuy);
+    expect(preet.returnReason).toBeUndefined();
+    // 30 invested days clears the annualization floor.
+    expect(preet.annualizedReturnPct).not.toBeNull();
+    // Not a late entrant: its capital is a recorded purchase, not an imputed arrival.
+    expect(r.lateEntrants).toEqual([]);
+  });
+
+  it('reconciles member gains to the household when an account joins mid-window', async () => {
+    const joined = new Date('2026-09-01T00:00:00.000Z');
+    const { service } = build([
+      { id: 'c1', name: 'Existing', opening: 1_000_000, closing: 1_100_000 },
+      { id: 'c2', name: 'Newcomer', opening: 0, closing: 500_000, createdAt: joined },
+    ]);
+
+    const r = await service.periodReturn('fam1', PERIOD, SUPER_ADMIN);
+    const newcomer = r.members.find((m) => m.clientId === 'c2')!;
+
+    // The arrival is a flow on the member row, exactly as on the household's.
+    expect(newcomer.netFlows).toBeCloseTo(500_000, 6);
+    expect(newcomer.gain).toBeCloseTo(0, 6);
+    expect(newcomer.sinceDate).toEqual(joined);
+    const summed = r.members.reduce((s, m) => s + m.gain, 0);
+    expect(summed).toBeCloseTo(r.closingValue - r.openingValue - r.netFlows, 6);
   });
 
   /**

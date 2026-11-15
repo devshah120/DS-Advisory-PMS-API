@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { HistoricalPriceService } from '../historical-price/historical-price.service';
-import { benchmarkXirr, CashFlow } from '../analytics/calculators/xirr';
+import { benchmarkXirr, capitalStartDate, CashFlow } from '../analytics/calculators/xirr';
 import { DEFAULT_MARKET, MARKETS, Market } from '../common/market-scope';
 
 export interface BenchmarkWindowResult {
@@ -64,10 +64,11 @@ export class BenchmarkHistoryService {
       return { code: bm.code, name: bm.name, xirr: null, interim: null, reason: result.reason };
     }
 
-    const days = Math.max(
-      1,
-      (asOf.getTime() - flows[0].date.getTime()) / 86_400_000,
-    );
+    // From the first flow that moves money, not the window's nominal start, so
+    // a book funded mid-window is compared against the index over the same
+    // invested days the portfolio's own period return uses. See capitalStartDate.
+    const start = capitalStartDate(flows) ?? flows[0].date;
+    const days = Math.max(1, (asOf.getTime() - start.getTime()) / 86_400_000);
     const interim = (1 + result.rate) ** (days / 365) - 1;
 
     return { code: bm.code, name: bm.name, xirr: result.rate, interim };

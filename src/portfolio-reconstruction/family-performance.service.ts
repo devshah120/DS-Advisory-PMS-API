@@ -2,7 +2,13 @@ import { BadRequestException, Injectable, NotFoundException } from '@nestjs/comm
 import { PrismaService } from '../common/prisma/prisma.service';
 import { PortfolioHistoryService } from './portfolio-history.service';
 import { BenchmarkHistoryService, BenchmarkWindowResult } from './benchmark-history.service';
-import { CashFlow, xirr } from '../analytics/calculators/xirr';
+import {
+  CashFlow,
+  capitalStartDate,
+  periodMwrr,
+  wholeDays,
+  xirr,
+} from '../analytics/calculators/xirr';
 import { AccountingMethod, buildWindowFlows, isBulkImportClient } from '../analytics/calculators/flows';
 import { ResolvedPeriod } from './periods';
 import { Market, benchmarksFor, currencyForMarket } from '../common/market-scope';
@@ -27,18 +33,25 @@ export interface FamilyMemberPerformance {
   netFlows: number;
 
   /**
-   * The account's own money-weighted return over the window, or null when it
-   * cannot be solved for this member alone.
+   * The account's own period money-weighted return, or null when it cannot be
+   * solved for this member alone.
    *
-   * A null here does NOT remove the member from the household total — see the
-   * class doc. An account that joined mid-window has no meaningful standalone
-   * return for the whole window, but its capital and its gain still belong in
-   * the family's.
+   * An account funded mid-window (zero opening, first purchase inside it) IS
+   * measured: its return runs from the day its capital arrived, so a single
+   * deposit reads exactly gain ÷ capital. Null is reserved for an account with
+   * neither an opening value nor a recorded inflow — a late entrant whose
+   * balance is imputed at its closing value, which has no return to measure.
+   * A null does NOT remove the member from the household total.
    */
   returnPct: number | null;
+  /** The same rate per annum. Null under 30 invested days. */
+  annualizedReturnPct: number | null;
   returnReason?: string;
 
-  /** What the account gained over the window, net of its own deposits. */
+  /**
+   * What the account gained over the window, net of its own flows — including
+   * a late entrant's arriving balance, so member gains sum to the household's.
+   */
   gain: number;
 
   /**
@@ -46,6 +59,13 @@ export interface FamilyMemberPerformance {
    * household's, because the account itself starts later.
    */
   entryDate?: Date;
+
+  /**
+   * When this account's capital first arrived, if after the window opened —
+   * its first purchase, or its entry date as a late entrant. Drives the
+   * "Since …" label and is the start of its period return.
+   */
+  sinceDate?: Date;
 
   /** Share of the household's closing value — what this account is, as a weight. */
   weight: number;
@@ -90,6 +110,8 @@ export interface FamilyPeriodReturn {
   /** The household's index over the same window, priced on the same flows. */
   benchmark: BenchmarkWindowResult | null;
   alpha: number | null;
+  /** XIRR p.a. − benchmark XIRR p.a.; the headline alpha on windows of a year or more. */
+  annualizedAlpha: number | null;
   /**
    * The household's own index (the members' shared benchmark, else the book
    * default). Differs from `benchmark.code` while comparing against another.
@@ -280,11 +302,12 @@ export class FamilyPerformanceService {
 
     const solved = xirr(flows);
     const annualized = solved.status === 'ok' ? solved.rate : null;
-    // Same de-annualization, same 365-day basis and same 30-day floor as the
-    // single-client engine, so a one-member family reports exactly what that
-    // member's own sheet reports.
-    const returnPct = annualized !== null ? (1 + annualized) ** (periodDays / 365) - 1 : null;
-    const annualizedReturnPct = periodDays >= 30 ? annualized : null;
+    // Same de-annualization, same 365-day basis, same capital-start date and
+    // same 30-day floor as the single-client engine, so a one-member family
+    // reports exactly what that member's own sheet reports.
+    const capitalFrom = capitalStartDate(flows) ?? from;
+    const returnPct = annualized !== null ? periodMwrr(annualized, capitalFrom, to) : null;
+    const annualizedReturnPct = wholeDays(capitalFrom, to) >= 30 ? annualized : null;
 
     const netFlows = flows.slice(1, -1).reduce((sum, f) => sum - f.amount, 0);
 
@@ -312,6 +335,10 @@ export class FamilyPerformanceService {
       benchmark,
       alpha:
         returnPct !== null && benchmark?.interim != null ? returnPct - benchmark.interim : null,
+      annualizedAlpha:
+        annualizedReturnPct !== null && benchmark?.xirr != null
+          ? annualizedReturnPct - benchmark.xirr
+          : null,
       assignedBenchmarkCode,
       memberCount: family.clients.length,
       members: this.memberRows(measured, lateEntrants, from, to, closingValue),
@@ -424,48 +451,68 @@ export class FamilyPerformanceService {
     householdClosing: number,
   ): FamilyMemberPerformance[] {
     return measured
-      .map((m) => {
+      .map((m): FamilyMemberPerformance => {
         const entrant = lateEntrants.find((e) => e.clientId === m.client.id);
-        const memberFrom = entrant?.entryDate ?? from;
-        const memberDays = Math.max(
-          1,
-          Math.round((to.getTime() - memberFrom.getTime()) / 86_400_000),
-        );
 
-        const netFlows = m.flows.reduce((sum, f) => sum - f.amount, 0);
+        // A late entrant's balance enters the HOUSEHOLD series as a deposit on
+        // its entry date (see householdFlows). Its member row books the same
+        // arrival as a flow, so its gain is what the household credits it with
+        // and the Net Gain column sums exactly to the household's.
+        const arrival = entrant ? m.closingValue : 0;
+        const netFlows = m.flows.reduce((sum, f) => sum - f.amount, 0) + arrival;
+        const gain = m.closingValue - m.openingValue - netFlows;
 
-        // A late entrant has no opening value to solve against, so its
-        // standalone return is not measurable for this window even though its
-        // gain still counts in the household's. Reported as such, not as a zero.
-        const solved =
-          m.openingValue > 0
-            ? xirr([
-                { date: from, amount: -m.openingValue },
-                ...m.flows,
-                { date: to, amount: m.closingValue },
-              ])
-            : null;
+        const memberFlows: CashFlow[] = [
+          ...(m.openingValue > 0 ? [{ date: from, amount: -m.openingValue }] : []),
+          ...m.flows,
+        ];
+        const capitalFrom = capitalStartDate(memberFlows);
+        const sinceDate =
+          m.openingValue > 0 ? undefined : entrant?.entryDate ?? capitalFrom ?? undefined;
 
-        const annualized = solved?.status === 'ok' ? solved.rate : null;
-        const returnPct = annualized !== null ? (1 + annualized) ** (memberDays / 365) - 1 : null;
-
-        return {
+        const base = {
           clientId: m.client.id,
           clientName: m.client.name,
           openingValue: m.openingValue,
           closingValue: m.closingValue,
           netFlows,
-          returnPct,
-          returnReason: entrant
-            ? 'Joined the household during this period'
-            : solved?.status === 'no-solution'
-              ? solved.reason
-              : m.openingValue <= 0
-                ? 'No opening value for this window'
-                : undefined,
-          gain: m.closingValue - m.openingValue - netFlows,
+          gain,
           entryDate: entrant?.entryDate,
+          sinceDate,
           weight: householdClosing > 0 ? m.closingValue / householdClosing : 0,
+        };
+
+        // Imputed at its closing value, a late entrant's arrival has no
+        // recorded cost to measure growth against — any rate would be invented.
+        if (entrant) {
+          return {
+            ...base,
+            returnPct: null,
+            annualizedReturnPct: null,
+            returnReason: 'Joined the household during this period',
+          };
+        }
+        if (!capitalFrom) {
+          return {
+            ...base,
+            returnPct: null,
+            annualizedReturnPct: null,
+            returnReason: 'No opening value or capital inflow in this window',
+          };
+        }
+
+        // Solved from the day this account's capital arrived: the window's
+        // start when it had an opening value, its first purchase when it was
+        // funded mid-window. A single deposit therefore reads exactly
+        // gain ÷ capital, and the figure matches the member's own sheet.
+        const solved = xirr([...memberFlows, { date: to, amount: m.closingValue }]);
+        const annualized = solved.status === 'ok' ? solved.rate : null;
+
+        return {
+          ...base,
+          returnPct: annualized !== null ? periodMwrr(annualized, capitalFrom, to) : null,
+          annualizedReturnPct: wholeDays(capitalFrom, to) >= 30 ? annualized : null,
+          returnReason: solved.status === 'no-solution' ? solved.reason : undefined,
         };
       })
       .sort((a, b) => b.closingValue - a.closingValue);
@@ -514,6 +561,7 @@ export class FamilyPerformanceService {
       simpleReturnPct: null,
       benchmark: null,
       alpha: null,
+      annualizedAlpha: null,
       assignedBenchmarkCode: null,
       memberCount: 0,
       members: [],
