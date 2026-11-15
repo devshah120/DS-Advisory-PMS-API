@@ -51,6 +51,11 @@ export interface MarketCapQuote {
    * reports none: ETFs and funds, and symbols it doesn't know.
    */
   marketCapInr: number | null;
+  /**
+   * The cap in its listing currency (`currency`), unconverted. US books band on
+   * this in dollars ($10bn / $50bn), so they don't depend on the FX rate.
+   */
+  marketCap: number | null;
   /** The currency Yahoo reported the cap in before conversion; null with no cap. */
   currency: string | null;
   /** Yahoo's quoteType for the symbol as held ('EQUITY', 'ETF', 'MUTUALFUND'…). */
@@ -475,6 +480,7 @@ export class MarketService {
       const rate = source?.currency === 'INR' ? 1 : source?.currency ? toInr.get(source.currency) : undefined;
       const value: MarketCapQuote = {
         marketCapInr: source?.marketCap && rate ? source.marketCap * rate : null,
+        marketCap: source?.marketCap || null,
         currency: source?.marketCap ? source.currency : null,
         // The held symbol's own type — an alternate can disagree (Yahoo types
         // the bare 'AIMTRON.NS' as MUTUALFUND while its Emerge line is EQUITY).
