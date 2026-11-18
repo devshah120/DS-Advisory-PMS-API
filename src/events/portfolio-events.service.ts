@@ -286,6 +286,13 @@ export class PortfolioEventsService {
    * Rejected and cancelled actions are excluded: they describe something the
    * desk decided was not real, and surfacing them as upcoming events would
    * undo that decision on screen.
+   *
+   * Booked actions whose dates have all passed are excluded too. This page
+   * lists what is coming, and since booking became automatic a processed
+   * past dividend is history, kept in the ledger and the reports. The one
+   * kind of past row still shown is an action whose effective date passed
+   * without it booking. That means a gate held it back (conflict, low
+   * confidence, failed run), and nowhere else in the app shows it.
    */
   private async corporateActionEvents(
     market: Market,
@@ -311,13 +318,47 @@ export class PortfolioEventsService {
       // Return type annotated on the callback rather than left to `satisfies`
       // at the end of the literal: inference runs first, so an optional field
       // set to a bare `null` resolves to `any` before the check happens.
-      .map((a): PortfolioEvent => {
+      .flatMap((a): PortfolioEvent[] => {
         const entry = byTicker.get(a.symbol)!;
         const meta = CA_EVENT_MAP[a.actionType] ?? {
           type: 'OTHER_CORPORATE_ACTION' as const,
           code: 'C',
           label: a.actionType,
         };
+
+        const exDay = a.exDate ? tradeDay(a.exDate, market) : null;
+        // Booking keys off the effective date (a dividend's PAY date from
+        // FMP), so that is the date that decides whether the action is still
+        // to come.
+        const effectiveDay = tradeDay(a.effectiveDate, market);
+        const processed = a.status === 'PROCESSED';
+
+        // The row shows the NEXT date that matters. Before the ex-date that is
+        // the ex-date, the day the entitlement is fixed. Once the ex-date has
+        // passed but the dividend is still unpaid, it is the pay date: Visa
+        // went ex on 10 Nov and pays on 1 Dec, and listing it under 10 Nov
+        // would put a past date on an upcoming page.
+        let date = exDay ?? effectiveDay;
+        let label = meta.label;
+        if (date < today && effectiveDay >= today) {
+          date = effectiveDay;
+          if (meta.type === 'DIVIDEND') label = `${meta.label} Pay Date`;
+        }
+
+        if (processed && date < today) return [];
+
+        // Only booking ends an action's open state. Before that, the effective
+        // date decides the label. Not yet reached is upcoming, even when the
+        // ex-date is behind it, because the scheduler books on the effective
+        // date. Already passed means a gate held the action back. An
+        // approved-but-unrun or FAILED action is as unbooked as a pending one,
+        // so they all share 'Not processed'. The engine's own stage is still on
+        // the row as corporateActionStatus.
+        const status: EventStatus = processed
+          ? 'Processed'
+          : effectiveDay >= today
+            ? 'Upcoming'
+            : 'Not processed';
 
         const holders: EventHolder[] = [...entry.holders.entries()]
           .map(([clientId, h]): EventHolder => ({
@@ -336,24 +377,11 @@ export class PortfolioEventsService {
 
         const totalQuantity = holders.reduce((sum, h) => sum + h.quantity, 0);
 
-        // The ex-date is what an advisor watches for an entitlement; the
-        // effective date is what matters for everything else.
-        const date = tradeDay(a.exDate ?? a.effectiveDate, market);
-
-        // Only processing ends an action's open state. Before that, its date
-        // decides the label: not yet reached is upcoming, already passed means
-        // the ledger is behind. An approved-but-unrun or FAILED action whose
-        // date has passed is just as unbooked as a pending one, so they all
-        // share 'Not processed'. The engine's own stage is still on the row as
-        // corporateActionStatus for anyone who needs it.
-        const status: EventStatus =
-          a.status === 'PROCESSED' ? 'Processed' : date >= today ? 'Upcoming' : 'Not processed';
-
-        return {
+        return [{
           ticker: a.symbol,
           type: meta.type,
           code: meta.code,
-          label: meta.label,
+          label,
           date,
           status,
           dividendRate: null,
@@ -371,7 +399,7 @@ export class PortfolioEventsService {
           corporateActionStatus: a.status,
           detail: describeAction(a),
           source: a.source,
-        };
+        }];
       });
   }
 
