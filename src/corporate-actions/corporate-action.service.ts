@@ -44,8 +44,11 @@ import { CorporateActionAuditService, RequestContext } from './audit.service';
 import {
   calculateConfidence,
   detectConflicts,
+  EX_DATE_IDENTIFIED,
   fingerprintOf,
   mergeSources,
+  sameDayRange,
+  tierForScore,
   toSourceReference,
 } from './corporate-action.dedupe';
 import {
@@ -59,6 +62,11 @@ import {
 import { CorporateActionValidator } from './corporate-action.validator';
 import { formatRatioLabel, normalize, ratioMultiplier } from './ratio';
 import { SplitEvent, sharesHeldOnEve } from './dividend-entitlement';
+import {
+  isBulkImportClient,
+  isImportArtifact,
+  JUN30_REBASE_DATE,
+} from '../analytics/calculators/flows';
 import {
   AffectedHolding,
   PlannedClientChange,
@@ -98,6 +106,23 @@ const CASH_ENTITLEMENT_TYPES: ReadonlySet<CorporateActionType> = new Set<Corpora
   'RETURN_OF_CAPITAL',
 ]);
 
+/** The fields of an action that decide who holds it and what they are owed. */
+export type EntitlementSubject = Pick<
+  CorporateAction,
+  'symbol' | 'actionType' | 'exDate' | 'recordDate' | 'market' | 'company'
+>;
+
+/**
+ * Statuses a merged report never changes. PROCESSED is booked; PROCESSING
+ * belongs to a run in flight; REJECTED and CANCELLED were judged not real.
+ */
+const CLOSED_TO_MERGE: ReadonlySet<CorporateActionStatus> = new Set<CorporateActionStatus>([
+  'PROCESSED',
+  'PROCESSING',
+  'REJECTED',
+  'CANCELLED',
+]);
+
 /** Actions that change the share count by a ratio, which a later dividend's entitlement must pass through. */
 const SPLIT_TYPES: CorporateActionType[] = ['STOCK_SPLIT', 'REVERSE_SPLIT', 'BONUS_ISSUE', 'STOCK_DIVIDEND'];
 
@@ -126,13 +151,13 @@ export class CorporateActionService {
     incoming: NormalizedCorporateAction,
     actor?: Actor | null,
   ): Promise<{ action: CorporateAction; created: boolean; merged: boolean }> {
-    const symbol = normalizeSymbol(incoming.symbol, incoming.market ?? marketForSymbol(incoming.symbol));
-    const normalized: NormalizedCorporateAction = { ...incoming, symbol };
+    const normalized = withCanonicalSymbol(incoming);
+    const symbol = normalized.symbol;
 
     const fingerprint = fingerprintOf(normalized);
     const reference = toSourceReference(normalized);
 
-    const existing = await this.prisma.corporateAction.findUnique({ where: { fingerprint } });
+    const existing = await this.findExisting(normalized);
 
     if (existing) {
       return { action: await this.mergeInto(existing, normalized, reference, actor), created: false, merged: true };
@@ -196,6 +221,40 @@ export class CorporateActionService {
   }
 
   /**
+   * What `ingest` would do with this report, without writing anything: the
+   * stored action it would merge into, or null if it would create one. Backs
+   * the sweep's dry run.
+   */
+  async previewIngest(incoming: NormalizedCorporateAction): Promise<CorporateAction | null> {
+    return this.findExisting(withCanonicalSymbol(incoming));
+  }
+
+  /**
+   * The stored action a report describes, if any. Matches on the fingerprint
+   * first, then, for types identified by their ex-date, on symbol, type and
+   * ex-date. Without the second match, FMP's report of a dividend (dated by pay
+   * date) and Yahoo's (dated by ex-date) became two actions and would have been
+   * paid twice. See EX_DATE_IDENTIFIED.
+   */
+  private async findExisting(normalized: NormalizedCorporateAction): Promise<CorporateAction | null> {
+    const byFingerprint = await this.prisma.corporateAction.findUnique({
+      where: { fingerprint: fingerprintOf(normalized) },
+    });
+    if (byFingerprint || !normalized.exDate || !EX_DATE_IDENTIFIED.has(normalized.actionType)) {
+      return byFingerprint;
+    }
+
+    return this.prisma.corporateAction.findFirst({
+      where: {
+        symbol: normalized.symbol,
+        actionType: normalized.actionType,
+        exDate: sameDayRange(normalized.exDate),
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+  }
+
+  /**
    * Folds a second report of the same event into the existing row (PART 7/32).
    *
    * Two rules govern what happens to the stored figures:
@@ -217,8 +276,15 @@ export class CorporateActionService {
     reference: SourceReference,
     actor?: Actor | null,
   ): Promise<CorporateAction> {
+    // A row written outside ingest() may have no sources recorded. Seed one
+    // from the row itself, or the first merge would replace its provenance with
+    // the newcomer's. The APH split written by its repair script had a score of
+    // 100 and became "yahoo, 75".
     const priorSources = readSources(existing.sources);
-    const sources = mergeSources(priorSources, reference);
+    const sources = mergeSources(
+      priorSources.length > 0 ? priorSources : [rowAsSource(existing)],
+      reference,
+    );
     const conflicts = detectConflicts(sources);
 
     const primary = sources[0];
@@ -240,7 +306,9 @@ export class CorporateActionService {
       sources: sources as unknown as Prisma.InputJsonValue,
       conflicts: (conflicts.length ? conflicts : undefined) as unknown as Prisma.InputJsonValue,
       hasConflict: conflicts.length > 0,
-      confidenceScore: confidence,
+      // A booked action keeps the score it was booked on. A later source can
+      // corroborate it, not demote it after the fact.
+      confidenceScore: alreadyApplied ? Math.max(existing.confidenceScore, confidence) : confidence,
     };
 
     // A better source may correct the figures — but never on a processed action.
@@ -270,8 +338,13 @@ export class CorporateActionService {
      * A conflict on an action already cleared for processing sends it back for
      * review. Leaving it APPROVED would let the scheduler process figures a
      * source now disputes.
+     *
+     * Only an OPEN action is sent back. A processed, cancelled, rejected or
+     * in-flight one keeps its status. With booking automatic, a cancelled
+     * action reopened by a conflict would be booked by the next sweep once a
+     * later report cleared that conflict.
      */
-    if (conflicts.length > 0 && !alreadyApplied && existing.status !== 'REJECTED') {
+    if (conflicts.length > 0 && !CLOSED_TO_MERGE.has(existing.status)) {
       data.status = 'PENDING_APPROVAL';
     }
 
@@ -907,6 +980,46 @@ export class CorporateActionService {
   // ══ Queries ═══════════════════════════════════════════════════════════════
 
   /**
+   * Each client's entitlement to a distribution that need not be stored yet,
+   * worked out by the same code processing uses. Read-only. Backs the dividend
+   * backfill's dry run, so its cash estimate cannot disagree with what booking
+   * would do.
+   */
+  async entitledHolders(action: EntitlementSubject): Promise<AffectedHolding[]> {
+    return this.affectedHoldings(action);
+  }
+
+  /**
+   * Re-dates each bulk-import client's import rows to the 30-June baseline.
+   *
+   * Those clients' 1-July BUY rows are not purchases made on 1 July. They are
+   * the position held at the 30-June close, written as a day of trading by the
+   * import (see `isImportArtifact`). Left as dated, a dividend that went ex on
+   * 1 July treated them as bought ON the ex-date, so those shares were not
+   * entitled. That dropped 3 of STT's 4 holders from its 1-July dividend, and
+   * a duplicated import row turned one HEI-A holder's balance negative.
+   */
+  private async importRowsAtBaseline<T extends { type: string; date: Date }>(
+    rowsByClient: Map<string, T[]>,
+    db: TxClient | PrismaService,
+  ): Promise<Map<string, T[]>> {
+    const baselines = await db.portfolioBaseline.findMany({
+      where: { clientId: { in: [...rowsByClient.keys()] } },
+      select: { clientId: true, baselineDate: true },
+    });
+
+    for (const { clientId, baselineDate } of baselines) {
+      if (!isBulkImportClient({ baselineDate })) continue;
+      const rows = rowsByClient.get(clientId) ?? [];
+      rowsByClient.set(
+        clientId,
+        rows.map((r) => (isImportArtifact(r, true) ? { ...r, date: JUN30_REBASE_DATE } : r)),
+      );
+    }
+    return rowsByClient;
+  }
+
+  /**
    * Every client position an action touches.
    *
    * Deliberately UNSCOPED by ownership. A corporate action is a fact about a
@@ -917,7 +1030,7 @@ export class CorporateActionService {
    * PROCESSING is not, and that asymmetry is the point.
    */
   private async affectedHoldings(
-    action: CorporateAction,
+    action: EntitlementSubject,
     tx?: TxClient,
   ): Promise<AffectedHolding[]> {
     const db = tx ?? this.prisma;
@@ -964,7 +1077,7 @@ export class CorporateActionService {
    * this inside the processing transaction affordable.
    */
   private async withEntitlements(
-    action: CorporateAction,
+    action: EntitlementSubject,
     current: AffectedHolding[],
     db: TxClient | PrismaService,
   ): Promise<AffectedHolding[]> {
@@ -992,7 +1105,10 @@ export class CorporateActionService {
 
     const splits = splitActions.map(toSplitEvent);
     const market = action.market;
-    const rowsByClient = groupBy(ledger, (r) => r.clientId);
+    const rowsByClient = await this.importRowsAtBaseline(
+      groupBy(ledger, (r) => r.clientId),
+      db,
+    );
 
     // One entitlement per client. A second Holding row for the same client and
     // ticker would otherwise be paid the whole entitlement again.
@@ -1173,6 +1289,8 @@ export class CorporateActionService {
         (row?.caFractionalSharePolicy as ProcessorSettings['fractionalSharePolicy']) ?? 'RETAIN',
       cashInLieuPolicy:
         (row?.caCashInLieuPolicy as ProcessorSettings['cashInLieuPolicy']) ?? 'MARKET_PRICE',
+      // Still returned for the settings API, but nothing reads it any more:
+      // booking is always automatic (see CorporateActionScheduler).
       autoProcessEnabled: row?.caAutoProcessEnabled ?? false,
       minimumConfidenceScore: row?.caMinimumConfidenceScore ?? 90,
       notificationEnabled: row?.caNotificationEnabled ?? true,
@@ -1183,6 +1301,33 @@ export class CorporateActionService {
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
+
+/** A stored row as the source reference it would have recorded, for a row that recorded none. */
+function rowAsSource(row: CorporateAction): SourceReference {
+  const reference = toSourceReference({
+    symbol: row.symbol,
+    actionType: row.actionType,
+    recordDate: row.recordDate,
+    exDate: row.exDate,
+    effectiveDate: row.effectiveDate,
+    paymentDate: row.paymentDate,
+    oldRatio: row.oldRatio,
+    newRatio: row.newRatio,
+    cashAmount: row.cashAmount,
+    newSymbol: row.newSymbol,
+    source: row.source,
+    tier: tierForScore(row.confidenceScore),
+    sourceUrl: row.sourceUrl,
+    sourceReference: row.sourceReference,
+  });
+  return { ...reference, fetchedAt: row.createdAt.toISOString() };
+}
+
+/** The report with its symbol in the form Holding.ticker uses, so lookups and joins agree. */
+function withCanonicalSymbol(incoming: NormalizedCorporateAction): NormalizedCorporateAction {
+  const market = incoming.market ?? marketForSymbol(incoming.symbol);
+  return { ...incoming, symbol: normalizeSymbol(incoming.symbol, market) };
+}
 
 /** Reads the sources Json column back into typed references. */
 function readSources(value: unknown): SourceReference[] {

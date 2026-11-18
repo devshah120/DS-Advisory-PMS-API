@@ -38,6 +38,7 @@ import { SpinOffProcessor } from './processors/spin-off.processor';
 import { StockSplitProcessor } from './processors/stock-split.processor';
 import { TickerChangeProcessor } from './processors/ticker-change.processor';
 import { FmpCorporateActionProvider } from './providers/fmp-corporate-action.provider';
+import { YahooCorporateActionProvider } from './providers/yahoo-corporate-action.provider';
 import { CORPORATE_ACTION_PROVIDERS } from './providers/corporate-actions.tokens';
 import { ReconciliationService } from './reconciliation.service';
 
@@ -62,12 +63,18 @@ import { ReconciliationService } from './reconciliation.service';
     DelistingProcessor,
 
     FmpCorporateActionProvider,
+    YahooCorporateActionProvider,
     {
       provide: CORPORATE_ACTION_PROVIDERS,
       // Priority order — highest-tier source first. An SEC/company-IR adapter
-      // belongs above FMP when one is written.
-      useFactory: (fmp: FmpCorporateActionProvider) => [fmp],
-      inject: [FmpCorporateActionProvider],
+      // belongs above FMP when one is written. Yahoo comes after FMP: it fills
+      // the symbols and history the FMP plan refuses, and FMP's pay dates win
+      // wherever both report the same event.
+      useFactory: (fmp: FmpCorporateActionProvider, yahoo: YahooCorporateActionProvider) => [
+        fmp,
+        yahoo,
+      ],
+      inject: [FmpCorporateActionProvider, YahooCorporateActionProvider],
     },
   ],
   /**

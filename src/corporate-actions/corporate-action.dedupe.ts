@@ -73,6 +73,48 @@ function ratioKey(value: number | null | undefined): string {
 }
 
 /**
+ * Types for which the ex-date identifies the event when sources disagree on
+ * the other dates.
+ *
+ * A dividend's effective date is its pay date when the source has one (FMP)
+ * and its ex-date when it does not (Yahoo). Two reports of one dividend then
+ * fingerprint differently, and they are weeks apart, which is well outside
+ * the validator's ±3-day duplicate check. The ex-date is the one date every
+ * source reports, and a security has one distribution of a given type per
+ * ex-date.
+ */
+export const EX_DATE_IDENTIFIED: ReadonlySet<CorporateActionType> = new Set([
+  'DIVIDEND',
+  'SPECIAL_DIVIDEND',
+  'CASH_DISTRIBUTION',
+  'RETURN_OF_CAPITAL',
+  'STOCK_SPLIT',
+  'REVERSE_SPLIT',
+  'BONUS_ISSUE',
+  'STOCK_DIVIDEND',
+] as CorporateActionType[]);
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const IST_OFFSET_MS = 330 * 60 * 1000;
+
+/**
+ * Every stored instant that means the same calendar day as `date`, for a query.
+ *
+ * Date-only values are stored either at UTC midnight or at IST midnight (18:30Z
+ * the evening before). The range runs from IST midnight to just before the next
+ * IST midnight, so it contains both encodings of the day and neither encoding
+ * of the days on either side.
+ */
+export function sameDayRange(date: Date): { gte: Date; lt: Date } {
+  const day = new Date(date.getTime() + IST_OFFSET_MS).toISOString().slice(0, 10);
+  const utcMidnight = Date.parse(`${day}T00:00:00.000Z`);
+  return {
+    gte: new Date(utcMidnight - IST_OFFSET_MS),
+    lt: new Date(utcMidnight + DAY_MS - IST_OFFSET_MS),
+  };
+}
+
+/**
  * Whether two normalised actions describe the same real-world event.
  *
  * Fingerprint equality is the primary test. The looser `nearDuplicate` below
@@ -113,6 +155,17 @@ export function tierRank(tier: SourceTier): number {
   return SOURCE_TIERS[tier]?.rank ?? 99;
 }
 
+/**
+ * The best tier a stored confidence score could have come from. Only for a
+ * row written outside ingest() (a repair script, say) that never recorded its
+ * sources: 100 reads as COMPANY_IR, 90 as PRIMARY_API.
+ */
+export function tierForScore(score: number): SourceTier {
+  const byRank = (Object.entries(SOURCE_TIERS) as Array<[SourceTier, { rank: number; confidence: number }]>)
+    .sort((a, b) => a[1].rank - b[1].rank);
+  return byRank.find(([, t]) => t.confidence <= score)?.[0] ?? 'UNVERIFIED';
+}
+
 /** True when `candidate` outranks `incumbent` and should become the primary source. */
 export function outranks(candidate: SourceTier, incumbent: SourceTier): boolean {
   return tierRank(candidate) < tierRank(incumbent);
@@ -137,7 +190,14 @@ export function toSourceReference(action: NormalizedCorporateAction): SourceRefe
       cashAmount: action.cashAmount ?? null,
       recordDate: action.recordDate?.toISOString() ?? null,
       exDate: action.exDate?.toISOString() ?? null,
-      effectiveDate: action.effectiveDate.toISOString(),
+      // A cash distribution's effective date IS its pay date. A source with no
+      // pay date falls back to the ex-date, which says nothing about when the
+      // cash lands, so it is left out rather than read as a disagreement with
+      // a source that knows (Yahoo's ex-date against FMP's pay date).
+      effectiveDate:
+        CASH_TYPES.has(action.actionType) && !action.paymentDate
+          ? null
+          : action.effectiveDate.toISOString(),
       paymentDate: action.paymentDate?.toISOString() ?? null,
       newSymbol: action.newSymbol ?? null,
     },
