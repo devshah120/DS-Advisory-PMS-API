@@ -205,6 +205,14 @@ export class CreateClientDto {
   @Max(100, { message: 'feeRatePercent must be a percentage between 0 and 100' })
   feeRatePercent: number;
 
+  // Optional: most mandates have no withholding. Below 100 because a rate of
+  // 100% would leave nothing to book, which is a typo, not a tax.
+  @IsNumber()
+  @Min(0)
+  @Max(99, { message: 'dividendWithholdingPercent must be a percentage from 0 to 99' })
+  @IsOptional()
+  dividendWithholdingPercent?: number | null;
+
   // Required on create: prorating the first billing quarter needs a real
   // mandate start date, not the record's createdAt timestamp.
   @IsDateString({}, { message: 'inceptionDate must be a valid date' })

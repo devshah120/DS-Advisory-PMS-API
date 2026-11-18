@@ -136,6 +136,12 @@ export interface ClientImpact {
   cashImpact: number;
   currency: string;
   fractionalShares: number;
+  /**
+   * Cost basis the action removed, when that differs from `cashImpact`. A
+   * return of capital cuts basis only on shares still held, and never below
+   * zero. Reconciliation uses `cashImpact` when this is absent.
+   */
+  basisReduction?: number;
 
   /** 'READY' before processing, then the ledger status afterwards. */
   status: string;

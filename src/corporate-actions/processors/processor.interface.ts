@@ -20,6 +20,7 @@
  */
 import { CorporateAction, Prisma } from '@prisma/client';
 import { ClientImpact } from '../corporate-action.types';
+import type { Eligibility } from '../dividend-entitlement';
 
 /**
  * The Prisma client inside an interactive transaction. Everything a processor
@@ -35,6 +36,11 @@ export interface ProcessorSettings {
 
 /** One client's current position in the action's symbol, loaded once. */
 export interface AffectedHolding {
+  /**
+   * Empty for a FORMER holder: a client who held on the ex-date and has sold
+   * out since. Only cash-distribution actions include these (they are still
+   * owed the dividend), and no holding row exists to update for them.
+   */
   holdingId: string;
   clientId: string;
   clientName: string;
@@ -50,6 +56,16 @@ export interface AffectedHolding {
   industry: string;
   country: string;
   exchange: string;
+
+  /**
+   * Cash distributions only: shares held at the close before the ex-date,
+   * worked out from the ledger by CorporateActionService (see
+   * dividend-entitlement.ts). DividendProcessor will not plan without it,
+   * because falling back to `quantity` is the bug this field replaced.
+   */
+  entitlement?: Eligibility;
+  /** Fraction withheld at source from this client's dividends (0.25 = 25%). 0 when not flagged. */
+  dividendWithholdingRate?: number;
 }
 
 export interface ProcessorContext {

@@ -57,8 +57,8 @@ import {
   ValidationOutcome,
 } from './corporate-action.types';
 import { CorporateActionValidator } from './corporate-action.validator';
-import { formatRatioLabel, normalize } from './ratio';
-import { entitlementWarning } from './processors/dividend.processor';
+import { formatRatioLabel, normalize, ratioMultiplier } from './ratio';
+import { SplitEvent, sharesHeldOnEve } from './dividend-entitlement';
 import {
   AffectedHolding,
   PlannedClientChange,
@@ -85,6 +85,21 @@ const PROCESSABLE: ReadonlySet<CorporateActionStatus> = new Set<CorporateActionS
   // PART 36: "after fixing the error, re-run entire corporate action."
   'FAILED',
 ]);
+
+/**
+ * Actions that pay cash per share held on the ex-date. Their holders are
+ * worked out from the ledger, not just from today's Holding rows; see
+ * `withEntitlements`.
+ */
+const CASH_ENTITLEMENT_TYPES: ReadonlySet<CorporateActionType> = new Set<CorporateActionType>([
+  'DIVIDEND',
+  'SPECIAL_DIVIDEND',
+  'CASH_DISTRIBUTION',
+  'RETURN_OF_CAPITAL',
+]);
+
+/** Actions that change the share count by a ratio, which a later dividend's entitlement must pass through. */
+const SPLIT_TYPES: CorporateActionType[] = ['STOCK_SPLIT', 'REVERSE_SPLIT', 'BONUS_ISSUE', 'STOCK_DIVIDEND'];
 
 @Injectable()
 export class CorporateActionService {
@@ -476,8 +491,10 @@ export class CorporateActionService {
       warnings.push(`No client currently holds ${action.symbol}; processing would affect nobody.`);
     }
 
-    const stale = entitlementWarning(action.recordDate);
-    if (stale) warnings.push(stale);
+    const blocked = blockedClients(changes);
+    if (blocked) {
+      warnings.push(`${blocked} Processing will fail until each is fixed.`);
+    }
 
     if (action.hasConflict) {
       warnings.push('Sources disagree on this action. Resolve the conflict before processing.');
@@ -635,6 +652,14 @@ export class CorporateActionService {
             tx,
             runReference,
           });
+
+          // A blocked entitlement is a client whose ex-date share count the
+          // ledger cannot support (an unrecorded split, more sold than held).
+          // Paying everyone else and marking the action PROCESSED would leave
+          // that client unpaid with no way to re-run, so the whole run fails
+          // and stays re-runnable once the ledger is fixed.
+          const blocked = blockedClients(changes);
+          if (blocked) throw new Error(blocked);
 
           let transactionsCreated = 0;
 
@@ -899,10 +924,14 @@ export class CorporateActionService {
 
     const holdings = await db.holding.findMany({
       where: { ticker: action.symbol },
-      include: { client: { select: { id: true, name: true, currency: true } } },
+      include: {
+        client: {
+          select: { id: true, name: true, currency: true, dividendWithholdingPercent: true },
+        },
+      },
     });
 
-    return holdings.map((h) => ({
+    const current: AffectedHolding[] = holdings.map((h) => ({
       holdingId: h.id,
       clientId: h.clientId,
       clientName: h.client.name,
@@ -917,7 +946,112 @@ export class CorporateActionService {
       industry: h.industry,
       country: h.country,
       exchange: h.exchange,
+      dividendWithholdingRate: (h.client.dividendWithholdingPercent ?? 0) / 100,
     }));
+
+    return CASH_ENTITLEMENT_TYPES.has(action.actionType)
+      ? this.withEntitlements(action, current, db)
+      : current;
+  }
+
+  /**
+   * Attaches each holder's ex-date entitlement, and adds the clients who held
+   * on the ex-date but have sold out since. They have no Holding row, but they
+   * are owed the dividend. See dividend-entitlement.ts.
+   *
+   * Every figure comes from two indexed reads (the ticker's ledger rows and its
+   * split actions), not a reconstruction per client. That is what makes doing
+   * this inside the processing transaction affordable.
+   */
+  private async withEntitlements(
+    action: CorporateAction,
+    current: AffectedHolding[],
+    db: TxClient | PrismaService,
+  ): Promise<AffectedHolding[]> {
+    const exDate = action.exDate ?? action.recordDate;
+    if (!exDate) {
+      throw new BadRequestException(
+        `${action.symbol} ${action.actionType} has neither an ex-date nor a record date, ` +
+          'so there is no date to measure entitlement on.',
+      );
+    }
+
+    const [ledger, splitActions] = await Promise.all([
+      db.transaction.findMany({
+        where: { ticker: action.symbol },
+        select: { clientId: true, ticker: true, type: true, quantity: true, date: true },
+      }),
+      db.corporateAction.findMany({
+        where: {
+          symbol: action.symbol,
+          actionType: { in: SPLIT_TYPES },
+          status: { notIn: ['REJECTED', 'CANCELLED'] },
+        },
+      }),
+    ]);
+
+    const splits = splitActions.map(toSplitEvent);
+    const market = action.market;
+    const rowsByClient = groupBy(ledger, (r) => r.clientId);
+
+    // One entitlement per client. A second Holding row for the same client and
+    // ticker would otherwise be paid the whole entitlement again.
+    const anchor = new Map<string, number>();
+    for (const h of current) anchor.set(h.clientId, (anchor.get(h.clientId) ?? 0) + h.quantity);
+
+    const entitled = (clientId: string) =>
+      sharesHeldOnEve({
+        rows: rowsByClient.get(clientId) ?? [],
+        ticker: action.symbol,
+        exDate,
+        market,
+        splits,
+        anchorQuantity: anchor.get(clientId) ?? 0,
+      });
+
+    const seen = new Set<string>();
+    const result: AffectedHolding[] = current.map((h) => {
+      const first = !seen.has(h.clientId);
+      seen.add(h.clientId);
+      return {
+        ...h,
+        entitlement: first ? entitled(h.clientId) : { shares: 0, status: 'OK', notes: [] },
+      };
+    });
+
+    const formerIds = [...rowsByClient.keys()].filter((id) => !seen.has(id));
+    if (formerIds.length === 0) return result;
+
+    const clients = await db.client.findMany({
+      where: { id: { in: formerIds } },
+      select: { id: true, name: true, currency: true, dividendWithholdingPercent: true },
+    });
+
+    for (const client of clients) {
+      const entitlement = entitled(client.id);
+      if (entitlement.status === 'OK' && entitlement.shares === 0) continue;
+
+      result.push({
+        holdingId: '',
+        clientId: client.id,
+        clientName: client.name,
+        clientCurrency: client.currency,
+        ticker: action.symbol,
+        company: action.company ?? action.symbol,
+        quantity: 0,
+        averageCost: 0,
+        currentPrice: 0,
+        marketValue: 0,
+        sector: '',
+        industry: '',
+        country: '',
+        exchange: '',
+        dividendWithholdingRate: (client.dividendWithholdingPercent ?? 0) / 100,
+        entitlement,
+      });
+    }
+
+    return result;
   }
 
   /**
@@ -1053,6 +1187,50 @@ export class CorporateActionService {
 /** Reads the sources Json column back into typed references. */
 function readSources(value: unknown): SourceReference[] {
   return Array.isArray(value) ? (value as SourceReference[]) : [];
+}
+
+/** The clients a plan cannot pay, with the reason for each, or null when there are none. */
+function blockedClients(changes: PlannedClientChange[]): string | null {
+  const blocked = changes.filter((c) => c.impact.status === 'BLOCKED');
+  if (blocked.length === 0) return null;
+  return (
+    `${blocked.length} client(s) cannot be paid on the ledger as it stands: ` +
+    blocked.map((c) => `${c.impact.clientName}: ${c.impact.note}`).join(' | ')
+  );
+}
+
+/**
+ * A split-type action as the entitlement check sees it. A split's multiplier
+ * is newRatio/oldRatio (ratio.ts). A bonus uses its own convention, so a 1:1
+ * bonus doubles the holding. A missing ratio still yields an event, because
+ * the split still has to appear in the ledger; there is just no figure to
+ * check the row against.
+ */
+function toSplitEvent(a: CorporateAction): SplitEvent {
+  const usable =
+    a.oldRatio !== null && a.newRatio !== null && a.oldRatio > 0 && a.newRatio > 0;
+  const isBonus = a.actionType === 'BONUS_ISSUE' || a.actionType === 'STOCK_DIVIDEND';
+
+  return {
+    ticker: a.symbol,
+    exDate: a.exDate ?? a.effectiveDate,
+    multiplier: !usable
+      ? null
+      : isBonus
+        ? 1 + a.newRatio! / a.oldRatio!
+        : ratioMultiplier(a.oldRatio!, a.newRatio!),
+  };
+}
+
+function groupBy<T>(rows: T[], key: (row: T) => string): Map<string, T[]> {
+  const out = new Map<string, T[]>();
+  for (const row of rows) {
+    const k = key(row);
+    const list = out.get(k);
+    if (list) list.push(row);
+    else out.set(k, [row]);
+  }
+  return out;
 }
 
 /**

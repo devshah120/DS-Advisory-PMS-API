@@ -8,7 +8,8 @@
  */
 import type { CorporateAction, CorporateActionType } from '@prisma/client';
 import { BonusProcessor } from './bonus.processor';
-import { DividendProcessor, entitlementWarning } from './dividend.processor';
+import { ReconciliationService } from '../reconciliation.service';
+import { DividendProcessor } from './dividend.processor';
 import { MergerProcessor } from './merger.processor';
 import { RightsIssueProcessor } from './rights-issue.processor';
 import { SpinOffProcessor } from './spin-off.processor';
@@ -246,9 +247,15 @@ describe('DividendProcessor — PART 45 Tests 6 and 7', () => {
     paymentDate: new Date('2026-09-15'),
   });
 
+  /** A holder whose ex-date entitlement is what they hold today, unless overridden. */
+  const holder = (overrides: Partial<AffectedHolding> = {}): AffectedHolding => {
+    const h = holding(overrides);
+    return { ...h, entitlement: h.entitlement ?? { shares: h.quantity, status: 'OK', notes: [] } };
+  };
+
   it('Test 6: 10 AAPL shares at $1/share pays $10', () => {
     const [change] = processor.plan(
-      context([holding({ ticker: 'AAPL', quantity: 10, averageCost: 150 })], dividend),
+      context([holder({ ticker: 'AAPL', quantity: 10, averageCost: 150 })], dividend),
     );
 
     expect(change.impact.cashImpact).toBe(10);
@@ -259,7 +266,7 @@ describe('DividendProcessor — PART 45 Tests 6 and 7', () => {
 
   it('Test 7: a client with zero shares generates NO transaction at all', () => {
     const changes = processor.plan(
-      context([holding({ ticker: 'AAPL', quantity: 0, averageCost: 0 })], dividend),
+      context([holder({ ticker: 'AAPL', quantity: 0, averageCost: 0 })], dividend),
     );
 
     expect(changes).toHaveLength(0);
@@ -267,7 +274,7 @@ describe('DividendProcessor — PART 45 Tests 6 and 7', () => {
 
   it('does not modify the share count or the average cost (PART 13)', () => {
     const [change] = processor.plan(
-      context([holding({ ticker: 'AAPL', quantity: 10, averageCost: 150 })], dividend),
+      context([holder({ ticker: 'AAPL', quantity: 10, averageCost: 150 })], dividend),
     );
 
     expect(change.impact.quantityAfter).toBe(10);
@@ -278,7 +285,7 @@ describe('DividendProcessor — PART 45 Tests 6 and 7', () => {
   it('books a special dividend under its own transaction type', () => {
     const [change] = processor.plan(
       context(
-        [holding({ ticker: 'AAPL', quantity: 10 })],
+        [holder({ ticker: 'AAPL', quantity: 10 })],
         action({
           ...dividend,
           actionType: 'SPECIAL_DIVIDEND' as CorporateActionType,
@@ -294,7 +301,7 @@ describe('DividendProcessor — PART 45 Tests 6 and 7', () => {
   it('reduces cost basis for a return of capital rather than booking income', () => {
     const [change] = processor.plan(
       context(
-        [holding({ ticker: 'AAPL', quantity: 10, averageCost: 150 })],
+        [holder({ ticker: 'AAPL', quantity: 10, averageCost: 150 })],
         action({
           ...dividend,
           actionType: 'RETURN_OF_CAPITAL' as CorporateActionType,
@@ -311,7 +318,7 @@ describe('DividendProcessor — PART 45 Tests 6 and 7', () => {
   it('floors basis at zero and flags the excess rather than going negative', () => {
     const [change] = processor.plan(
       context(
-        [holding({ ticker: 'AAPL', quantity: 10, averageCost: 5 })],
+        [holder({ ticker: 'AAPL', quantity: 10, averageCost: 5 })],
         action({
           ...dividend,
           actionType: 'RETURN_OF_CAPITAL' as CorporateActionType,
@@ -324,12 +331,132 @@ describe('DividendProcessor — PART 45 Tests 6 and 7', () => {
     expect(change.impact.note).toMatch(/exceeds the remaining cost basis/i);
   });
 
-  it('warns when a record date is stale enough for entitlement to have drifted', () => {
-    const longAgo = new Date(Date.now() - 30 * 24 * 3600 * 1000);
-    expect(entitlementWarning(longAgo)).toMatch(/CURRENT share counts/);
+  it('pays on the shares held on the ex-date, not on today’s holding', () => {
+    // Held 4 on the eve, bought 6 more before the pay date.
+    const [change] = processor.plan(
+      context([holder({ ticker: 'AAPL', quantity: 10, entitlement: { shares: 4, status: 'OK', notes: [] } })], dividend),
+    );
 
-    const yesterday = new Date(Date.now() - 24 * 3600 * 1000);
-    expect(entitlementWarning(yesterday)).toBeNull();
+    expect(change.transactions[0].amount).toBe(4);
+    expect(change.transactions[0].description).toMatch(/on 4 shares/);
+    expect(change.impact.note).toMatch(/not the 10 held today/);
+  });
+
+  it('pays a former holder, who has no holding left to touch', () => {
+    const [change] = processor.plan(
+      context(
+        [
+          holder({
+            holdingId: '',
+            ticker: 'AAPL',
+            quantity: 0,
+            averageCost: 0,
+            entitlement: { shares: 25, status: 'OK', notes: [] },
+          }),
+        ],
+        dividend,
+      ),
+    );
+
+    expect(change.transactions[0].amount).toBe(25);
+    expect(change.holdingUpdate).toBeNull();
+    expect(change.impact.note).toMatch(/since been closed/);
+  });
+
+  it('plans a BLOCKED entitlement with no transactions and no cash', () => {
+    const [change] = processor.plan(
+      context(
+        [
+          holder({
+            ticker: 'AAPL',
+            entitlement: { shares: 100, status: 'BLOCKED', notes: ['no SPLIT or BONUS row records it'] },
+          }),
+        ],
+        dividend,
+      ),
+    );
+
+    expect(change.impact.status).toBe('BLOCKED');
+    expect(change.transactions).toHaveLength(0);
+    expect(change.impact.cashImpact).toBe(0);
+    expect(change.impact.note).toMatch(/no SPLIT or BONUS row/);
+  });
+
+  it('books a withheld dividend NET, with gross and tax in the description', () => {
+    const [change] = processor.plan(
+      context(
+        [holder({ ticker: 'AAPL', quantity: 400, dividendWithholdingRate: 0.25 })],
+        action({ ...dividend, cashAmount: 0.25 }),
+      ),
+    );
+
+    expect(change.transactions[0].amount).toBe(75);
+    expect(change.impact.cashImpact).toBe(75);
+    expect(change.transactions[0].description).toBe(
+      'Dividend $0.25/share on 400 shares of AAPL: gross $100.00, withholding 25% $25.00, net $75.00',
+    );
+  });
+
+  it('never withholds on a return of capital, which is not income', () => {
+    const [change] = processor.plan(
+      context(
+        [holder({ ticker: 'AAPL', quantity: 10, averageCost: 150, dividendWithholdingRate: 0.25 })],
+        action({ ...dividend, actionType: 'RETURN_OF_CAPITAL' as CorporateActionType, cashAmount: 10 }),
+      ),
+    );
+
+    expect(change.transactions[0].amount).toBe(100);
+  });
+
+  it('reconciles a return of capital paid on fewer shares than held, and to a former holder', async () => {
+    const roc = action({
+      ...dividend,
+      actionType: 'RETURN_OF_CAPITAL' as CorporateActionType,
+      cashAmount: 0.165,
+    });
+    const changes = processor.plan(
+      context(
+        [
+          // Held 58.1561 on the ex-date and bought 20 more since.
+          holder({
+            holdingId: 'h1',
+            clientId: 'c1',
+            ticker: 'AAPL',
+            quantity: 78.1561,
+            averageCost: 40,
+            entitlement: { shares: 58.1561, status: 'OK', notes: [] },
+          }),
+          // Sold out after the ex-date.
+          holder({
+            holdingId: '',
+            clientId: 'c2',
+            ticker: 'AAPL',
+            quantity: 0,
+            averageCost: 0,
+            entitlement: { shares: 30, status: 'OK', notes: [] },
+          }),
+        ],
+        roc,
+      ),
+    );
+
+    // Basis falls by what the 58.1561 entitled shares received, not by the cents-rounded cash.
+    expect(changes[0].impact.basisReduction).toBe(9.5957565);
+
+    // What the database holds after apply(): exactly the planned holding update.
+    const written = changes
+      .filter((c) => c.holdingUpdate)
+      .map((c) => ({ id: c.holdingUpdate!.holdingId, ticker: 'AAPL', ...c.holdingUpdate! }));
+    const tx = { holding: { findMany: async () => written } } as unknown as ProcessorContext['tx'];
+
+    const result = await new ReconciliationService().verify(tx, changes, { symbol: 'AAPL' });
+    expect(result.status).toBe('RECONCILED');
+  });
+
+  it('refuses to plan without an ex-date entitlement rather than fall back to today’s quantity', () => {
+    expect(() => processor.plan(context([holding({ ticker: 'AAPL' })], dividend))).toThrow(
+      /no ex-date entitlement/,
+    );
   });
 });
 

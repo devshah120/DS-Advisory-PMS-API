@@ -204,8 +204,11 @@ export function isPreBaseline(
  * row moves a position. Corporate-action rows store `quantity` as the signed
  * DELTA (a reverse split or a merger's outgoing leg is negative), so they pass
  * through as recorded; a SELL's quantity is stored positive.
+ *
+ * Exported for dividend entitlement (corporate-actions/dividend-entitlement.ts),
+ * which must agree with every valuation about how many shares a row left behind.
  */
-function shareDelta(row: { type: string; quantity: number | null }): number {
+export function shareDelta(row: { type: string; quantity: number | null }): number {
   if (!row.quantity) return 0;
   switch (row.type) {
     case 'BUY':

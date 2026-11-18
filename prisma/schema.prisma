@@ -293,6 +293,19 @@ model Client {
   /// method and why quarter-end NAV alone could not express it. Defaulted for
   /// clients created before this field existed; required on create going forward.
   feeRatePercent Float    @default(0)
+
+  /// Flat tax withheld at source from this mandate's cash dividends, as a
+  /// percent (25 for 25%). Meant for foreign withholding, e.g. a US book held
+  /// by an Indian resident: 25% under the India–US treaty with a W-8BEN on
+  /// file, 30% without one. Null or 0 books dividends gross.
+  ///
+  /// Not suitable for Indian resident TDS, which only applies above a
+  /// per-company annual threshold that a flat rate cannot express.
+  ///
+  /// The DIVIDEND row's `amount` is the NET cash; gross and tax are in its
+  /// description. See corporate-actions/dividend-entitlement.ts.
+  dividendWithholdingPercent Float?
+
   /// The mandate's actual start date, used to prorate the first (partial)
   /// billing quarter. NOT the same as createdAt, which is only when the
   /// record was entered into Giriraj Global Consultants and may postdate real inception for

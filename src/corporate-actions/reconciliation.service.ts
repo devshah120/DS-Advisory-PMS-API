@@ -184,8 +184,14 @@ export class ReconciliationService {
     const cashMoved = normalize(changes.reduce((sum, c) => sum + c.impact.cashImpact, 0));
 
     // Cost may legitimately fall by the basis that left with a cash-settled
-    // fraction, so the comparison allows for cash actually paid out.
-    const costVariance = normalize(costAfter - costBefore + cashMoved);
+    // fraction or a return of capital. A processor that knows exactly how much
+    // basis left says so (`basisReduction`); otherwise the cash paid out stands
+    // in for it. Only touched positions count: cash paid to a client whose
+    // holding was not updated cannot explain a change in the ones that were.
+    const basisOut = normalize(
+      positionChanges.reduce((sum, c) => sum + (c.impact.basisReduction ?? c.impact.cashImpact), 0),
+    );
+    const costVariance = normalize(costAfter - costBefore + basisOut);
     const costScale = Math.max(1, Math.abs(costBefore));
 
     if (Math.abs(costVariance) / costScale > 1e-6) {
@@ -198,7 +204,7 @@ export class ReconciliationService {
         actualCash: cashMoved,
         message:
           `Economic cost was not preserved for ${options.symbol}: total cost moved from ` +
-          `${costBefore} to ${costAfter} (cash out ${cashMoved}, unexplained ${costVariance}). ` +
+          `${costBefore} to ${costAfter} (basis out ${basisOut}, unexplained ${costVariance}). ` +
           'A corporate action must not change total economic cost.',
       };
     }
