@@ -9,6 +9,25 @@ import { EventSnapshotRepository } from './event-snapshot.repository';
 // reimplemented — a stored 1:2 must read as '2:1' identically here and in the
 // Review Center, and two independent formatters is how one of them inverts.
 import { formatRatioLabel } from '../corporate-actions/ratio';
+// The same calendar-day rule the dividend engine uses, so a row's date and
+// "today" are read in the book's own trading calendar, and an action stored at
+// IST midnight (18:30Z the evening before) lands on its intended day.
+import { tradeDay } from '../corporate-actions/dividend-entitlement';
+
+/**
+ * A row's status badge.
+ *
+ * 'Upcoming' and 'Confirmed' are the Yahoo calendar's own words: the date is
+ * still an estimate, or the issuer has announced it. The other two apply only
+ * to Corporate Action Engine rows and say whether the ledger has caught up:
+ * 'Processed' means the action was applied to holdings, and 'Not processed'
+ * means its date has passed and it still has not been.
+ *
+ * 'Not processed' exists because an unapproved dividend whose ex-date was six
+ * weeks ago is not upcoming. It is unbooked client cash, and calling it
+ * upcoming hides the one thing the desk needs to act on.
+ */
+export type EventStatus = 'Upcoming' | 'Confirmed' | 'Processed' | 'Not processed';
 
 /** One client's exposure to a single event — the rows behind the Held By hover. */
 export interface EventHolder {
@@ -30,7 +49,17 @@ export interface EventHolder {
   estimatedAmount: number | null;
 }
 
-export interface PortfolioEvent extends Omit<WatchlistEvent, 'type' | 'code'> {
+export interface PortfolioEvent extends Omit<WatchlistEvent, 'type' | 'code' | 'status'> {
+  /** Widened past the calendar's two values; see EventStatus. */
+  status: EventStatus;
+  /**
+   * The per-share cash declared for THIS event, on Corporate Action Engine
+   * rows only. It is a separate field from `dividendRate` because that one is
+   * Yahoo's forward ANNUAL rate. Putting a single declared payment there would
+   * be labelled "annual" by the UI and divided by a payout frequency it never
+   * needed.
+   */
+  declaredAmount: number | null;
   /**
    * Widened beyond WatchlistEvent's three kinds to carry corporate actions.
    *
@@ -167,10 +196,17 @@ export class PortfolioEventsService {
   ): Promise<PortfolioEvent[]> {
     const byTicker = await this.trackedTickers(market, actor);
     const stored = await this.snapshots.listAll();
+    const today = tradeDay(new Date(), market);
 
     const calendarEvents = stored
-      .filter((e) => byTicker.has(e.ticker))
-      .map((e) => {
+      // The snapshot is forward-only by construction: refresh() keeps only
+      // [today, today+60d]. Between refreshes, though, its rows age in place,
+      // so an earnings date that has already been reported would keep its
+      // "Upcoming" badge until someone presses Refresh. The read applies the
+      // same lower bound the refresh does, so the page never depends on how
+      // recently anyone refreshed.
+      .filter((e) => byTicker.has(e.ticker) && e.date >= today)
+      .map((e): PortfolioEvent => {
         const entry = byTicker.get(e.ticker)!;
 
         // Only a dividend carries cash. A split changes the share count, not
@@ -206,6 +242,7 @@ export class PortfolioEventsService {
           status: e.status as WatchlistEvent['status'],
           dividendRate: rate,
           payoutsPerYear: frequency,
+          declaredAmount: null,
           company: entry.company,
           clientCount: entry.holders.size,
           market,
@@ -218,7 +255,7 @@ export class PortfolioEventsService {
         };
       });
 
-    const corporateActions = await this.corporateActionEvents(market, byTicker);
+    const corporateActions = await this.corporateActionEvents(market, byTicker, today);
 
     /**
      * One feed, sorted by date.
@@ -253,6 +290,7 @@ export class PortfolioEventsService {
   private async corporateActionEvents(
     market: Market,
     byTicker: Map<string, TrackedTicker>,
+    today: string,
   ): Promise<PortfolioEvent[]> {
     // A window wide enough to cover what is coming and what just happened,
     // matching the scheduler's own sweep window.
@@ -282,37 +320,52 @@ export class PortfolioEventsService {
         };
 
         const holders: EventHolder[] = [...entry.holders.entries()]
-          .map(([clientId, h]) => ({
+          .map(([clientId, h]): EventHolder => ({
             clientId,
             clientName: h.clientName,
             quantity: h.quantity,
-            // Only a cash action pays anything; a split's holders are listed
-            // with quantities and no amount rather than a misleading zero.
-            annualAmount: a.cashAmount != null ? h.quantity * a.cashAmount : null,
+            // A declared amount is ONE payment, so it fills "this pay" only.
+            // Reporting it as the annual figure too would make the hover's
+            // Annual column show a quarterly dividend as the whole year.
+            // A split's holders are listed with quantities and no amount
+            // rather than a misleading zero.
+            annualAmount: null,
             estimatedAmount: a.cashAmount != null ? h.quantity * a.cashAmount : null,
           }))
           .sort((x, y) => y.quantity - x.quantity);
 
         const totalQuantity = holders.reduce((sum, h) => sum + h.quantity, 0);
 
+        // The ex-date is what an advisor watches for an entitlement; the
+        // effective date is what matters for everything else.
+        const date = tradeDay(a.exDate ?? a.effectiveDate, market);
+
+        // Only processing ends an action's open state. Before that, its date
+        // decides the label: not yet reached is upcoming, already passed means
+        // the ledger is behind. An approved-but-unrun or FAILED action whose
+        // date has passed is just as unbooked as a pending one, so they all
+        // share 'Not processed'. The engine's own stage is still on the row as
+        // corporateActionStatus for anyone who needs it.
+        const status: EventStatus =
+          a.status === 'PROCESSED' ? 'Processed' : date >= today ? 'Upcoming' : 'Not processed';
+
         return {
           ticker: a.symbol,
           type: meta.type,
           code: meta.code,
           label: meta.label,
-          // The ex-date is what an advisor watches for an entitlement; the
-          // effective date is what matters for everything else.
-          date: (a.exDate ?? a.effectiveDate).toISOString().slice(0, 10),
-          status: a.status === 'PROCESSED' ? 'Confirmed' : 'Upcoming',
+          date,
+          status,
           dividendRate: null,
           payoutsPerYear: null,
+          declaredAmount: a.cashAmount,
           company: a.company ?? entry.company,
           clientCount: entry.holders.size,
           market,
           watchlistOnly: entry.holders.size === 0,
           holders,
           totalQuantity,
-          totalAnnualAmount: a.cashAmount != null ? totalQuantity * a.cashAmount : null,
+          totalAnnualAmount: null,
           totalEstimatedAmount: a.cashAmount != null ? totalQuantity * a.cashAmount : null,
           corporateActionId: a.id,
           corporateActionStatus: a.status,
