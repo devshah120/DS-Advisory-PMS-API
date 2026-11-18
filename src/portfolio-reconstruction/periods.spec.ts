@@ -20,22 +20,23 @@ const iso = (d: Date) => d.toISOString().slice(0, 10);
 const AUG_2026 = new Date('2026-08-16T00:00:00.000Z');
 
 describe('resolvePeriod — Indian financial year', () => {
-  it('reads today as Q2 FY27 and opens QTD on 1-July', () => {
+  it('reads today as Q2 FY27 and opens QTD on the 30-June close', () => {
     const r = resolvePeriod('QTD', { asOf: AUG_2026, market: 'INDIA' });
     expect(r.label).toBe('Q2 FY27 to date');
-    // Anchored back onto inception: 1-July has no valuation of its own.
+    // The quarter's first day is 1-July, so it opens on the 30-June close,
+    // which is inception itself.
     expect(iso(r.from)).toBe(INCEPTION);
   });
 
   it('opens FYTD on the 31-March close', () => {
     const r = resolvePeriod('FYTD', { asOf: AUG_2026, market: 'INDIA' });
     expect(r.label).toBe('FY27 to date');
-    expect(iso(r.nominalFrom!)).toBe('2026-04-01');
+    expect(iso(r.nominalFrom!)).toBe('2026-03-31');
   });
 
   it('opens CYTD on the 31-December close, not on 1-April', () => {
     const r = resolvePeriod('CYTD', { asOf: AUG_2026, market: 'INDIA' });
-    expect(iso(r.nominalFrom!)).toBe('2026-01-01');
+    expect(iso(r.nominalFrom!)).toBe('2025-12-31');
   });
 
   /**
@@ -46,21 +47,21 @@ describe('resolvePeriod — Indian financial year', () => {
   it('reports how many days the inception clamp cost', () => {
     const fytd = resolvePeriod('FYTD', { asOf: AUG_2026, market: 'INDIA' });
     expect(fytd.clampedToInception).toBe(true);
-    expect(fytd.daysClamped).toBe(90); // 1-Apr → 30-Jun
+    expect(fytd.daysClamped).toBe(91); // 1-Apr through 30-Jun: 31-Mar close → 30-Jun close
     expect(iso(fytd.from)).toBe(INCEPTION);
 
     const cytd = resolvePeriod('CYTD', { asOf: AUG_2026, market: 'INDIA' });
-    expect(cytd.daysClamped).toBe(180); // 1-Jan → 30-Jun
+    expect(cytd.daysClamped).toBe(181); // 1-Jan through 30-Jun
   });
 
   /**
-   * The one-day anchor (Q1's nominal 1-July start becoming the 30-June close)
-   * is the same valuation under two names, not a lost day — reporting it as a
-   * shortfall would be a lie in the other direction.
+   * The first quarter after inception opens on the 30-June close because that
+   * is its prior close, not because it was pulled anywhere. Flagging it as
+   * clamped told the review pack the mandate opened part-way into the period.
    */
-  it('does not count the one-day inception anchor as lost days', () => {
+  it('does not flag the quarter whose prior close IS inception as clamped', () => {
     const r = resolvePeriod('QTD', { asOf: AUG_2026, market: 'INDIA' });
-    expect(r.clampedToInception).toBe(true);
+    expect(r.clampedToInception).toBe(false);
     expect(r.daysClamped).toBe(0);
     expect(r.nominalFrom).toBeUndefined();
   });
@@ -69,7 +70,7 @@ describe('resolvePeriod — Indian financial year', () => {
     const asOf = new Date('2027-05-10T00:00:00.000Z');
     const q3 = resolvePeriod('Q3-FY27', { asOf, market: 'INDIA' });
 
-    expect(iso(q3.from)).toBe('2026-10-01');
+    expect(iso(q3.from)).toBe('2026-09-30'); // the 30-Sep close
     expect(iso(q3.to)).toBe('2026-12-31');
     expect(q3.label).toBe('Q3 FY27');
     expect(q3.openPeriod).toBe(false);
@@ -79,7 +80,7 @@ describe('resolvePeriod — Indian financial year', () => {
     const asOf = new Date('2028-02-01T00:00:00.000Z');
     const fy27 = resolvePeriod('FY27', { asOf, market: 'INDIA' });
 
-    expect(iso(fy27.nominalFrom!)).toBe('2026-04-01');
+    expect(iso(fy27.nominalFrom!)).toBe('2026-03-31');
     expect(iso(fy27.to)).toBe('2027-03-31');
     expect(fy27.label).toBe('FY27');
   });
@@ -107,7 +108,7 @@ describe('resolvePeriod — US calendar year is unchanged', () => {
     const asOf = new Date('2027-02-10T00:00:00.000Z');
     const q4 = resolvePeriod('Q4-CY26', { asOf, market: 'US' });
 
-    expect(iso(q4.from)).toBe('2026-10-01');
+    expect(iso(q4.from)).toBe('2026-09-30');
     expect(iso(q4.to)).toBe('2026-12-31');
   });
 
@@ -119,7 +120,7 @@ describe('resolvePeriod — US calendar year is unchanged', () => {
   it('honours an explicit FY code regardless of the caller market', () => {
     const asOf = new Date('2027-05-10T00:00:00.000Z');
     const r = resolvePeriod('Q3-FY27', { asOf, market: 'US' });
-    expect(iso(r.from)).toBe('2026-10-01');
+    expect(iso(r.from)).toBe('2026-09-30');
   });
 });
 
@@ -226,7 +227,7 @@ describe('resolvePeriod / availablePeriods — per-client inception floor', () =
     });
     expect(iso(r.from)).toBe('2027-02-10');
     expect(r.clampedToInception).toBe(true);
-    expect(iso(r.nominalFrom!)).toBe('2026-04-01'); // FY27's nominal start
+    expect(iso(r.nominalFrom!)).toBe('2026-03-31'); // FY27's opening close
   });
 
   /**
@@ -348,5 +349,73 @@ describe('availablePeriods', () => {
         }
       }
     }
+  });
+});
+
+/**
+ * Consecutive windows must chain: one closes on the valuation the next opens
+ * on, so no day's price move, trade or dividend falls between them. Windows
+ * used to open on the 1st's own close, which left the 1st of every quarter,
+ * month and year in no window at all.
+ */
+describe('resolvePeriod — windows open on the prior close and chain', () => {
+  const LATE_2027 = new Date('2028-02-01T00:00:00.000Z');
+
+  it('opens each quarter on the close the previous quarter ends on', () => {
+    const q3 = resolvePeriod('Q3-CY26', { asOf: LATE_2027, market: 'US' });
+    const q4 = resolvePeriod('Q4-CY26', { asOf: LATE_2027, market: 'US' });
+    const q1 = resolvePeriod('Q1-CY27', { asOf: LATE_2027, market: 'US' });
+    expect(iso(q3.to)).toBe(iso(q4.from));
+    expect(iso(q4.to)).toBe(iso(q1.from));
+    expect(iso(q4.from)).toBe('2026-09-30');
+  });
+
+  it('chains the Indian fiscal quarters the same way', () => {
+    const q2 = resolvePeriod('Q2-FY27', { asOf: LATE_2027, market: 'INDIA' });
+    const q3 = resolvePeriod('Q3-FY27', { asOf: LATE_2027, market: 'INDIA' });
+    expect(iso(q2.to)).toBe('2026-09-30');
+    expect(iso(q3.from)).toBe('2026-09-30');
+  });
+
+  it('opens QTD on the previous quarter-end close, matching the market watchlist', () => {
+    const r = resolvePeriod('QTD', { asOf: new Date('2026-11-18T00:00:00.000Z'), market: 'US' });
+    expect(iso(r.from)).toBe('2026-09-30');
+    expect(r.clampedToInception).toBe(false);
+    // 1-Oct through 18-Nov inclusive.
+    expect((r.to.getTime() - r.from.getTime()) / 86_400_000).toBe(49);
+  });
+
+  it('opens MTD on the last close of the prior month, so the 1st spans one day', () => {
+    const r = resolvePeriod('MTD', { asOf: new Date('2026-11-01T00:00:00.000Z'), market: 'US' });
+    expect(iso(r.from)).toBe('2026-10-31');
+    expect(iso(r.to)).toBe('2026-11-01');
+  });
+
+  it('spans a whole closed year as 365 days, so it reports on the annualized basis', () => {
+    const cy27 = resolvePeriod('CY27', { asOf: LATE_2027, market: 'US' });
+    expect(iso(cy27.from)).toBe('2026-12-31');
+    expect(iso(cy27.to)).toBe('2027-12-31');
+    expect((cy27.to.getTime() - cy27.from.getTime()) / 86_400_000).toBe(365);
+  });
+
+  it('opens a late client\'s month naturally when its prior close is that client\'s inception', () => {
+    const r = resolvePeriod('MTD', {
+      asOf: new Date('2027-02-20T00:00:00.000Z'),
+      market: 'INDIA',
+      clientInception: new Date('2027-01-31T00:00:00.000Z'),
+    });
+    expect(iso(r.from)).toBe('2027-01-31');
+    expect(r.clampedToInception).toBe(false);
+    expect(r.daysClamped).toBe(0);
+  });
+
+  it('leaves INCEPTION and CUSTOM on the date given, as the opening valuation', () => {
+    expect(iso(resolvePeriod('INCEPTION', { asOf: AUG_2026 }).from)).toBe(INCEPTION);
+    const custom = resolvePeriod('CUSTOM', {
+      asOf: AUG_2026,
+      from: new Date('2026-07-15T00:00:00.000Z'),
+      to: new Date('2026-08-01T00:00:00.000Z'),
+    });
+    expect(iso(custom.from)).toBe('2026-07-15');
   });
 });

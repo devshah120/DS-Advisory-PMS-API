@@ -29,15 +29,30 @@ import {
  * and that client's earlier history is rolled up into their opening position
  * (see JUN30_REBASE_DATE in analytics/calculators/flows.ts).
  *
- * The identity the desk expects falls out for free: the quarter after the
- * baseline opened 1-July, with no valuation in between, so QTD and INCEPTION
- * resolve to the same opening value and report the same number.
+ * ── Windows open on the PRIOR close ────────────────────────────────────────
+ * A named window covers its days inclusive, so its opening value is the close
+ * of the day BEFORE its first day: Q4 CY26 opens on the 30-Sep close, FY27 on
+ * the 31-Mar close, MTD in November on the 31-Oct close. That is what makes
+ * consecutive windows chain: Q3 closes on the 30-Sep valuation and Q4 opens on
+ * it, so no trading day, price move, trade or dividend falls between them. The
+ * engine used to open on the 1st's own close, which left the first day of
+ * every quarter in no window at all. It is also the convention the market
+ * watchlist already used (periodBaseDates), so a benchmark's QTD now reads the
+ * same on both screens.
+ *
+ * The identity the desk expects falls out for free: Q3 CY26 opens on the
+ * 30-June close, which IS inception, so QTD and INCEPTION resolve to the same
+ * opening value and report the same number.
+ *
+ * `from` on a resolved window is therefore an opening VALUATION date, and the
+ * sheet prints it as such ("30 Sep 2026 → 18 Nov 2026"). INCEPTION and CUSTOM
+ * pass their date through as that valuation date unchanged.
  *
  * ── Two calendars ──────────────────────────────────────────────────────────
  * Every window here is resolved against the MARKET's reporting calendar, not
  * against the calendar year. The Indian book runs April–March, so on that book
  * `QTD` today means Q2 FY27 (Jul–Sep 2026) and `FYTD` opens on the 31-March
- * close; the US book keeps January–December and is unchanged. `CYTD` is offered
+ * close; the US book keeps January–December. `CYTD` is offered
  * on both and always means 31-December → today, because an Indian desk still
  * reconciles some things (index performance, offshore statements) on the
  * calendar year even though it reports on the fiscal one.
@@ -72,23 +87,26 @@ export interface ResolvedPeriod {
   period: PeriodCode;
   /** Human label for the sheet, e.g. "Q2 FY27" or "Since inception". */
   label: string;
+  /** The opening VALUATION date: the close of the day before the window's first day. */
   from: Date;
   to: Date;
   /**
-   * True when `from` was pulled forward to inception. The sheet says so, because
+   * True when `from` was pulled forward to inception, i.e. the window would
+   * have opened on a close the house cannot price. The sheet says so, because
    * a "Q1 FY27" figure that actually measures one day is a number a reader would
-   * otherwise misread as a full quarter.
+   * otherwise misread as a full quarter. A window whose prior close IS
+   * inception (Q3 CY26 opening on the 30-June close) is not clamped.
    */
   clampedToInception: boolean;
   /**
-   * The date the window WOULD have opened on had the house priced history that
+   * The close the window WOULD have opened on had the house priced history that
    * far back, when that differs from `from`.
    *
-   * This is what lets the sheet say "FYTD, measured from 30-Jun-2026 rather than
-   * 01-Apr-2026" instead of printing a bare "FYTD" over a number that is 90 days
-   * short of one. A clamped figure is publishable; a clamped figure wearing an
-   * unqualified label is not, and this field is what makes the difference
-   * renderable rather than a comment nobody reads.
+   * This is what lets the sheet say "FYTD, measured from the 30-Jun-2026 close
+   * rather than the 31-Mar-2026 close" instead of printing a bare "FYTD" over a
+   * number that is 91 days short of one. A clamped figure is publishable; a
+   * clamped figure wearing an unqualified label is not, and this field is what
+   * makes the difference renderable rather than a comment nobody reads.
    */
   nominalFrom?: Date;
   /** Days lost to the clamp — `nominalFrom` → `from`. Zero when unclamped. */
@@ -127,21 +145,15 @@ function effectiveInception(houseInception: Date, clientInception?: Date): Date 
 }
 
 /**
- * Does a window starting at `rawFrom` open on the trading day immediately after
- * inception, with no valuation of its own in between?
+ * The close a window whose first day is `firstDay` opens on: the day before.
  *
- * Inception is 30-June, a quarter-end and a month-end, so the very next period —
- * Q3 CY26, July MTD, and QTD while we are still in Q3 — nominally starts 1-July.
- * There is no separate 1-July opening value: it IS the 30-June close. Anchoring
- * such a window on inception keeps its return measured from a real priced base
- * rather than from a date we would have to invent a value for.
- *
- * Deliberately narrow — one day. A window starting 1-August is a genuine
- * later window and must keep its own opening value.
+ * This replaced a one-day special case that pulled only the first period after
+ * inception back onto the 30-June close. Every other window opened on its 1st's
+ * own close, so the 1st of each later quarter, month and year was measured by
+ * neither the window before it nor the one it started.
  */
-function isFirstPeriodAfterInception(rawFrom: Date, inception: Date): boolean {
-  const dayAfter = new Date(inception.getTime() + 86_400_000);
-  return utcDay(rawFrom).getTime() === utcDay(dayAfter).getTime();
+function priorClose(firstDay: Date): Date {
+  return new Date(utcDay(firstDay).getTime() - 86_400_000);
 }
 
 /**
@@ -366,32 +378,24 @@ export function resolvePeriod(
   const market = opts.market ?? DEFAULT_MARKET;
 
   const clamp = (
-    rawFrom: Date,
+    /**
+     * The opening VALUATION date — already the prior close for a named window
+     * (see priorClose), the date itself for INCEPTION and CUSTOM.
+     */
+    openAt: Date,
     rawTo: Date,
     period: PeriodCode,
     label: string,
   ): ResolvedPeriod => {
     /**
-     * A window opens at the LAST VALUATION ON OR BEFORE its nominal start, and
-     * for the first quarter that means inception itself.
-     *
-     * The nominal start of Q3 is 1-July, but no valuation exists for 1-July that
-     * isn't just 30-June carried forward — the book did not trade in between, and
-     * 30-June is the only priced opening value we have. Anchoring on 30-June is
-     * therefore both more correct (it is the real opening value of the quarter)
-     * and gives the identity the desk expects: with no flows between the two
-     * dates, QTD and INCEPTION report the same number, because they are measuring
-     * the same thing.
-     *
-     * `inceptionAnchored` is the flag for "this window was pulled back to the
-     * 30-June base", covering both the pull-BACK here and the pull-FORWARD of a
-     * window that tried to start before inception.
+     * A window may not open on a close the house cannot price. One that would
+     * is pulled FORWARD to inception and says so (`clampedToInception`,
+     * `daysClamped`). A window whose prior close is inception itself (Q3 CY26,
+     * July MTD) opens there naturally and is not flagged: nothing was lost.
      */
-    const startsBeforeInception = rawFrom < inception;
-    const anchorsOnInception = isFirstPeriodAfterInception(rawFrom, inception);
-
-    const clampedToInception = startsBeforeInception || anchorsOnInception;
-    const from = clampedToInception ? inception : utcDay(rawFrom);
+    const nominal = utcDay(openAt);
+    const clampedToInception = nominal < inception;
+    const from = clampedToInception ? inception : nominal;
 
     const openPeriod = rawTo > asOf;
     const to = openPeriod ? asOf : utcDay(rawTo);
@@ -407,12 +411,13 @@ export function resolvePeriod(
      * measurable". Rejecting it keeps it out of the dropdown, since
      * availablePeriods offers only what resolves.
      *
-     * A LIVE window is the deliberate exception. On the first day of a month
-     * MTD legitimately spans zero days, as do QTD and FYTD on their opening day
-     * — and on those days the honest answer is "0.00%, nothing has happened
-     * yet", not an error that blanks the page. The distinction is whether the
-     * window is still running: a zero-length live window will have length
-     * tomorrow, a zero-length closed one never will.
+     * A LIVE window is the deliberate exception. Since inception on its own
+     * opening day (or a custom range opened today) legitimately spans zero
+     * days, and the honest answer then is "0.00%, nothing has happened yet",
+     * not an error that blanks the page. The distinction is whether the window
+     * is still running: a zero-length live window will have length tomorrow, a
+     * zero-length closed one never will. (Named windows now open on the prior
+     * close, so MTD on the 1st already spans that one day.)
      */
     const live = rawTo >= asOf;
     if (to < from || (to.getTime() === from.getTime() && !live)) {
@@ -424,15 +429,11 @@ export function resolvePeriod(
     }
 
     /**
-     * Report the shortfall, not just the fact of it.
-     *
-     * Only a genuine pull-FORWARD counts as lost days. The one-day anchor onto
-     * inception (Q1's nominal 1-July start becoming the 30-June close) is not a
-     * shortfall — it is the same valuation under two names — so it would be
-     * misleading to tell the reader a day went missing.
+     * Report the shortfall, not just the fact of it: the days between the close
+     * the window should have opened on and the one it did. FYTD on the Indian
+     * book loses 1-Apr through 30-Jun, which is 91 days.
      */
-    const nominal = utcDay(rawFrom);
-    const daysClamped = startsBeforeInception
+    const daysClamped = clampedToInception
       ? Math.round((from.getTime() - nominal.getTime()) / 86_400_000)
       : 0;
 
@@ -454,7 +455,7 @@ export function resolvePeriod(
 
   if (code === 'MTD') {
     const from = new Date(Date.UTC(asOf.getUTCFullYear(), asOf.getUTCMonth(), 1));
-    return clamp(from, asOf, 'MTD', 'Month to date');
+    return clamp(priorClose(from), asOf, 'MTD', 'Month to date');
   }
 
   /** The fiscal quarter in progress — Q2 FY27 on the Indian book today. */
@@ -462,7 +463,7 @@ export function resolvePeriod(
     const fy = fiscalYearOf(asOf, market);
     const q = fiscalQuarterOf(asOf, market);
     const { start } = fiscalQuarterRange(q, fy, market);
-    return clamp(start, asOf, 'QTD', `${fiscalQuarterLabel(q, fy, market)} to date`);
+    return clamp(priorClose(start), asOf, 'QTD', `${fiscalQuarterLabel(q, fy, market)} to date`);
   }
 
   /**
@@ -474,13 +475,13 @@ export function resolvePeriod(
   if (code === 'FYTD' || code === 'YTD') {
     const fy = fiscalYearOf(asOf, market);
     const { start } = fiscalYearRange(fy, market);
-    return clamp(start, asOf, code, `${fiscalYearLabel(fy, market)} to date`);
+    return clamp(priorClose(start), asOf, code, `${fiscalYearLabel(fy, market)} to date`);
   }
 
   /** CYTD — 31-December close to today, on either book. */
   if (code === 'CYTD') {
     const from = new Date(Date.UTC(asOf.getUTCFullYear(), 0, 1));
-    return clamp(from, asOf, 'CYTD', 'Calendar year to date');
+    return clamp(priorClose(from), asOf, 'CYTD', 'Calendar year to date');
   }
 
   if (code === 'CUSTOM') {
@@ -496,7 +497,7 @@ export function resolvePeriod(
     const m = marketForPrefix(quarter[2], market);
     const fy = 2000 + Number(quarter[3]);
     const { start, end } = fiscalQuarterRange(q, fy, m);
-    return clamp(start, end, code, fiscalQuarterLabel(q, fy, m));
+    return clamp(priorClose(start), end, code, fiscalQuarterLabel(q, fy, m));
   }
 
   const year = YEAR_CODE.exec(code);
@@ -504,7 +505,7 @@ export function resolvePeriod(
     const m = marketForPrefix(year[1], market);
     const fy = 2000 + Number(year[2]);
     const { start, end } = fiscalYearRange(fy, m);
-    return clamp(start, end, code, fiscalYearLabel(fy, m));
+    return clamp(priorClose(start), end, code, fiscalYearLabel(fy, m));
   }
 
   throw new BadRequestException(

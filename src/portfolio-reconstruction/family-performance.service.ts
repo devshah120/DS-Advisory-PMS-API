@@ -9,7 +9,7 @@ import {
   wholeDays,
   xirr,
 } from '../analytics/calculators/xirr';
-import { AccountingMethod, buildWindowFlows, isBulkImportClient } from '../analytics/calculators/flows';
+import { AccountingMethod, isBulkImportClient, valuedWindowFlows } from '../analytics/calculators/flows';
 import { ResolvedPeriod } from './periods';
 import { Market, benchmarksFor, currencyForMarket } from '../common/market-scope';
 import { Actor, assertOwns } from '../common/ownership-scope';
@@ -409,8 +409,10 @@ export class FamilyPerformanceService {
     method: AccountingMethod,
   ): Promise<CashFlow[]> {
     const [rows, baseline] = await Promise.all([
+      // No upper bound: valuedWindowFlows applies the valuation bounds, which
+      // reach past `to` (see PerformanceBaselineService.windowFlows).
       this.prisma.transaction.findMany({
-        where: { clientId, date: { gt: from, lt: to } },
+        where: { clientId, date: { gt: from } },
         orderBy: { date: 'asc' },
       }),
       this.prisma.portfolioBaseline.findUnique({
@@ -426,7 +428,7 @@ export class FamilyPerformanceService {
     // isBulkImportClient.
     const isHouseBaseline = isBulkImportClient({ baselineDate: baseline?.baselineDate });
 
-    return buildWindowFlows(rows, method, from, to, undefined, isHouseBaseline);
+    return valuedWindowFlows(rows, method, from, to, undefined, isHouseBaseline);
   }
 
   /**

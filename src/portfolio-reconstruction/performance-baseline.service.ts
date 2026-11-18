@@ -9,7 +9,7 @@ import {
   wholeDays,
   xirr,
 } from '../analytics/calculators/xirr';
-import { AccountingMethod, buildWindowFlows, isBulkImportClient } from '../analytics/calculators/flows';
+import { AccountingMethod, isBulkImportClient, valuedWindowFlows } from '../analytics/calculators/flows';
 import { ResolvedPeriod } from './periods';
 import { Market, benchmarksFor } from '../common/market-scope';
 
@@ -299,7 +299,7 @@ export class PerformanceBaselineService {
    * real flow strictly inside the window sits between them on its own date.
    *
    * Which ledger rows count as "a real flow" is decided by the CLIENT'S
-   * ACCOUNTING METHOD, via the shared `buildWindowFlows` - not by a hardcoded
+   * ACCOUNTING METHOD, via the shared `valuedWindowFlows` - not by a hardcoded
    * CASH_DEPOSIT/CASH_WITHDRAWAL filter. That filter is correct for a cash-flow
    * book and silently wrong for a transactional one, which has no cash rows at
    * all: the window then saw no flows, XIRR reduced to a two-point series, and
@@ -315,14 +315,17 @@ export class PerformanceBaselineService {
     closingValue: number,
     method: AccountingMethod,
   ): Promise<CashFlow[]> {
+    // Fetched from `from` with no upper bound: valuedWindowFlows applies the
+    // valuation bounds, which reach past `to` (to the end of its day, or every
+    // row when `to` is today).
     const [ledger, isHouseBaseline] = await Promise.all([
       this.prisma.transaction.findMany({
-        where: { clientId, date: { gt: from, lt: to } },
+        where: { clientId, date: { gt: from } },
         orderBy: { date: 'asc' },
       }),
       this.isHouseBaseline(clientId),
     ]);
-    const interior = buildWindowFlows(ledger, method, from, to, undefined, isHouseBaseline);
+    const interior = valuedWindowFlows(ledger, method, from, to, undefined, isHouseBaseline);
 
     return [
       { date: from, amount: -openingValue },

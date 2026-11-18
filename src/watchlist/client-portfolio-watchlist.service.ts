@@ -5,7 +5,12 @@ import { PortfolioHistoryService } from '../portfolio-reconstruction/portfolio-h
 import { PerformanceBaselineService } from '../portfolio-reconstruction/performance-baseline.service';
 import { ResolvedPeriod, resolvePeriod } from '../portfolio-reconstruction/periods';
 import { ReconstructedPortfolio, ReconstructedPosition } from '../portfolio-reconstruction/types';
-import { LedgerEntry, buildWindowFlows } from '../analytics/calculators/flows';
+import {
+  LedgerEntry,
+  buildWindowFlows,
+  rowsBetweenValuations,
+  valuationCutoff,
+} from '../analytics/calculators/flows';
 import { CashFlow, xirr } from '../analytics/calculators/xirr';
 import { Market, currencyForMarket, parseMarket } from '../common/market-scope';
 import { Actor, assertCanAccessClient, assertOwns } from '../common/ownership-scope';
@@ -156,25 +161,11 @@ function iso(d: Date): string {
   return d.toISOString().slice(0, 10);
 }
 
-function utcDay(d: Date): Date {
-  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
-}
-
 /**
- * The instant before which a ledger row is already inside the valuation of
- * `date`, or null when every recorded row is (the live book).
- *
- * This restates PortfolioReconstructionService's replay bound and must stay in
- * step with it: a historical date replays rows up to the END of that day, and
- * today replays everything already entered, including rows dated ahead. Flow
- * bounds that disagree with the valuation bounds either drop a trade the
- * valuation saw (a top-up booked today reads as gain) or count one twice.
+ * The valuation-bound rule now lives in flows.ts, shared with the book-level
+ * period engines. Re-exported for existing importers.
  */
-export function valuationCutoff(date: Date, now: Date = new Date()): Date | null {
-  const day = utcDay(date);
-  if (day.getTime() >= utcDay(now).getTime()) return null;
-  return new Date(day.getTime() + MS_PER_DAY);
-}
+export { valuationCutoff };
 
 /** One account's ledger rows, with how its 1-July BUY rows are to be read. */
 type AccountLedger = { rows: LedgerEntry[]; isHouseBaseline: boolean };
@@ -197,11 +188,7 @@ function interiorFlows(
   return (
     ledgers
       .flatMap((ledger) => {
-        const rows = ledger.rows
-          .filter((r) => r.date >= openedThrough && (closedThrough === null || r.date < closedThrough))
-          // A row the live book already holds but dated after today is priced
-          // into the closing value, so its cash belongs on the closing date.
-          .map((r) => (r.date > to ? { ...r, date: to } : r));
+        const rows = rowsBetweenValuations(ledger.rows, to, openedThrough, closedThrough);
         // Bounds are already applied above; these only keep buildWindowFlows' own
         // strict filter from re-trimming the rows that sit on the closing date.
         return buildWindowFlows(

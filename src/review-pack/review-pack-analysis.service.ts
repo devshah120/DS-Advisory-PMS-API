@@ -84,11 +84,12 @@ export class ReviewPackAnalysisService {
     // Reuses the same window-flow construction the client's own Performance
     // page is measured on, so the return quoted here is the return that page
     // shows — never a re-derivation. See analytics/calculators/flows.ts.
-    const { buildWindowFlows, isBulkImportClient } = await import('../analytics/calculators/flows');
+    const { valuedWindowFlows, isBulkImportClient } = await import('../analytics/calculators/flows');
     const { xirr } = await import('../analytics/calculators/xirr');
     const [txns, clientRow, baseline] = await Promise.all([
       this.prisma.transaction.findMany({
-        where: { clientId, date: { gt: resolved.from, lt: resolved.to } },
+        // No upper bound: valuedWindowFlows applies the valuation bounds.
+        where: { clientId, date: { gt: resolved.from } },
         orderBy: { date: 'asc' },
       }),
       this.prisma.client.findUnique({
@@ -108,7 +109,7 @@ export class ReviewPackAnalysisService {
     // baseline on the house date — the same gate the reconstruction uses. See
     // isBulkImportClient.
     const isHouseBaseline = isBulkImportClient({ baselineDate: baseline?.baselineDate });
-    const interior = buildWindowFlows(
+    const interior = valuedWindowFlows(
       txns,
       'TRANSACTIONAL',
       resolved.from,

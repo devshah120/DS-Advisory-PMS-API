@@ -9,6 +9,8 @@ import {
   totalContributed,
   totalWithdrawn,
   LedgerEntry,
+  valuationCutoff,
+  valuedWindowFlows,
 } from './flows';
 import { xirr } from './xirr';
 
@@ -422,7 +424,7 @@ describe('buildWindowFlows — period windows respect the accounting method', ()
     expect(flows[0].amount).toBe(-200_000); // 250k out, 50k back in
   });
 
-  it('ignores rows on the window boundaries, which the valuations already hold', () => {
+  it('is strict on its own bounds (period engines bound by valuation via valuedWindowFlows)', () => {
     const boundary: LedgerEntry[] = [
       { type: 'BUY', amount: 500_000, date: FROM },
       { type: 'BUY', amount: 500_000, date: TO },
@@ -554,5 +556,70 @@ describe('rebaseLedgerToJun30 — every client opens on the 30-June close', () =
     ];
     const out = rebaseLedgerToJun30(ledger, new Map(), new Map(), false);
     expect(out).toEqual([]);
+  });
+});
+
+/**
+ * Every ledger row must land in exactly one of: the opening value, the flows,
+ * the closing value. The valuations replay through the END of a date's UTC day
+ * (or every row, for today), so the flow bounds follow them, not midnight.
+ *
+ * Both desks' timestamp conventions are pinned: the US book stores a trade at
+ * 00:00Z on its date, the Indian book at IST midnight (18:30Z the day before).
+ */
+describe('valuedWindowFlows — flow bounds follow the valuation bounds', () => {
+  const FROM = d('2026-10-01T00:00:00Z');
+  const TODAY = d('2026-11-18T00:00:00Z');
+  const NOW = d('2026-11-18T10:00:00Z');
+  const buy = (amount: number, date: string): LedgerEntry => ({ type: 'BUY', amount, date: d(date) });
+  const net = (flows: ReturnType<typeof valuedWindowFlows>) => flows.reduce((s, f) => s - f.amount, 0);
+
+  it('counts a US trade booked today as capital, not gain (the 18-Nov-2026 bug)', () => {
+    // Ketan Gohil's book: three buys at IST-style stamps on the 17th, sixteen at
+    // 00:00Z on the 18th. The old `from < date < to` filter saw only the first.
+    const ledger = [buy(16_500, '2026-11-17T18:30:00Z'), buy(31_468.6, '2026-11-18T00:00:00Z')];
+    const flows = valuedWindowFlows(ledger, 'TRANSACTIONAL', FROM, TODAY, {}, false, NOW);
+    expect(net(flows)).toBeCloseTo(47_968.6, 2);
+  });
+
+  it('moves a future-dated row the live book already holds onto the closing date', () => {
+    const flows = valuedWindowFlows(
+      [buy(1_000, '2026-11-20T00:00:00Z')],
+      'TRANSACTIONAL',
+      FROM,
+      TODAY,
+      {},
+      false,
+      NOW,
+    );
+    expect(flows).toEqual([{ date: TODAY, amount: -1_000 }]);
+  });
+
+  it('leaves a trade on the opening UTC day in the opening value, either convention', () => {
+    const ledger = [
+      buy(500, '2026-10-01T00:00:00Z'), // US, opening day
+      buy(700, '2026-10-01T18:30:00Z'), // India, 2-Oct IST: inside the 1-Oct replay
+    ];
+    expect(valuedWindowFlows(ledger, 'TRANSACTIONAL', FROM, TODAY, {}, false, NOW)).toHaveLength(0);
+  });
+
+  it('counts a trade on the closing day of a CLOSED window, which its valuation holds', () => {
+    const to = d('2026-09-30T00:00:00Z');
+    const from = d('2026-06-30T00:00:00Z');
+    const ledger = [
+      buy(900, '2026-09-30T00:00:00Z'), // US, closing day
+      buy(400, '2026-09-30T18:30:00Z'), // India, 1-Oct IST: still inside the 30-Sep replay
+      buy(300, '2026-10-01T00:00:00Z'), // next quarter
+    ];
+    const flows = valuedWindowFlows(ledger, 'TRANSACTIONAL', from, to, {}, false, NOW);
+    expect(net(flows)).toBeCloseTo(1_300, 2);
+    expect(flows.every((f) => f.date.getTime() <= to.getTime())).toBe(true);
+  });
+
+  it('has no interior flows on a window that opens today', () => {
+    expect(valuationCutoff(TODAY, NOW)).toBeNull();
+    expect(
+      valuedWindowFlows([buy(100, '2026-11-18T05:00:00Z')], 'TRANSACTIONAL', TODAY, TODAY, {}, false, NOW),
+    ).toHaveLength(0);
   });
 });

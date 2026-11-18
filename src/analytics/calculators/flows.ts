@@ -609,10 +609,11 @@ export function totalWithdrawn(flows: CashFlow[]): number {
  * Same-day BUY/SELL netting is inherited from `toNettedCashFlows`, so a window
  * agrees with the since-inception series about what one trading day's flow was.
  *
- * Boundaries are STRICT on both sides (`from < date < to`), matching the
- * previous behaviour: a trade dated on the opening day is already inside the
- * opening valuation, and one dated on the closing day is inside the closing
- * valuation. Counting either again would double-book it.
+ * Boundaries here are STRICT on both sides (`from < date < to`). A period
+ * engine should not call this directly with the window's midnight instants:
+ * call `valuedWindowFlows`, which bounds the rows by what the opening and
+ * closing VALUATIONS actually contain and then delegates here. Midnight bounds
+ * disagree with the valuations at both ends (see valuedWindowFlows).
  */
 export function buildWindowFlows(
   ledger: LedgerEntry[],
@@ -645,4 +646,90 @@ export function buildWindowFlows(
   return flows
     .filter((f) => f.amount !== 0)
     .sort((a, b) => a.date.getTime() - b.date.getTime());
+}
+
+const MS_PER_DAY = 86_400_000;
+
+function utcDayStart(d: Date): Date {
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+}
+
+/**
+ * The instant before which a ledger row is already inside the valuation of
+ * `date`, or null when every recorded row is (the live book).
+ *
+ * This restates PortfolioReconstructionService's replay bound and must stay in
+ * step with it: a historical date replays rows up to the END of that UTC day,
+ * and today replays everything already entered, including rows dated ahead.
+ */
+export function valuationCutoff(date: Date, now: Date = new Date()): Date | null {
+  const day = utcDayStart(date);
+  if (day.getTime() >= utcDayStart(now).getTime()) return null;
+  return new Date(day.getTime() + MS_PER_DAY);
+}
+
+/**
+ * The ledger rows that are neither in the opening valuation nor missing from
+ * the closing one, so each row lands in exactly one of opening value, flows,
+ * and closing value. A row the live book already holds but dated after `to` is
+ * priced into the closing value, so its cash is moved onto the closing date.
+ */
+export function rowsBetweenValuations<T extends { date: Date }>(
+  rows: ReadonlyArray<T>,
+  to: Date,
+  openedThrough: Date | null,
+  closedThrough: Date | null,
+): T[] {
+  if (openedThrough === null) return [];
+  return rows
+    .filter((r) => r.date >= openedThrough && (closedThrough === null || r.date < closedThrough))
+    .map((r) => (r.date > to ? { ...r, date: to } : r));
+}
+
+/**
+ * The interior flows for one period window, bounded by the valuations rather
+ * than by the window's midnight instants. Every period engine (client sheet,
+ * household sheet, review pack, per-symbol watchlist) goes through this, so
+ * the books cannot disagree about which trades a window contained.
+ *
+ * Why not `from < date < to`: the opening value is a replay through the END of
+ * `from`'s UTC day, and the closing value is a replay through the end of `to`'s
+ * day (or of every row, when `to` is today). Midnight bounds broke both ends,
+ * and how badly depended on how a desk timestamps its trades:
+ *
+ *  - US trades are stored at 00:00Z on the trade date. A buy booked ON the
+ *    closing day sat at exactly `to`, so it was in the closing value but not a
+ *    flow, and the capital read as gain. On 18-Nov-2026 Ketan Gohil's sixteen
+ *    same-day buys (about $31.5k) turned a roughly flat quarter into +27%
+ *    against an S&P 500 at -4.8%.
+ *  - Indian trades are stored at IST midnight (18:30Z the previous day), which
+ *    is why the Indian book mostly read right: its closing-day trades fall
+ *    strictly inside the window. But a trade on the day AFTER `from` landed in
+ *    the opening value and was also counted as a flow, so it was double-booked.
+ */
+export function valuedWindowFlows(
+  ledger: LedgerEntry[],
+  method: AccountingMethod,
+  from: Date,
+  to: Date,
+  opts: FlowOptions = {},
+  isHouseBaseline = true,
+  now: Date = new Date(),
+): CashFlow[] {
+  const rows = rowsBetweenValuations(
+    ledger,
+    to,
+    valuationCutoff(from, now),
+    valuationCutoff(to, now),
+  );
+  // The bounds are already applied; these widen buildWindowFlows' own strict
+  // filter so it does not re-trim the rows that sit on the closing date.
+  return buildWindowFlows(
+    rows,
+    method,
+    new Date(from.getTime() - 1),
+    new Date(to.getTime() + 1),
+    opts,
+    isHouseBaseline,
+  );
 }
